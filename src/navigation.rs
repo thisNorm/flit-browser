@@ -1,6 +1,43 @@
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub(crate) const HOME: &str = "about:blank";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SearchEngine {
+    Google,
+    Naver,
+    Bing,
+    #[default]
+    #[serde(rename = "duckduckgo", other)]
+    DuckDuckGo,
+}
+
+impl SearchEngine {
+    pub(crate) const ALL: [(Self, &'static str); 4] = [
+        (Self::DuckDuckGo, "DuckDuckGo"),
+        (Self::Google, "Google"),
+        (Self::Naver, "Naver"),
+        (Self::Bing, "Bing"),
+    ];
+
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::DuckDuckGo
+    }
+
+    fn search(self, keyword: &str) -> String {
+        let (base, parameter) = match self {
+            Self::DuckDuckGo => ("https://duckduckgo.com/", "q"),
+            Self::Google => ("https://www.google.com/search", "q"),
+            Self::Naver => ("https://search.naver.com/search.naver", "query"),
+            Self::Bing => ("https://www.bing.com/search", "q"),
+        };
+        let mut url = Url::parse(base).expect("static search URL");
+        url.query_pairs_mut().append_pair(parameter, keyword);
+        url.into()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -45,9 +82,61 @@ mod tests {
         assert_eq!(address("chrome://settings/").unwrap(), "chrome://settings/");
         assert!(address("chrome://user@settings/").is_err());
     }
+
+    #[test]
+    fn explicit_search_keeps_address_like_queries_as_search_terms() {
+        let query = "https://example.test/한글?q=x+y&z=#끝";
+        for (engine, host, path, field) in [
+            (SearchEngine::DuckDuckGo, "duckduckgo.com", "/", "q"),
+            (SearchEngine::Google, "www.google.com", "/search", "q"),
+            (
+                SearchEngine::Naver,
+                "search.naver.com",
+                "/search.naver",
+                "query",
+            ),
+            (SearchEngine::Bing, "www.bing.com", "/search", "q"),
+        ] {
+            let target = address_bar(&format!(" ? {query} "), engine).unwrap();
+            let parsed = Url::parse(&target).unwrap();
+            assert_eq!(parsed.scheme(), "https");
+            assert_eq!(parsed.host_str(), Some(host));
+            assert_eq!(parsed.path(), path);
+            assert_eq!(parsed.fragment(), None);
+            assert_eq!(
+                parsed.query_pairs().collect::<Vec<_>>(),
+                [(field.into(), query.into())]
+            );
+            assert_eq!(
+                address_bar("example.test", engine).unwrap(),
+                "https://example.test/"
+            );
+            assert!(address_bar("?   ", engine).is_err());
+            assert!(address_bar("? x\ny", engine).is_err());
+        }
+        assert_eq!(
+            address_bar("브라우저 검색", SearchEngine::Naver).unwrap(),
+            "https://search.naver.com/search.naver?query=%EB%B8%8C%EB%9D%BC%EC%9A%B0%EC%A0%80+%EA%B2%80%EC%83%89"
+        );
+    }
 }
 
 pub(crate) fn address(input: &str) -> Result<String, &'static str> {
+    resolve(input, SearchEngine::default())
+}
+
+pub(crate) fn address_bar(input: &str, engine: SearchEngine) -> Result<String, &'static str> {
+    if let Some(term) = input.trim().strip_prefix('?') {
+        let term = term.trim();
+        if term.is_empty() || term.chars().any(char::is_control) {
+            return Err("Enter search terms.");
+        }
+        return Ok(engine.search(term));
+    }
+    resolve(input, engine)
+}
+
+fn resolve(input: &str, engine: SearchEngine) -> Result<String, &'static str> {
     let input = input.trim();
     if input == HOME {
         return Ok(HOME.into());
@@ -79,9 +168,7 @@ pub(crate) fn address(input: &str) -> Result<String, &'static str> {
     if explicit_scheme {
         return web_url(input);
     }
-    let mut search = Url::parse("https://duckduckgo.com/").expect("static search URL");
-    search.query_pairs_mut().append_pair("q", input);
-    Ok(search.into())
+    Ok(engine.search(input))
 }
 
 fn web_url(input: &str) -> Result<String, &'static str> {

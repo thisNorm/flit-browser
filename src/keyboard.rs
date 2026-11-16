@@ -61,7 +61,7 @@ pub(crate) fn shortcut(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<S
         (VK_L, true, false, false) | (VK_F6, false, false, false) | (VK_D, false, false, true) => {
             FocusAddress
         }
-        (VK_K, true, false, false) => FocusSearch,
+        (VK_K | VK_E, true, false, false) => FocusSearch,
         (VK_D, true, false, false) => Bookmark,
         (VK_O, true, true, false) => ManageBookmarks,
         (VK_T, true, false, false) => NewTab,
@@ -412,6 +412,7 @@ mod tests {
             (VK_G, true, true, false, Some(FindPrevious)),
             (VK_D, false, false, true, Some(FocusAddress)),
             (VK_K, true, false, false, Some(FocusSearch)),
+            (VK_E, true, false, false, Some(FocusSearch)),
             (VK_F3, false, false, false, Some(FindNext)),
             (VK_F3, false, true, false, Some(FindPrevious)),
             (VK_F11, false, false, false, Some(ToggleFullscreen)),

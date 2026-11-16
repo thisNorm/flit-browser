@@ -4,7 +4,7 @@ use crate::{
     download_guard,
     keyboard::{self, Shortcut},
     memory_sites::{self, SiteExceptions},
-    navigation::{self, HOME},
+    navigation::{self, HOME, SearchEngine},
     panel_motion::Motion,
     permissions,
     session::{self, Entry, Session, WindowState},
@@ -110,6 +110,8 @@ const EXIT_FLIT: usize = 172;
 const RECOVERY_COPY: usize = 173;
 const IMPORT_BOOKMARKS: usize = 174;
 const EXPORT_BOOKMARKS: usize = 175;
+const SEARCH_ENGINE_FIRST: usize = 176;
+const SEARCH_ENGINE_LAST: usize = SEARCH_ENGINE_FIRST + SearchEngine::ALL.len() - 1;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -299,6 +301,7 @@ thread_local! {
     static RESTORE_TABS: Cell<bool> = const { Cell::new(true) };
     static SIDEBAR_DEFAULT: Cell<bool> = const { Cell::new(true) };
     static DEFER_BACKGROUND: Cell<bool> = const { Cell::new(false) };
+    static SEARCH_ENGINE: Cell<SearchEngine> = const { Cell::new(SearchEngine::DuckDuckGo) };
     static MEMORY_SITES: RefCell<SiteExceptions> = RefCell::new(SiteExceptions::default());
     static RECOVERY_WINDOW: Cell<usize> = const { Cell::new(0) };
     static OPENING_SESSION: Cell<bool> = const { Cell::new(false) };
@@ -1071,6 +1074,11 @@ pub(crate) fn open(
     RESTORE_TABS.set(saved.as_ref().is_none_or(|state| state.restore));
     SIDEBAR_DEFAULT.set(saved.as_ref().is_none_or(|state| state.sidebar_open));
     DEFER_BACKGROUND.set(saved.as_ref().is_some_and(|state| state.defer_background));
+    SEARCH_ENGINE.set(
+        saved
+            .as_ref()
+            .map_or_else(SearchEngine::default, |state| state.search_engine),
+    );
     match SiteExceptions::load(profile) {
         Ok(sites) => MEMORY_SITES.with(|slot| *slot.borrow_mut() = sites),
         Err(error) => eprintln!("Flit Browser: Could not read memory exceptions: {error}"),
@@ -2261,7 +2269,7 @@ fn navigate() {
         return;
     };
     let raw = text(ui.address, 16_384);
-    let url = match navigation::address(&raw) {
+    let url = match navigation::address_bar(&raw, SEARCH_ENGINE.get()) {
         Ok(url) => url,
         Err(message) => {
             let label = wide(message);
@@ -2904,6 +2912,7 @@ fn session_from(mut primary: WindowState, mut additional_windows: Vec<WindowStat
         restore,
         sidebar_open: SIDEBAR_DEFAULT.get(),
         defer_background: DEFER_BACKGROUND.get(),
+        search_engine: SEARCH_ENGINE.get(),
     }
 }
 
@@ -3635,6 +3644,8 @@ fn show_menu(ui: Controls) {
         );
     }
     separator();
+    add(FOCUS_SEARCH, "Search the web\tCtrl+K", true);
+    add_search_engine_menu(menu, !private());
     add(SAVE_BOOKMARK, "Bookmark this page\tCtrl+D", !private());
     add(BOOKMARKS, "Manage bookmarks\tCtrl+Shift+O", !private());
     add(IMPORT_BOOKMARKS, "Import bookmarks from HTML…", !private());
@@ -3748,6 +3759,48 @@ fn show_menu(ui: Controls) {
         _ => unsafe {
             PostMessageW(ui.window, WM_COMMAND, selection, 0);
         },
+    }
+}
+
+fn add_search_engine_menu(menu: HMENU, enabled: bool) {
+    let choices = unsafe { CreatePopupMenu() };
+    if choices.is_null() {
+        return;
+    }
+    for (offset, (_, label)) in SearchEngine::ALL.into_iter().enumerate() {
+        unsafe {
+            AppendMenuW(
+                choices,
+                MF_STRING,
+                SEARCH_ENGINE_FIRST + offset,
+                wide(label).as_ptr(),
+            );
+        }
+    }
+    let current = SearchEngine::ALL
+        .iter()
+        .position(|(engine, _)| *engine == SEARCH_ENGINE.get());
+    if let Some(index) = current {
+        unsafe {
+            CheckMenuRadioItem(
+                choices,
+                SEARCH_ENGINE_FIRST as u32,
+                SEARCH_ENGINE_LAST as u32,
+                (SEARCH_ENGINE_FIRST + index) as u32,
+                MF_BYCOMMAND,
+            );
+        }
+    }
+    if unsafe {
+        AppendMenuW(
+            menu,
+            MF_POPUP | if enabled { 0 } else { MF_GRAYED },
+            choices as usize,
+            windows_sys::w!("Search engine"),
+        )
+    } == 0
+    {
+        unsafe { DestroyMenu(choices) };
     }
 }
 
@@ -4365,6 +4418,10 @@ unsafe extern "system" fn chrome_proc(
                 }
                 return 0;
             }
+            (TABS, VK_RETURN) if !ctrl && !shift && !alt => {
+                focus_page();
+                return 0;
+            }
             (_, VK_TAB) if !ctrl && !alt => {
                 if let Some(ui) = controls() {
                     let chain: Vec<_> = ui
@@ -4397,6 +4454,7 @@ unsafe extern "system" fn chrome_proc(
             },
             FILTER => filter_input(wp),
             FIND_TEXT => find_in_page(true, true),
+            TABS => (),
             _ => return unsafe { DefSubclassProc(hwnd, message, wp, lp) },
         }
         return 0;
@@ -4467,10 +4525,12 @@ unsafe extern "system" fn chrome_proc(
                             move_tab(drag.key, drop);
                         } else if !drag.dragging
                             && tab_point(hwnd, lp, false) == Some(drag.key)
-                            && with_shell(|s| !s.closing && s.active != Some(drag.key))
-                                == Some(true)
+                            && with_shell(|s| !s.closing) == Some(true)
                         {
-                            select_key(drag.key);
+                            if with_shell(|s| s.active != Some(drag.key)) == Some(true) {
+                                select_key(drag.key);
+                            }
+                            focus_page();
                         }
                     }
                     return 0;
@@ -4699,7 +4759,23 @@ unsafe extern "system" fn window_proc(
                 FOCUS_ADDRESS | FOCUS_SEARCH => {
                     reveal_toolbar(window);
                     if let Some(ui) = controls() {
-                        focus_control(ui.address, true);
+                        if id == FOCUS_SEARCH {
+                            // Treat leading '?' as visible search mode, even for a dotted term.
+                            set_text(ui.address, "? ");
+                            focus_control(ui.address, false);
+                            unsafe { SendMessageW(ui.address, EM_SETSEL, 2, 2) };
+                        } else {
+                            if text(ui.address, 16_384).trim_start().starts_with('?') {
+                                refresh(true);
+                            }
+                            focus_control(ui.address, true);
+                        }
+                    }
+                }
+                SEARCH_ENGINE_FIRST..=SEARCH_ENGINE_LAST if !private() => {
+                    let (engine, _) = SearchEngine::ALL[id - SEARCH_ENGINE_FIRST];
+                    if SEARCH_ENGINE.replace(engine) != engine {
+                        save_session();
                     }
                 }
                 FOCUS_FILTER => {

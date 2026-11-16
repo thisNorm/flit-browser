@@ -1,4 +1,4 @@
-use crate::navigation;
+use crate::navigation::{self, SearchEngine};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -42,6 +42,8 @@ pub(crate) struct Session {
     pub sidebar_open: bool,
     #[serde(default)]
     pub defer_background: bool,
+    #[serde(default, skip_serializing_if = "SearchEngine::is_default")]
+    pub search_engine: SearchEngine,
 }
 
 fn default_true() -> bool {
@@ -291,6 +293,7 @@ mod tests {
             restore: true,
             sidebar_open: true,
             defer_background: false,
+            search_engine: SearchEngine::default(),
         }
     }
 
@@ -331,6 +334,7 @@ mod tests {
                 restore: true,
                 sidebar_open: true,
                 defer_background: false,
+                search_engine: SearchEngine::default(),
             })
         );
     }
@@ -383,11 +387,28 @@ mod tests {
                 restore,
                 sidebar_open: !restore,
                 defer_background: restore,
+                search_engine: SearchEngine::Naver,
             };
             save(&profile.0, &empty).unwrap();
             assert_eq!(load(&profile.0), Some(empty));
             assert!(load(&other.0).is_none());
         }
+    }
+
+    #[test]
+    fn unknown_search_engine_keeps_existing_tabs() {
+        let profile = Profile::new();
+        fs::write(
+            profile.0.join(FILE_NAME),
+            br#"{"entries":[{"url":"https://example.com/","title":"page"}],"selected":0,"search_engine":"future_provider"}"#,
+        )
+        .unwrap();
+        let restored = load(&profile.0).unwrap();
+        assert_eq!(restored.search_engine, SearchEngine::DuckDuckGo);
+        assert_eq!(
+            restored.primary.entries,
+            [entry("https://example.com/", "page", false)]
+        );
     }
 
     #[test]
