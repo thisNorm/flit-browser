@@ -1,0 +1,19 @@
+/target/
+/bundle/
+/work/
+/evidence/
+/installer/Output/
+__pycache__/
+.env
+.env.*
+*.dll
+*.exe
+*.pak
+*.pfx
+*.pem
+*.key
+*.zip
+User Data/
+.flit-browser-profile
+session.json
+session.previous.json
