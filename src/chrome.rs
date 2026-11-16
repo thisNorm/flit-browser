@@ -73,6 +73,7 @@ pub(crate) enum ButtonKind {
     Back,
     Forward,
     Reload,
+    Stop,
     Go,
     NewTab,
     NewTabCompact,
@@ -518,6 +519,10 @@ fn button_icon(dc: HDC, kind: ButtonKind, center: (i32, i32), dpi: i32, color: C
                 );
             }
             stroke(dc, center, dpi, [(5, -7), (5, -3), (1, -3)]);
+        }
+        ButtonKind::Stop => {
+            stroke(dc, center, dpi, [(-5, -5), (5, 5)]);
+            stroke(dc, center, dpi, [(5, -5), (-5, 5)]);
         }
         ButtonKind::Go => stroke(dc, center, dpi, [(-3, -5), (2, 0), (-3, 5)]),
         ButtonKind::SiteInfo => {

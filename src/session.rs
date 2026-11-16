@@ -26,11 +26,15 @@ pub(crate) struct Entry {
 pub(crate) struct Session {
     pub entries: Vec<Entry>,
     pub selected: usize,
-    #[serde(default = "default_restore")]
+    #[serde(default = "default_true")]
     pub restore: bool,
+    #[serde(default = "default_true")]
+    pub sidebar_open: bool,
+    #[serde(default)]
+    pub defer_background: bool,
 }
 
-fn default_restore() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -107,7 +111,7 @@ pub(crate) fn validated(session: &Session) -> Session {
     Session {
         entries,
         selected,
-        restore: session.restore,
+        ..*session
     }
 }
 
@@ -200,6 +204,8 @@ mod tests {
                 ],
                 selected: 1,
                 restore: true,
+                sidebar_open: true,
+                defer_background: false,
             })
         );
     }
@@ -211,6 +217,8 @@ mod tests {
             entries: vec![entry("about:blank", "", false)],
             selected: 0,
             restore: true,
+            sidebar_open: true,
+            defer_background: false,
         };
         save(&profile.0, &initial).unwrap();
         assert_eq!(load(&profile.0), Some(initial));
@@ -230,6 +238,8 @@ mod tests {
                 entries,
                 selected,
                 restore: true,
+                sidebar_open: true,
+                defer_background: false,
             },
         )
         .unwrap();
@@ -248,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_restore_preference_even_without_tabs() {
+    fn keeps_browser_preferences_even_without_tabs() {
         let profile = Profile::new();
         let other = Profile::new();
         for restore in [false, true] {
@@ -256,6 +266,8 @@ mod tests {
                 entries: vec![],
                 selected: 0,
                 restore,
+                sidebar_open: !restore,
+                defer_background: restore,
             };
             save(&profile.0, &empty).unwrap();
             assert_eq!(load(&profile.0), Some(empty));

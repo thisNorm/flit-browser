@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 from windows_smoke import (
-    Browser, NEW_TAB, OwnedProcess, TAB_TITLE, TABS, WORKSPACE, Win32,
+    Browser, NEW_TAB, OwnedProcess, SIDEBAR_TOGGLE, TAB_TITLE, TABS, WORKSPACE, Win32,
     fixture, page_counts, require, until,
 )
 
@@ -107,6 +107,7 @@ def run(exe, work, evidence):
         try:
             with launch("seed", "/start") as browser:
                 browser.page("/start", require_request=True)
+                require(browser.win.visible(browser.controls[TABS]), "Fresh profile did not show vertical tabs")
                 for index, path in enumerate(("/tab", "/second"), start=1):
                     browser.click(NEW_TAB)
                     browser.wait(f"new tab {index}", lambda: browser.selected() == index)
@@ -115,13 +116,20 @@ def run(exe, work, evidence):
                 select(browser, 1)
                 browser.wait("pinned order and fixture titles", lambda: titles(browser) == TITLES)
                 require(browser.address() == site.origin + "/start", "Wrong tab selected after pin")
+                browser.click(SIDEBAR_TOGGLE)
+                browser.wait("vertical tabs collapse", lambda: not browser.win.visible(browser.controls[TABS]))
             state = session_is(profile, site, PATHS, selected=1)
             require(tuple(item["title"] for item in state["entries"]) == TITLES, "Tab titles were not saved")
+            require(state.get("sidebar_open") is False, "Sidebar preference was not saved")
 
             before = counts(PATHS)
             background = ("/tab", "/second")
             with launch("lazy_restore") as browser:
                 browser.page("/start", require_request=True, baseline=before["/start"])
+                require(not browser.win.visible(browser.controls[TABS]), "Sidebar reopened after restart")
+                evidence["collapsed_sidebar_restored"] = True
+                browser.click(SIDEBAR_TOGGLE)
+                browser.wait("vertical tabs expand", lambda: browser.win.visible(browser.controls[TABS]))
                 require(browser.selected() == 1 and titles(browser) == TITLES,
                         "Restore changed tab order, titles or selection")
                 report = browser.process.report

@@ -24,7 +24,11 @@ use windows_sys::Win32::{
         InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, RDW_ALLCHILDREN,
         RDW_INVALIDATE, RedrawWindow, ScreenToClient, UpdateWindow,
     },
-    System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_CENTERIMAGE},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
+        SystemServices::SS_CENTERIMAGE,
+    },
     UI::{
         Controls::*,
         HiDpi::{
@@ -94,6 +98,8 @@ const DEVTOOLS_CONSOLE: usize = 164;
 const CLOSE_WINDOW: usize = 165;
 const SITE_INFO: usize = 166;
 const FREE_MEMORY: usize = 167;
+const TOGGLE_DEFER_BACKGROUND: usize = 168;
+const RELOAD_SHORTCUT: usize = 169;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -102,6 +108,8 @@ const TAB_MENU_ACTION: u32 = WM_APP + 5;
 const TAB_CLOSE_CANCELLED: u32 = WM_APP + 6;
 const POPUP_CLOSED: u32 = WM_APP + 7;
 const OPEN_SETTINGS_WINDOW: u32 = WM_APP + 8;
+const LOAD_STATE_CHANGED: u32 = WM_APP + 9;
+const STOP_LOADING: u32 = WM_APP + 10;
 const TAB_PIN: usize = 1;
 const TAB_DUPLICATE: usize = 2;
 const TAB_MUTE: usize = 3;
@@ -192,6 +200,7 @@ struct Tab {
     has_audio_access: bool,
     back: bool,
     forward: bool,
+    loading: bool,
     pinned: bool,
     muted: bool,
     unloading: bool,
@@ -217,6 +226,8 @@ struct Shell {
     next_key: usize,
     sidebar_open: bool,
     sidebar_motion: Motion,
+    tooltip: HWND,
+    reload_is_stop: bool,
     filter: String,
     rows: Vec<Row>,
     font: HFONT,
@@ -247,6 +258,8 @@ thread_local! {
     static PROFILE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     static PRIVATE_CONTEXT: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESTORE_TABS: Cell<bool> = const { Cell::new(true) };
+    static SIDEBAR_DEFAULT: Cell<bool> = const { Cell::new(true) };
+    static DEFER_BACKGROUND: Cell<bool> = const { Cell::new(false) };
     static RECOVERY_WINDOW: Cell<usize> = const { Cell::new(0) };
     static EXIT_CODE: Cell<i32> = const { Cell::new(0) };
 }
@@ -325,7 +338,13 @@ fn browser_closed(window: usize, message: u32, key: usize) {
 }
 
 fn queue_session_save() {
-    if !RESTORE_TABS.get() || with_shell(|s| !s.private && !s.closing) != Some(true) {
+    if RESTORE_TABS.get() {
+        queue_profile_save();
+    }
+}
+
+fn queue_profile_save() {
+    if with_shell(|s| !s.private && !s.closing) != Some(true) {
         return;
     }
     if let Some(window) = normal_window() {
@@ -469,7 +488,7 @@ wrap_client! {
             Some(FlitLoad::new(self.window, self.key))
         }
         fn keyboard_handler(&self) -> Option<KeyboardHandler> {
-            Some(FlitKeyboard::new(self.window))
+            Some(FlitKeyboard::new(self.window, self.key))
         }
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(FlitRequest::new(self.window, self.key))
@@ -763,9 +782,16 @@ wrap_display_handler! {
 wrap_load_handler! {
     struct FlitLoad { window: usize, key: usize }
     impl LoadHandler {
-        fn on_loading_state_change(&self, _browser: Option<&mut Browser>, _loading: i32, back: i32, forward: i32) {
+        fn on_loading_state_change(&self, _browser: Option<&mut Browser>, loading: i32, back: i32, forward: i32) {
             let _scope = WindowScope::enter(self.window);
-            update_page(self.key, |tab| { tab.back = back != 0; tab.forward = forward != 0; });
+            let active = change(|s| {
+                let Some(tab) = s.tabs.iter_mut().find(|tab| tab.key == self.key) else { return false };
+                (tab.loading, tab.back, tab.forward) = (loading != 0, back != 0, forward != 0);
+                s.active == Some(self.key)
+            });
+            if active == Some(true) {
+                unsafe { PostMessageW(self.window as HWND, LOAD_STATE_CHANGED, self.key, 0); }
+            }
         }
         fn on_load_end(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _status: i32) {
             if let Some(frame) = frame {
@@ -777,7 +803,7 @@ wrap_load_handler! {
 }
 
 wrap_keyboard_handler! {
-    struct FlitKeyboard { window: usize }
+    struct FlitKeyboard { window: usize, key: usize }
     impl KeyboardHandler {
         fn on_pre_key_event(
             &self, _browser: Option<&mut Browser>, event: Option<&KeyEvent>,
@@ -797,6 +823,23 @@ wrap_keyboard_handler! {
             ) else { return 0 };
             unsafe { PostMessageW(self.window as HWND, WM_COMMAND, shortcut_command(command), 0); }
             1
+        }
+        fn on_key_event(
+            &self, browser: Option<&mut Browser>, event: Option<&KeyEvent>, _os_event: Option<&mut sys::MSG>,
+        ) -> i32 {
+            let modifiers = sys::cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0
+                | sys::cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0
+                | sys::cef_event_flags_t::EVENTFLAG_ALT_DOWN.0
+                | sys::cef_event_flags_t::EVENTFLAG_ALTGR_DOWN.0;
+            if event.is_some_and(|e| {
+                matches!(e.type_, KeyEventType::RAWKEYDOWN | KeyEventType::KEYDOWN)
+                    && e.windows_key_code == i32::from(VK_ESCAPE)
+                    && e.modifiers & modifiers as u32 == 0
+            }) && browser.is_some_and(|b| b.is_popup() == 0 && b.is_loading() != 0) {
+                unsafe { PostMessageW(self.window as HWND, STOP_LOADING, self.key, 0) }
+            } else {
+                0
+            }
         }
     }
 }
@@ -879,7 +922,7 @@ fn static_label(parent: HWND, id: usize, title: &str) -> HWND {
     )
 }
 
-fn tooltips(ui: Controls) {
+fn tooltips(ui: Controls) -> HWND {
     use windows_sys::w;
     let class = wide("tooltips_class32");
     let tip = unsafe {
@@ -899,7 +942,7 @@ fn tooltips(ui: Controls) {
         )
     };
     if tip.is_null() {
-        return;
+        return tip;
     }
     for (hwnd, text) in [
         (ui.sidebar, w!("Show or hide vertical tabs")),
@@ -926,6 +969,7 @@ fn tooltips(ui: Controls) {
             SendMessageW(tip, TTM_ADDTOOLW, 0, (&info as *const TTTOOLINFOW) as isize);
         }
     }
+    tip
 }
 
 fn icon(exe: HINSTANCE, width: i32, height: i32) -> HICON {
@@ -974,6 +1018,8 @@ pub(crate) fn open(
     PROFILE.with(|slot| slot.replace(Some(profile.to_owned())));
     let saved = session::load(profile);
     RESTORE_TABS.set(saved.as_ref().is_none_or(|state| state.restore));
+    SIDEBAR_DEFAULT.set(saved.as_ref().is_none_or(|state| state.sidebar_open));
+    DEFER_BACKGROUND.set(saved.as_ref().is_some_and(|state| state.defer_background));
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -1109,6 +1155,8 @@ fn open_window(
             windows_sys::w!("Find in page") as isize,
         );
     }
+    let tooltip = tooltips(ui);
+    let sidebar_open = SIDEBAR_DEFAULT.get();
     WINDOWS.with(|windows| {
         let id = NEXT_WINDOW_ID.get();
         NEXT_WINDOW_ID.set(id + 1);
@@ -1120,8 +1168,10 @@ fn open_window(
                 tabs: Vec::new(),
                 active: None,
                 next_key: 1,
-                sidebar_open: true,
-                sidebar_motion: Motion::new(true),
+                sidebar_open,
+                sidebar_motion: Motion::new(sidebar_open),
+                tooltip,
+                reload_is_stop: false,
                 filter: String::new(),
                 rows: Vec::new(),
                 font: null_mut(),
@@ -1153,7 +1203,6 @@ fn open_window(
     }
     let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
     chrome::apply_backdrop(window, 8 * dpi / 96);
-    tooltips(ui);
     layout();
     unsafe {
         ShowWindow(window, SW_SHOW);
@@ -1724,15 +1773,14 @@ fn refresh_rows(ensure_visible: bool) {
 
 fn refresh(force_address: bool) {
     refresh_rows(force_address);
-    let Some((ui, url, title, capture, back, forward, web)) = with_shell(|s| {
+    refresh_load_controls();
+    let Some((ui, url, title, capture, web)) = with_shell(|s| {
         let tab = s.tabs.iter().find(|t| Some(t.key) == s.active)?;
         Some((
             s.controls,
             tab.url.clone(),
             clean(&tab.title, 100),
             capture_labels(tab).map(|(_, caption)| caption),
-            tab.back,
-            tab.forward,
             tab.browser.is_some()
                 && (tab.url.starts_with("https://") || tab.url.starts_with("http://")),
         ))
@@ -1761,8 +1809,53 @@ fn refresh(force_address: bool) {
     }
     unsafe {
         EnableWindow(ui.site_info, i32::from(web));
+    }
+}
+
+fn refresh_load_controls() {
+    let Some((ui, tooltip, back, forward, loading, changed)) = change(|s| {
+        let (back, forward, loading) = s
+            .tabs
+            .iter()
+            .find(|t| Some(t.key) == s.active)
+            .map_or((false, false, false), |tab| {
+                (tab.back, tab.forward, tab.loading)
+            });
+        let changed = std::mem::replace(&mut s.reload_is_stop, loading) != loading;
+        (s.controls, s.tooltip, back, forward, loading, changed)
+    }) else {
+        return;
+    };
+    unsafe {
         EnableWindow(ui.back, i32::from(back));
         EnableWindow(ui.forward, i32::from(forward));
+    }
+    if changed {
+        set_text(ui.reload, if loading { "Stop loading" } else { "Reload" });
+        unsafe {
+            InvalidateRect(ui.reload, null(), 0);
+            if !tooltip.is_null() {
+                let info = TTTOOLINFOW {
+                    cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                    uFlags: TTF_IDISHWND,
+                    hwnd: ui.window,
+                    uId: ui.reload as usize,
+                    lpszText: (if loading {
+                        windows_sys::w!("Stop loading (Esc)")
+                    } else {
+                        windows_sys::w!("Reload (Ctrl+R)")
+                    })
+                    .cast_mut(),
+                    ..Default::default()
+                };
+                SendMessageW(
+                    tooltip,
+                    TTM_UPDATETIPTEXTW,
+                    0,
+                    (&info as *const TTTOOLINFOW) as isize,
+                );
+            }
+        }
     }
 }
 
@@ -1853,10 +1946,22 @@ fn open_tab(url: &str, foreground: bool) -> Result<(), &'static str> {
         select(index);
     } else {
         refresh_rows(false);
-        load_deferred(key)?;
+        if !DEFER_BACKGROUND.get() && !physical_memory_low() {
+            load_deferred(key)?;
+        }
     }
     queue_session_save();
     Ok(())
+}
+
+fn physical_memory_low() -> bool {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // Check only when opening a background link; never evict a loaded tab here.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    ok && status.ullAvailPhys < (status.ullTotalPhys / 16).clamp(512 << 20, 3 << 30)
 }
 
 fn append_tab(url: &str, title: &str, pinned: bool) -> Result<(usize, usize), &'static str> {
@@ -1906,6 +2011,7 @@ fn append_tab(url: &str, title: &str, pinned: bool) -> Result<(usize, usize), &'
             has_audio_access: false,
             back: false,
             forward: false,
+            loading: false,
             pinned,
             muted: false,
             unloading: false,
@@ -2147,6 +2253,7 @@ fn closed(key: usize) {
         tab.has_audio_access = false;
         tab.back = false;
         tab.forward = false;
+        tab.loading = false;
         Some((s.controls.window, s.closing))
     })
     .flatten()
@@ -2372,7 +2479,7 @@ fn close_window(window: HWND) {
         s.closing = true;
         s.pending_settings = None;
         s.memory_queue.clear();
-        s.closing_session = (!s.private).then(|| window_snapshot(s, true));
+        s.closing_session = (!s.private).then(|| window_snapshot(s));
         true
     }) == Some(true)
     {
@@ -2434,15 +2541,10 @@ fn continue_window_close(window: HWND) {
     } else if !waiting {
         if let Some(state) = change(|s| s.closing_session.take()).flatten() {
             if last_normal_window() {
-                if RESTORE_TABS.get() {
-                    store_session(&state);
-                } else {
-                    store_session(&Session {
-                        entries: Vec::new(),
-                        selected: 0,
-                        restore: false,
-                    });
-                }
+                store_session(state.clone());
+            } else if let Some(remaining) = normal_window() {
+                let _scope = WindowScope::enter(remaining as usize);
+                queue_profile_save();
             }
             if state.entries.iter().any(|entry| entry.url != HOME) && normal_window().is_some() {
                 let state = session::validated(&state);
@@ -2457,14 +2559,7 @@ fn continue_window_close(window: HWND) {
     }
 }
 
-fn window_snapshot(s: &Shell, restore: bool) -> Session {
-    if !restore {
-        return Session {
-            entries: Vec::new(),
-            selected: 0,
-            restore: false,
-        };
-    }
+fn window_snapshot(s: &Shell) -> Session {
     let mut entries = Vec::new();
     let mut selected = 0;
     for tab in &s.tabs {
@@ -2488,6 +2583,8 @@ fn window_snapshot(s: &Shell, restore: bool) -> Session {
         entries,
         selected,
         restore: true,
+        sidebar_open: SIDEBAR_DEFAULT.get(),
+        defer_background: DEFER_BACKGROUND.get(),
     }
 }
 
@@ -2496,10 +2593,17 @@ fn last_normal_window() -> bool {
         && WINDOWS.with(|windows| windows.borrow().values().filter(|s| !s.private).count() == 1)
 }
 
-fn store_session(state: &Session) {
+fn store_session(mut state: Session) {
+    state.sidebar_open = SIDEBAR_DEFAULT.get();
+    state.defer_background = DEFER_BACKGROUND.get();
+    state.restore = RESTORE_TABS.get();
+    if !state.restore {
+        state.entries.clear();
+        state.selected = 0;
+    }
     PROFILE.with(|slot| {
         if let Some(profile) = slot.borrow().as_deref() {
-            if let Err(error) = session::save(profile, state) {
+            if let Err(error) = session::save(profile, &state) {
                 eprintln!("Flit Browser: Could not save tabs: {error}");
             }
         }
@@ -2507,10 +2611,8 @@ fn store_session(state: &Session) {
 }
 
 fn save_session() {
-    if let Some(state) =
-        with_shell(|s| (!s.private).then(|| window_snapshot(s, RESTORE_TABS.get()))).flatten()
-    {
-        store_session(&state);
+    if let Some(state) = with_shell(|s| (!s.private).then(|| window_snapshot(s))).flatten() {
+        store_session(state);
     }
 }
 
@@ -2621,8 +2723,12 @@ unsafe extern "system" fn start_proc(
 }
 
 fn toggle_sidebar() {
-    if let Some(open) = with_shell(|s| s.sidebar_open) {
+    if let Some((open, private)) = with_shell(|s| (s.sidebar_open, s.private)) {
         set_sidebar(!open, true);
+        if !private {
+            SIDEBAR_DEFAULT.set(!open);
+            queue_profile_save();
+        }
     }
 }
 
@@ -3106,6 +3212,20 @@ fn show_menu(ui: Controls) {
         "Free memory from background tabs…",
         !background_tabs_for_release().is_empty(),
     );
+    unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING
+                | if DEFER_BACKGROUND.get() {
+                    MF_CHECKED
+                } else {
+                    0
+                }
+                | if private() { MF_GRAYED } else { 0 },
+            TOGGLE_DEFER_BACKGROUND,
+            windows_sys::w!("Load background links only when selected"),
+        );
+    }
     separator();
     add(SAVE_BOOKMARK, "Bookmark this page\tCtrl+D", !private());
     add(BOOKMARKS, "Manage bookmarks\tCtrl+Shift+O", !private());
@@ -3206,7 +3326,7 @@ fn shortcut_command(action: Shortcut) -> usize {
         Shortcut::RestoreTab => RESTORE_TAB,
         Shortcut::CloseTab => CLOSE_TAB,
         Shortcut::CloseWindow => CLOSE_WINDOW,
-        Shortcut::Reload => RELOAD,
+        Shortcut::Reload => RELOAD_SHORTCUT,
         Shortcut::HardReload => HARD_RELOAD,
         Shortcut::Back => BACK,
         Shortcut::Forward => FORWARD,
@@ -3613,6 +3733,16 @@ unsafe extern "system" fn chrome_proc(
                 close_find(true);
                 return 0;
             }
+            (_, VK_ESCAPE) if !ctrl && !shift && !alt => {
+                if let Some((key, true)) =
+                    with_shell(|s| Some((s.active?, s.reload_is_stop))).flatten()
+                {
+                    unsafe {
+                        PostMessageW(parent as HWND, STOP_LOADING, key, 0);
+                    }
+                    return 0;
+                }
+            }
             (TABS, VK_DELETE) => {
                 let index = unsafe { SendMessageW(hwnd, LB_GETCURSEL, 0, 0) };
                 if index >= 0 {
@@ -3759,7 +3889,7 @@ unsafe extern "system" fn window_proc(
             }
             if RECOVERY_WINDOW.get() == window as usize {
                 RECOVERY_WINDOW.set(0);
-                if RESTORE_TABS.get() && with_shell(|s| !s.private && !s.closing) == Some(true) {
+                if with_shell(|s| !s.private && !s.closing) == Some(true) {
                     save_session();
                 }
             }
@@ -3789,6 +3919,7 @@ unsafe extern "system" fn window_proc(
                 SIDEBAR => ButtonKind::Sidebar,
                 BACK => ButtonKind::Back,
                 FORWARD => ButtonKind::Forward,
+                RELOAD if with_shell(|s| s.reload_is_stop) == Some(true) => ButtonKind::Stop,
                 RELOAD => ButtonKind::Reload,
                 GO => ButtonKind::Go,
                 SAVE_BOOKMARK => ButtonKind::Bookmark,
@@ -3848,7 +3979,12 @@ unsafe extern "system" fn window_proc(
                         b.go_forward();
                     }
                 }
-                RELOAD | HARD_RELOAD => {
+                RELOAD if with_shell(|s| s.reload_is_stop) == Some(true) => {
+                    if let Some(b) = active() {
+                        b.stop_load();
+                    }
+                }
+                RELOAD | RELOAD_SHORTCUT | HARD_RELOAD => {
                     cancel_active_permission(window);
                     refresh(true);
                     if let Some(b) = active() {
@@ -3862,6 +3998,10 @@ unsafe extern "system" fn window_proc(
                 CLOSE_TAB => close_tab(None),
                 RESTORE_TAB => reopen_closed(),
                 FREE_MEMORY => free_background_memory(window),
+                TOGGLE_DEFER_BACKGROUND if !private() => {
+                    DEFER_BACKGROUND.set(!DEFER_BACKGROUND.get());
+                    queue_profile_save();
+                }
                 SIDEBAR => {
                     reveal_toolbar(window);
                     toggle_sidebar();
@@ -4080,6 +4220,20 @@ unsafe extern "system" fn window_proc(
         PAGE_CHANGED => {
             refresh(false);
             queue_session_save();
+            0
+        }
+        LOAD_STATE_CHANGED => {
+            if with_shell(|s| s.active == Some(wp)) == Some(true) {
+                refresh_load_controls();
+            }
+            0
+        }
+        STOP_LOADING => {
+            if with_shell(|s| s.active == Some(wp) && !s.closing) == Some(true) {
+                if let Some(browser) = active().filter(|b| b.is_loading() != 0) {
+                    browser.stop_load();
+                }
+            }
             0
         }
         PAGE_CLOSED => {
