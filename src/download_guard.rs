@@ -67,13 +67,17 @@ wrap_download_handler! {
             }
             let id = (self.window, self.key, browser.identifier(), item.id());
             let in_progress = item.is_in_progress() != 0;
-            ACTIVE.with(|items| {
+            let ended = ACTIVE.with(|items| {
                 if in_progress {
                     items.borrow_mut().insert(id);
+                    false
                 } else {
-                    items.borrow_mut().remove(&id);
+                    items.borrow_mut().remove(&id)
                 }
             });
+            if ended && self.key != 0 {
+                crate::window::download_ended(self.window, self.key, item.is_complete() != 0);
+            }
         }
     }
 }

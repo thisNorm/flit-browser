@@ -121,6 +121,7 @@ const OPEN_SETTINGS_WINDOW: u32 = WM_APP + 8;
 const LOAD_STATE_CHANGED: u32 = WM_APP + 9;
 const STOP_LOADING: u32 = WM_APP + 10;
 const EXIT_NEXT_WINDOW: u32 = WM_APP + 11;
+const TAB_DOWNLOAD_ENDED: u32 = WM_APP + 12;
 const TAB_PIN: usize = 1;
 const TAB_DUPLICATE: usize = 2;
 const TAB_MUTE: usize = 3;
@@ -129,6 +130,7 @@ const TAB_UNLOAD: usize = 5;
 const TAB_KEEP_SITE: usize = 6;
 const TAB_MOVE_UP: usize = 7;
 const TAB_MOVE_DOWN: usize = 8;
+const TAB_CANCEL_DEFERRED_CLOSE: usize = 9;
 const WINDOW_CLASS: &str = "FlitBrowserWindow";
 const APP_TITLE: &str = "Flit Browser";
 const PRIVATE_TITLE: &str = "Flit Browser — Private";
@@ -214,6 +216,13 @@ struct TabDrag {
     target: Option<TabDrop>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadClose {
+    None,
+    Asking,
+    Waiting,
+}
+
 struct Tab {
     key: usize,
     panel: HWND,
@@ -221,6 +230,7 @@ struct Tab {
     native_window: Option<Window>,
     native_close_sent: bool,
     close_requested: bool,
+    download_close: DownloadClose,
     retiring: bool,
     url: String,
     title: String,
@@ -1813,7 +1823,9 @@ fn refresh_rows(ensure_visible: bool) {
                     || tab.url.to_lowercase().contains(&s.filter))
                 .then(|| Row {
                     key: tab.key,
-                    label: if let Some((capture, _)) = capture_labels(tab) {
+                    label: if tab.download_close == DownloadClose::Waiting {
+                        format!("After download — {label}")
+                    } else if let Some((capture, _)) = capture_labels(tab) {
                         format!("{capture} — {label}")
                     } else {
                         label
@@ -2102,6 +2114,7 @@ fn append_tab(url: &str, title: &str, pinned: bool) -> Result<(usize, usize), &'
             native_window: None,
             native_close_sent: false,
             close_requested: false,
+            download_close: DownloadClose::None,
             retiring: false,
             url: url.to_owned(),
             title: title.to_owned(),
@@ -2532,22 +2545,105 @@ fn close_embedded_page(window: HWND, key: usize) {
     .execute();
 }
 
+fn tab_download_close(window: HWND, key: usize, count: usize) {
+    change(|s| {
+        if let Some(tab) = s.tabs.iter_mut().find(|t| t.key == key) {
+            tab.download_close = DownloadClose::Asking;
+        }
+    });
+    let message = wide(&format!(
+        "Downloads in progress: {count}\nClosing this tab now may interrupt them.\n\nClose this tab after the downloads finish?"
+    ));
+    let confirmed = unsafe {
+        MessageBoxW(
+            window,
+            message.as_ptr(),
+            windows_sys::w!("Download in progress"),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    } == IDYES;
+    let confirmed = confirmed && !exiting();
+    let scheduled = change(|s| {
+        let Some(tab) = s
+            .tabs
+            .iter_mut()
+            .find(|t| t.key == key && t.download_close == DownloadClose::Asking)
+        else {
+            return false;
+        };
+        let schedule = confirmed && !s.closing && !tab.retiring && !tab.close_requested;
+        tab.download_close = if schedule {
+            DownloadClose::Waiting
+        } else {
+            DownloadClose::None
+        };
+        schedule
+    }) == Some(true);
+    if scheduled {
+        complete_deferred_close(window, key);
+    }
+}
+
+pub(crate) fn download_ended(window: usize, key: usize, complete: bool) {
+    let _scope = WindowScope::enter(window);
+    let waiting = change(|s| {
+        let Some(tab) = s.tabs.iter_mut().find(|t| t.key == key) else {
+            return false;
+        };
+        let waiting = tab.download_close == DownloadClose::Waiting;
+        if !complete {
+            // Leave unsuccessful or canceled downloads' tabs available for retry.
+            tab.download_close = DownloadClose::None;
+        }
+        waiting
+    }) == Some(true);
+    if waiting {
+        // Closing the source must happen after the CEF download callback returns.
+        unsafe { PostMessageW(window as HWND, TAB_DOWNLOAD_ENDED, key, 0) };
+    }
+}
+
+fn complete_deferred_close(window: HWND, key: usize) {
+    let done = download_guard::count(window as usize, Some(key)) == 0;
+    let close = done
+        && change(|s| {
+            let Some(tab) = s
+                .tabs
+                .iter_mut()
+                .find(|t| t.key == key && t.download_close == DownloadClose::Waiting)
+            else {
+                return false;
+            };
+            tab.download_close = DownloadClose::None;
+            !s.closing
+        }) == Some(true);
+    refresh_rows(false);
+    if close && !exiting() {
+        close_tab(Some(key));
+    }
+}
+
 fn close_tab(key: Option<usize>) {
     let Some((window, key, loaded)) = with_shell(|s| {
         if s.closing {
             return None;
         }
         let key = key.or(s.active)?;
-        let tab = s
-            .tabs
-            .iter()
-            .find(|t| t.key == key && !t.unloading && !t.retiring && !t.close_requested)?;
+        let tab = s.tabs.iter().find(|t| {
+            t.key == key
+                && !t.unloading
+                && !t.retiring
+                && !t.close_requested
+                && t.download_close == DownloadClose::None
+        })?;
         Some((s.controls.window, key, tab.browser.is_some()))
     })
     .flatten() else {
         return;
     };
-    if !confirm_download_close(window, Some(key)) {
+    let count = download_guard::count(window as usize, Some(key));
+    if count != 0 {
+        tab_download_close(window, key, count);
         return;
     }
     permissions::cancel_tab(window as usize, key);
@@ -2561,7 +2657,7 @@ fn close_tab(key: Option<usize>) {
 fn close_window(window: HWND) {
     if exiting()
         || with_shell(|s| s.closing) != Some(false)
-        || !confirm_download_close(window, None)
+        || !confirm_window_download_close(window)
     {
         return;
     }
@@ -2693,14 +2789,13 @@ fn advance_exit(closed: HWND) {
     }
 }
 
-fn confirm_download_close(window: HWND, tab: Option<usize>) -> bool {
-    let count = download_guard::count(window as usize, tab);
+fn confirm_window_download_close(window: HWND) -> bool {
+    let count = download_guard::count(window as usize, None);
     if count == 0 {
         return true;
     }
-    let target = if tab.is_some() { "tab" } else { "window" };
     let message = wide(&format!(
-        "Downloads in progress: {count}\nClosing this {target} may interrupt them. Close anyway?"
+        "Downloads in progress: {count}\nClosing this window may interrupt them. Close anyway?"
     ));
     unsafe {
         MessageBoxW(
@@ -3850,23 +3945,26 @@ fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
     let Some(key) = key else {
         return;
     };
-    let Some((pinned, muted, copyable, unloadable, up, down, site)) = with_shell(|s| {
-        let tab = s.tabs.iter().find(|t| t.key == key)?;
-        Some((
-            tab.pinned,
-            tab.muted,
-            session::stored_url(&tab.url).is_some(),
-            can_unload(s, tab),
-            adjacent_tab(s, key, false).is_some(),
-            adjacent_tab(s, key, true).is_some(),
-            if s.private {
-                None
-            } else {
-                memory_sites::host(&tab.url)
-            },
-        ))
-    })
-    .flatten() else {
+    let Some((pinned, muted, copyable, unloadable, up, down, site, close_later)) =
+        with_shell(|s| {
+            let tab = s.tabs.iter().find(|t| t.key == key)?;
+            Some((
+                tab.pinned,
+                tab.muted,
+                session::stored_url(&tab.url).is_some(),
+                can_unload(s, tab),
+                adjacent_tab(s, key, false).is_some(),
+                adjacent_tab(s, key, true).is_some(),
+                if s.private {
+                    None
+                } else {
+                    memory_sites::host(&tab.url)
+                },
+                tab.download_close == DownloadClose::Waiting,
+            ))
+        })
+        .flatten()
+    else {
         return;
     };
     let menu = unsafe { CreatePopupMenu() };
@@ -3884,7 +3982,15 @@ fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
         (TAB_UNLOAD, "Unload tab to free memory…", unloadable),
         (TAB_MOVE_UP, "Move tab up", up),
         (TAB_MOVE_DOWN, "Move tab down", down),
-        (TAB_CLOSE, "Close tab", true),
+        if close_later {
+            (
+                TAB_CANCEL_DEFERRED_CLOSE,
+                "Keep tab open after downloads",
+                true,
+            )
+        } else {
+            (TAB_CLOSE, "Close tab", true)
+        },
     ] {
         unsafe {
             AppendMenuW(
@@ -3938,6 +4044,7 @@ fn can_unload(s: &Shell, tab: &Tab) -> bool {
     !s.closing
         && !tab.unloading
         && !tab.close_requested
+        && tab.download_close == DownloadClose::None
         && Some(tab.key) != s.active
         && tab.browser.is_some()
         && (tab.url.starts_with("http://") || tab.url.starts_with("https://"))
@@ -4150,6 +4257,22 @@ fn tab_action(key: usize, action: usize) {
             }
         }
         TAB_CLOSE => close_tab(Some(key)),
+        TAB_CANCEL_DEFERRED_CLOSE => {
+            if change(|s| {
+                let Some(tab) = s
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.key == key && t.download_close == DownloadClose::Waiting)
+                else {
+                    return false;
+                };
+                tab.download_close = DownloadClose::None;
+                true
+            }) == Some(true)
+            {
+                refresh_rows(false);
+            }
+        }
         TAB_UNLOAD => unload_tab(key),
         _ => {}
     }
@@ -4729,6 +4852,10 @@ unsafe extern "system" fn window_proc(
             if !exiting() {
                 tab_action(wp, lp as usize);
             }
+            0
+        }
+        TAB_DOWNLOAD_ENDED => {
+            complete_deferred_close(window, wp);
             0
         }
         TAB_CLOSE_CANCELLED => {

@@ -2,8 +2,8 @@
 setlocal EnableExtensions DisableDelayedExpansion
 rem Release settings: set the repository before publishing this file.
 set "FLIT_INSTALL_REPO=OWNER/REPO"
-set "FLIT_INSTALL_TAG=v0.15.0"
-set "FLIT_INSTALL_SHA256=4f4bed836ccc0a5bd5a179d8fbb91ee07f20efb6b7e51bd3e2977c2049a9460b"
+set "FLIT_INSTALL_TAG=v0.16.0"
+set "FLIT_INSTALL_SHA256=8fff7197e5e5ae302fe0b4bab5b3149b5185ac7630a6eb3cb63e67b8240a8a0b"
 set "FLIT_INSTALL_DIR=%~dp0"
 rem Use Windows PowerShell modules even when launched from PowerShell 7.
 set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
