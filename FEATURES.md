@@ -2,7 +2,7 @@
 
 CEF는 Chromium의 렌더링, 네트워크, 프로필 저장소를 제공한다. 탭 목록, 단축키, 시작 방식처럼 실제 사용자가 조작하는 흐름은 Flit이 연결한다. 비교 기준은 [Chrome의 탭 관리](https://support.google.com/chrome/answer/2391819?co=GENIE.Platform%3DDesktop&hl=en), [북마크 가져오기](https://support.google.com/chrome/answer/96816?hl=en), [시작 시 복원](https://support.google.com/chrome/answer/95314), [사이트 권한](https://support.google.com/chrome/answer/114662), [Edge의 절전 탭](https://support.microsoft.com/en-us/edge/learn-about-performance-features-in-microsoft-edge)이다.
 
-검증 기록은 각 결과를 확인한 버전으로 연결했다.
+아래 표는 개발 중 확인한 사용 흐름과 검증 범위를 정리한 것이다. 소스 저장소의 `tests/`에 Windows용 테스트가 있다.
 
 | 사용 흐름 | Flit 0.32.0 | 확인 범위 |
 | --- | --- | --- |

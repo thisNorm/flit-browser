@@ -12,32 +12,30 @@ Windows 11 x64에서 `FlitSetup-x64.exe`를 실행하면 내 계정에 Flit Brow
 .\Install-Flit.cmd
 ```
 
-현재 제공한 스크립트는 저장소 설정 전이므로 `FlitSetup-x64.exe`와 같은 폴더에서 실행한다. GitHub CLI나 PowerShell 실행 정책 변경은 필요 없다.
+소스에 들어 있는 스크립트는 템플릿이다. 아래 빌드 단계에서 생성된 스크립트와 `FlitSetup-x64.exe`를 같은 폴더에 두고 실행한다. GitHub CLI나 PowerShell 실행 정책 변경은 필요 없다.
 
-공개 후에는 GitHub 릴리스에서 스크립트만 받아도 된다. 정식 릴리스의 최신 스크립트를 명령어로 받으려면 실제 `OWNER/REPO`로 바꿔 실행한다.
+설치 파일이 GitHub Releases에 올라온 뒤에는 스크립트만 내려받아 설치할 수 있다.
 
 ```powershell
-curl.exe -fLO 'https://github.com/OWNER/REPO/releases/latest/download/Install-Flit.cmd'
+curl.exe -fLO 'https://github.com/thisNorm/flit-browser/releases/latest/download/Install-Flit.cmd'
 ```
 
 ## GitHub에 올리기
 
-1. 빌드하기 전에 `Install-Flit.cmd`의 `FLIT_INSTALL_REPO`에 공개 저장소의 `OWNER/REPO`를 넣는다. 빌드가 출력 폴더의 스크립트에 설치 EXE의 버전과 SHA-256을 넣는다.
+1. 빌드하기 전에 `Install-Flit.cmd`의 `FLIT_INSTALL_REPO`에 `thisNorm/flit-browser`를 넣는다. 빌드가 출력 폴더의 스크립트에 설치 EXE의 버전과 SHA-256을 넣는다.
 2. GitHub **Releases**에서 빌드한 버전의 릴리스(예: `v0.32.0`)에 출력 폴더의 `Install-Flit.cmd`, `FlitSetup-x64.exe`, `FlitSetup-x64.exe.sha256`를 첨부한다.
 3. 공개 후 별도 폴더에 `Install-Flit.cmd`만 내려받아 설치 화면까지 열리는지 확인한다.
 
-최신 정식 릴리스를 찾아 무인 설치하려면 `.\Install-Flit.ps1 -Repository OWNER/REPO -Silent`를 사용한다. [GitHub 릴리스 다운로드 링크](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)
+설치 파일을 제공하는 최신 정식 릴리스가 생긴 뒤에는 `.\Install-Flit.ps1 -Repository thisNorm/flit-browser -Silent`로 무인 설치할 수 있다. [GitHub 릴리스 다운로드 링크](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)
 
 설치 이후 Flit과 CEF를 함께 갱신하는 [서명된 자동 업데이트 채널](UPDATES.md)은 별도로 설정한다.
 
 ## 설치 파일 빌드
 
-1. 툴체인 기록의 Rust x64/CEF 환경에서 `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS`를 `-C target-feature=+crt-static`으로 설정한 뒤 `cargo build --release --locked --target x86_64-pc-windows-msvc`를 실행한다.
-2. 0.6.0 런타임 기록의 CEF Windows x64 배포본에서 `Release`의 런타임, `Resources`의 리소스·로캘, 루트의 `LICENSE.txt`와 `CREDITS.html`을 한 디렉터리에 모은다. 그 경로와 새 `flit.dll`을 `tools/New-WindowsBundle.ps1`에 넘긴다. Rust 의존성 고지(`third-party-licenses`)를 포함하고 사용자 프로필과 도구 캐시는 넣지 않는다.
+1. [README의 빌드 절차](../README.md#빌드)에 따라 `flit.dll`을 빌드한다.
+2. [CEF 158.0.3 Windows x64 minimal 배포본](https://cef-builds.spotifycdn.com/cef_binary_158.0.3%2Bg8c29be2%2Bchromium-158.0.8127.18_windows64_beta_minimal.tar.bz2)에서 `Release`의 부트스트랩과 런타임, `Resources`의 리소스·로캘, 루트의 `LICENSE.txt`와 `CREDITS.html`을 한 디렉터리에 모은다. 저장소 루트에서 `tools/New-WindowsBundle.ps1`의 `-CefRuntime`에 이 경로를, `-FlitDll`에 새 DLL을, `-Destination`에 새 번들 경로를 넘긴다. 설치 파일로 배포할 때 번들에 Rust 의존성 고지(`third-party-licenses`)를 포함한다.
 3. [Inno Setup 7.1.1](https://github.com/jrsoftware/issrc/releases/tag/is-7_1_1)의 `ISCC.exe` 경로와 번들 경로를 넘긴다. 새 출력 폴더에 설치 EXE, 버전과 SHA-256이 맞는 스크립트, `.sha256` 파일이 함께 생긴다. Windows 서명 등으로 EXE를 수정하면 최종 파일로 SHA-256과 스크립트를 다시 맞춰야 한다.
 
 ```powershell
-.\Build-Setup.ps1 -IsccPath 'C:\Tools\Inno Setup\ISCC.exe' -BundleDir 'C:\Build\Flit-Browser' -OutputDir 'C:\Build\release'
+.\installer\Build-Setup.ps1 -IsccPath 'C:\Tools\Inno Setup\ISCC.exe' -BundleDir 'C:\Build\Flit-Browser' -OutputDir 'C:\Build\release'
 ```
-
-0.31.0 설치 파일 빌드와 SHA-256 · 이전 테스트 프로필 업그레이드 · 초기 설치·제거와 브라우저 실행 검증

@@ -1,6 +1,8 @@
 # Flit Browser 0.32.0 · Windows 개발 미리보기
 
-0.32.0 실행 미리보기는 Windows 11 x64에서 미리보기 폴더의 실행 바로가기로 연다. 별도 프로필을 사용한다. 설치 번들을 빌드한 경우 **Install-Flit.cmd** 또는 **FlitSetup-x64.exe**로 설치·업데이트하며, 시작 메뉴에서 **Flit Browser**를 연다. [설치 및 GitHub 배포 방법](installer/README.md)
+Flit은 Windows 11 x64용 브라우저입니다. 왼쪽 세로 탭을 기본으로 쓰고, 빈 탭과 뒤에서 열리는 링크는 필요할 때 페이지를 로드해 메모리 사용량을 줄입니다.
+
+이 저장소에는 소스와 빌드 스크립트가 있습니다. 실행본은 아래에서 빌드할 수 있습니다. [설치 파일 만들기](installer/README.md)
 
 AI가 일반 창과 분리된 작업 탭에서 페이지의 본문과 링크를 읽고, 0.12부터 지원되는 사이트에서는 Flit Vault로 로그인할 수 있다. [Codex 연결과 Vault 사용법](AGENT.md)
 
@@ -44,22 +46,25 @@ AI가 일반 창과 분리된 작업 탭에서 페이지의 본문과 링크를 
 
 ## 범위
 
-현재 빌드는 **Rust + Win32 + CEF Chrome Runtime**이다. 빈 탭에는 웹 렌더러를 만들지 않고 주소를 열 때만 Chromium 탭을 만든다. 이번 빌드는 **CEF 158.0.3 베타**를 사용한다. [색과 RAM 설계](DESIGN.md) · 엔진 확인 기록
+현재 빌드는 **Rust + Win32 + CEF Chrome Runtime**이다. 빈 탭에는 웹 렌더러를 만들지 않고 주소를 열 때만 Chromium 탭을 만든다. 0.32.0은 **CEF 158.0.3 베타**로 검증했다. [창 UI와 메모리 설계](DESIGN.md)
 
-0.10.0의 변경 사항은 동작과 RAM 점검에 정리했다. 0.9.0과 Aside의 메모리 실측은 같은 로컬 페이지를 각각 새 프로필에서 불러와 비교한 결과다.
+Chrome 웹 스토어 직접 설치와 패스키는 지원하지 않는다. AI 작업 탭은 읽기·링크 이동·일부 HTTPS 폼 로그인을 지원한다. 기존 사용자 탭 인계와 다단계 로그인은 지원하지 않는다. 카메라·마이크 확인창은 가상 장치로 검사했으며 알림 허용·실제 화면 공유는 검증하지 않았다. 복원은 URL을 다시 여는 기능이며, 페이지 내부 입력이나 뒤로 가기 이력은 복원하지 않는다. 현재는 서명되지 않은 개발 미리보기다.
 
-Chrome 웹 스토어, 패스키, 실제 사이트 로그인 호환성, Microsoft 한국어 IME로 직접 타이핑하는 흐름, Exact 통합은 아직 확인하지 않았다. AI 작업 탭은 읽기·링크 이동·일부 HTTPS 폼 로그인을 지원한다. 기존 사용자 탭 인계와 다단계 로그인은 지원하지 않는다. 카메라·마이크 확인창은 가상 장치로 검사했으며 알림 허용·실제 화면 공유는 검증하지 않았다. 복원은 URL을 다시 여는 기능이며, 페이지 내부 입력이나 뒤로 가기 이력은 복원하지 않는다. 현재는 서명되지 않은 개발 미리보기다.
-
-[기능 비교 및 검증 범위](FEATURES.md) · 0.32.0 다운로드·확장 프로그램 검증 · 0.31.0 창 닫기·새 탭 양식·RAM 실측 · [사이트와 북마크 옮기기](MOVE-SITES.md) · [비밀번호 가져오기](PASSWORD-IMPORT.md)
+[기능과 검증 범위](FEATURES.md) · [사이트와 북마크 옮기기](MOVE-SITES.md) · [비밀번호 가져오기](PASSWORD-IMPORT.md)
 
 ## 빌드
 
-[Rust CEF 바인딩](https://github.com/tauri-apps/cef-rs/tree/9aa78c450489eddb828eb982eaee6c104a89d348) `156.4.0+156.0.26`과 Rust `1.100.0`으로 API `15600`을 대상으로 컴파일한다. 배포할 때는 동일한 API를 지원하는 CEF `158.0.3+g8c29be2` / Chromium `158.0.8127.18`의 Windows x64 부트스트랩과 런타임을 묶는다. 저장소 루트에서 실행한다.
+Windows에서 Rust의 MSVC 도구 체인과 Visual Studio C++ Build Tools(Windows SDK 및 CMake 포함)를 준비한다. 저장소 루트에서 x64 개발자 PowerShell을 연다. [Rust CEF 바인딩](https://github.com/tauri-apps/cef-rs/tree/9aa78c450489eddb828eb982eaee6c104a89d348) `156.4.0+156.0.26`과 Rust `1.100.0`으로 API `15600`을 대상으로 검증했다.
 
-~~~bash
-export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS='-C target-feature=+crt-static'
+~~~powershell
+rustup target add x86_64-pc-windows-msvc
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
 cargo test --release --locked --target x86_64-pc-windows-msvc --lib
 cargo build --release --locked --target x86_64-pc-windows-msvc
 ~~~
 
-툴체인 기록과 [설치 파일 빌드 안내](installer/README.md)를 참고한다. `tests/windows_*.py`는 별도의 테스트 프로필로 실행한다. `tests/windows_shortcuts.py --exe <Flit.exe>`는 잠금이 풀린 Windows에서 실제 키 입력을 검사한다. `tests/windows_memory.py`는 두 버전을 같은 로컬 페이지와 탭 상태로 비교한다.
+빌드 결과는 `target/x86_64-pc-windows-msvc/release/flit.dll`이다. [설치 파일 빌드 안내](installer/README.md)에 따라 CEF 런타임과 함께 실행 번들을 준비한다. `tests/windows_*.py`는 별도 테스트 프로필로 실행한다. 예를 들어 저장소 루트에서 아래처럼 다운로드 UI를 검사할 수 있다.
+
+~~~powershell
+python tests/windows_downloads_toolbar.py --exe .\bundle\Flit.exe --work .\work
+~~~

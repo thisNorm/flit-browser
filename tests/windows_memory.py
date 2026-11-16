@@ -1,6 +1,6 @@
 """Compare owned native Flit trees: one local page, six tabs, then one again.
 
-python -B windows_memory.py --wait-candidate
+This requires historical builds and an external PowerShell collector.
 The default adds five empty tabs; --extra-tabs fixture instead loads all six.
 Only the newly created evidence JSON is written; profiles use temporary dirs.
 """
@@ -18,7 +18,7 @@ import tempfile
 import time
 
 sys.dont_write_bytecode = True
-from windows_smoke import OwnedProcess, WORKSPACE, Win32, fixture, require, until
+from windows_smoke import OwnedProcess, Win32, fixture, require, until
 
 
 def utc():
@@ -186,11 +186,10 @@ def run_version(label, exe, site, collector, args, result):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", type=Path, default=WORKSPACE / "work/flit-setup/payload/Flit.exe")
-    parser.add_argument("--candidate", type=Path, default=WORKSPACE / "work/flit-0.2.0/Flit-Browser/Flit.exe")
-    parser.add_argument("--collector", type=Path, default=WORKSPACE /
-                        "outputs/flit-browser-phase0/experiments/Measure-Browser.ps1")
-    parser.add_argument("--evidence", type=Path, default=WORKSPACE / "work/flit-0.2.0/memory-comparison.json")
+    parser.add_argument("--baseline", type=Path, required=True, help="staged historical baseline Flit.exe")
+    parser.add_argument("--candidate", type=Path, required=True, help="staged historical candidate Flit.exe")
+    parser.add_argument("--collector", type=Path, required=True, help="path to a compatible Measure-Browser.ps1")
+    parser.add_argument("--evidence", type=Path, required=True, help="output JSON path")
     parser.add_argument("--sample-seconds", type=float, default=1)
     parser.add_argument("--settle-seconds", type=float, default=2)
     parser.add_argument("--extra-tabs", choices=("blank", "fixture"), default="blank")

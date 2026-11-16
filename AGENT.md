@@ -8,8 +8,6 @@ codex mcp add flit -- "$env:LOCALAPPDATA\Programs\Flit Browser\Flit.exe" --flit-
 
 예: “Flit으로 https://www.rust-lang.org/ 를 열고 본문을 읽어. 확인이 끝나면 네가 연 탭을 닫아.” MCP를 지원하는 다른 도구에서도 명령은 `Flit.exe`, 인수는 `--flit-agent`, 연결 방식은 `stdio`로 지정한다. 지원하는 MCP 버전은 2025-11-25와 2025-06-18이다. 일반 Flit 창에서는 이 인수 없이 실행한다.
 
-등록된 Codex MCP로 공개 문서를 읽고 링크를 따라간 뒤 탭을 닫은 검증 기록
-
 | 도구 | 동작 |
 | --- | --- |
 | `flit_open` | HTTP(S) URL을 새 작업 탭에서 연다. 로딩을 시작하면 탭 ID를 반환한다. |

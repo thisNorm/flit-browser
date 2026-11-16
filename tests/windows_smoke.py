@@ -17,7 +17,7 @@ import threading
 import time
 
 
-WORKSPACE = Path(__file__).resolve().parents[3]
+WORKSPACE = Path(__file__).resolve().parents[1]
 ADDRESS, BACK, FORWARD, RELOAD, NEW_TAB, GO = 101, 102, 103, 104, 105, 107
 TABS, SIDEBAR_TOGGLE, TAB_FILTER = 108, 109, 110
 TOOLBAR = (ADDRESS, BACK, FORWARD, RELOAD, GO, SIDEBAR_TOGGLE)
