@@ -7,6 +7,7 @@ pub(crate) const MANAGER_URL: &str = "chrome://bookmarks/";
 pub(crate) enum Request {
     Save(CefString),
     Import,
+    ImportProfile(CefString),
     Export,
 }
 
@@ -39,6 +40,19 @@ impl Request {
         Some(Self::Save(json))
     }
 
+    pub(crate) fn import_profile(
+        title: &str,
+        nodes: &[crate::site_setup::BookmarkNode],
+    ) -> Option<Self> {
+        // String-encode the JSON once more before using it as a JS expression.
+        let json = serde_json::to_string(&(title, nodes)).ok()?;
+        if json.len() > 2 * 1024 * 1024 {
+            return None;
+        }
+        let quoted = serde_json::to_string(&json).ok()?;
+        Some(Self::ImportProfile(CefString::from(quoted.as_str())))
+    }
+
     /// Consume a pending request on the UI thread after the owned manager's main-frame load.
     /// True means the script was dispatched; the WebUI itself reports the API result.
     pub(crate) fn dispatch_on_load_end(self, frame: &Frame) -> bool {
@@ -69,6 +83,58 @@ impl Request {
     }}
 }})();"#,
                 json
+            ),
+            Self::ImportProfile(quoted_json) => format!(
+                r#"(async () => {{
+    if (window !== window.top || location.href !== "chrome://bookmarks/") return;
+    if (window.flitBookmarkImportRunning) return;
+    window.flitBookmarkImportRunning = true;
+    document.title = "Bookmarks — Importing profile";
+    let added = 0;
+    try {{
+        const [title, nodes] = JSON.parse({});
+        const [root] = await chrome.bookmarks.getTree();
+        const other = root.children.find(n => n.folderType === "other" && !n.syncing && !n.unmodifiable)
+            ?? root.children.find(n => n.id === "2" && !n.syncing && !n.unmodifiable);
+        if (!other) throw new Error("No local bookmark folder");
+        const children = await chrome.bookmarks.getChildren(other.id);
+        const destination = children.find(n => !n.url && !n.unmodifiable && n.title === title)
+            ?? await chrome.bookmarks.create({{parentId: other.id, title}});
+
+        const append = async (parentId, items) => {{
+            if (!items.length) return;
+            const existing = await chrome.bookmarks.getChildren(parentId);
+            const folders = new Map(existing.filter(n => !n.url && !n.unmodifiable).map(n => [n.title, n]));
+            const key = n => {{
+                let address = n.url;
+                try {{ address = new URL(address).href; }} catch {{}}
+                return JSON.stringify([n.title, address]);
+            }};
+            const links = new Set(existing.filter(n => n.url).map(key));
+            for (const node of items) {{
+                if (node.url) {{
+                    const id = key(node);
+                    if (links.has(id)) continue;
+                    await chrome.bookmarks.create({{parentId, title: node.title, url: node.url}});
+                    links.add(id);
+                    added += 1;
+                    continue;
+                }}
+                const folder = folders.get(node.title)
+                    ?? await chrome.bookmarks.create({{parentId, title: node.title}});
+                folders.set(node.title, folder);
+                await append(folder.id, node.children);
+            }}
+        }};
+        await append(destination.id, nodes);
+        document.title = `Bookmarks — Imported ${{added}} bookmarks`;
+    }} catch {{
+        document.title = `Bookmarks — Import incomplete (${{added}} added)`;
+    }} finally {{
+        window.flitBookmarkImportRunning = false;
+    }}
+}})();"#,
+                quoted_json
             ),
             transfer => {
                 let method = if matches!(transfer, Self::Import) {

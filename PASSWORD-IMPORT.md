@@ -8,4 +8,8 @@
 
 활성 로그인 세션, 쿠키, 패스키, 일회용 인증 코드는 이전하지 않는다. 가져온 항목은 일반 비밀번호 관리자에 들어가고 Flit Vault나 AI 작업 탭에는 자동으로 전달되지 않는다. [Aside Vault의 공식 안내](https://docs.aside.com/help/password-manager)에서는 CSV 내보내기 경로를 확인하지 못했다. Aside에서 호환 파일을 내보낼 수 있는 경우에만 이 절차로 옮길 수 있다.
 
+[Aside 시작 단계의 브라우저 가져오기](https://docs.aside.com/help/get-started#import-your-browser-data)는 쿠키도 옮기는 별도 기능이다. 현재 Flit의 내장 가져오기 화면에서는 이 PC의 Chrome·Edge 원본과 쿠키 항목이 표시되지 않았다. 파일 없는 직접 가져오기 확인
+
+0.22.0부터 사이트와 북마크는 [파일을 내보내지 않고 준비하거나 옮길 수 있다](MOVE-SITES.md). 로그인 상태는 이 기능으로 이전되지 않는다.
+
 0.21.0에서 Chromium 계열 형식과 Firefox 추가 열이 있는 형식의 가짜 CSV를 가져왔다. CSV를 치우고 Flit을 다시 실행한 뒤에도 항목이 남았고, 로컬 로그인 폼의 두 필드가 자동완성됐다. 실제 계정이나 다른 브라우저의 비밀번호 파일은 읽지 않았다.

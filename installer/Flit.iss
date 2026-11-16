@@ -1,5 +1,5 @@
 #define Product "Flit Browser"
-#define ProductVersion "0.21.0"
+#define ProductVersion "0.22.0"
 #define BrowserClient "FlitBrowser"
 #define BrowserKey "Software\Clients\StartMenuInternet\" + BrowserClient
 #define CapabilitiesKey BrowserKey + "\Capabilities"

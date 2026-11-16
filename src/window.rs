@@ -8,6 +8,7 @@ use crate::{
     panel_motion::Motion,
     permissions,
     session::{self, Entry, Session, WindowState},
+    site_setup::{self, SourceBrowser},
     vault_ui,
 };
 use cef::*;
@@ -28,7 +29,9 @@ use windows_sys::Win32::{
         ScreenToClient, UpdateWindow,
     },
     System::{
+        DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
         LibraryLoader::GetModuleHandleW,
+        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
         SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
         SystemServices::SS_CENTERIMAGE,
     },
@@ -114,6 +117,11 @@ const SEARCH_ENGINE_FIRST: usize = 176;
 const SEARCH_ENGINE_LAST: usize = SEARCH_ENGINE_FIRST + SearchEngine::ALL.len() - 1;
 const GO_NEW_TAB: usize = 180;
 const IMPORT_PASSWORDS: usize = 181;
+const PREPARE_CHROME: usize = 182;
+const PREPARE_EDGE: usize = 183;
+const PREPARE_CLIPBOARD: usize = 184;
+const IMPORT_CHROME_BOOKMARKS: usize = 185;
+const IMPORT_EDGE_BOOKMARKS: usize = 186;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -3718,6 +3726,7 @@ fn show_menu(ui: Controls) {
     separator();
     add(FOCUS_SEARCH, "Search the web\tCtrl+K", true);
     add_search_engine_menu(menu, !private());
+    add_site_setup_menu(menu, !private());
     add(SAVE_BOOKMARK, "Bookmark this page\tCtrl+D", !private());
     add(BOOKMARKS, "Manage bookmarks\tCtrl+Shift+O", !private());
     add(IMPORT_BOOKMARKS, "Import bookmarks from HTML…", !private());
@@ -3874,6 +3883,273 @@ fn add_search_engine_menu(menu: HMENU, enabled: bool) {
     } == 0
     {
         unsafe { DestroyMenu(choices) };
+    }
+}
+
+fn add_site_setup_menu(menu: HMENU, enabled: bool) {
+    let sources = unsafe { CreatePopupMenu() };
+    if sources.is_null() {
+        return;
+    }
+    unsafe {
+        AppendMenuW(
+            sources,
+            MF_STRING,
+            PREPARE_CHROME,
+            windows_sys::w!("From Chrome bookmarks…"),
+        );
+        AppendMenuW(
+            sources,
+            MF_STRING,
+            PREPARE_EDGE,
+            windows_sys::w!("From Edge bookmarks…"),
+        );
+        AppendMenuW(
+            sources,
+            MF_STRING,
+            PREPARE_CLIPBOARD,
+            windows_sys::w!("From copied site links…"),
+        );
+        AppendMenuW(sources, MF_SEPARATOR, 0, null());
+        AppendMenuW(
+            sources,
+            MF_STRING,
+            IMPORT_CHROME_BOOKMARKS,
+            windows_sys::w!("Import Chrome bookmarks and folders…"),
+        );
+        AppendMenuW(
+            sources,
+            MF_STRING,
+            IMPORT_EDGE_BOOKMARKS,
+            windows_sys::w!("Import Edge bookmarks and folders…"),
+        );
+        if AppendMenuW(
+            menu,
+            MF_POPUP | if enabled { 0 } else { MF_GRAYED },
+            sources as usize,
+            windows_sys::w!("Move sites and bookmarks"),
+        ) == 0
+        {
+            DestroyMenu(sources);
+        }
+    }
+}
+
+fn site_setup_info(window: HWND, message: &str) {
+    let message = wide(message);
+    unsafe {
+        MessageBoxW(
+            window,
+            message.as_ptr(),
+            windows_sys::w!("Prepare sites in Flit"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+fn choose_browser_profile(
+    ui: Controls,
+    browser: SourceBrowser,
+) -> Option<site_setup::SourceProfile> {
+    let Some(local) = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    else {
+        site_setup_info(ui.window, "Flit could not find the local browser profiles.");
+        return None;
+    };
+    let mut profiles = site_setup::discover(&local, browser);
+    let profile = match profiles.len() {
+        0 => {
+            site_setup_info(
+                ui.window,
+                &format!(
+                    "No standard {} bookmarks profile was found.",
+                    browser.label()
+                ),
+            );
+            return None;
+        }
+        1 => profiles.pop().unwrap(),
+        _ => {
+            let menu = unsafe { CreatePopupMenu() };
+            if menu.is_null() {
+                return None;
+            }
+            let selection = unsafe {
+                for (index, profile) in profiles.iter().enumerate() {
+                    AppendMenuW(menu, MF_STRING, index + 1, wide(&profile.label).as_ptr());
+                }
+                let mut rect = RECT::default();
+                GetWindowRect(ui.menu, &mut rect);
+                let selection = TrackPopupMenu(
+                    menu,
+                    TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTALIGN,
+                    rect.right,
+                    rect.bottom,
+                    0,
+                    ui.window,
+                    null(),
+                );
+                DestroyMenu(menu);
+                selection as usize
+            };
+            if selection == 0 || selection > profiles.len() || exiting() {
+                return None;
+            }
+            profiles.swap_remove(selection - 1)
+        }
+    };
+    (with_shell(|s| !s.private && !s.closing) == Some(true)).then_some(profile)
+}
+
+fn browser_site_setup(ui: Controls, browser: SourceBrowser) {
+    let Some(profile) = choose_browser_profile(ui, browser) else {
+        return;
+    };
+    match site_setup::bookmarked_sites(&profile, &open_site_origins()) {
+        Ok(sites) => prepare_site_tabs(
+            ui.window,
+            &format!("{} · {}", browser.label(), profile.label),
+            sites,
+        ),
+        Err(message) => site_setup_info(ui.window, message),
+    }
+}
+
+fn import_browser_bookmarks(ui: Controls, browser: SourceBrowser) {
+    let Some(profile) = choose_browser_profile(ui, browser) else {
+        return;
+    };
+    let (nodes, count) = match site_setup::profile_bookmarks(&profile) {
+        Ok(result) => result,
+        Err(message) => {
+            site_setup_info(ui.window, message);
+            return;
+        }
+    };
+    if count == 0 {
+        site_setup_info(
+            ui.window,
+            "There are no website bookmarks in this profile to import.",
+        );
+        return;
+    }
+    let title = format!("From {} - {}", browser.label(), profile.label);
+    let Some(request) = BookmarkRequest::import_profile(&title, &nodes) else {
+        site_setup_info(
+            ui.window,
+            "This profile contains too much bookmark data to import at once.",
+        );
+        return;
+    };
+    let detail = wide(&format!(
+        "Import {count} bookmarks and their folders into Other bookmarks → {title}?\n\nExisting bookmarks will stay in place."
+    ));
+    if unsafe {
+        MessageBoxW(
+            ui.window,
+            detail.as_ptr(),
+            windows_sys::w!("Import bookmarks to Flit"),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        )
+    } == IDYES
+    {
+        run_bookmark_request(request);
+    }
+}
+
+fn copied_site_text(window: HWND) -> Result<String, &'static str> {
+    const UNICODE_TEXT: u32 = 13; // CF_UNICODETEXT.
+    const MAX_COPY_BYTES: usize = 256 * 1024;
+    if unsafe { OpenClipboard(window) } == 0 {
+        return Err("The clipboard is busy. Try again after copying the site links.");
+    }
+    let result = (|| {
+        let data = unsafe { GetClipboardData(UNICODE_TEXT) };
+        if data.is_null() {
+            return Err("Copy the site links as text, then try again.");
+        }
+        let size = unsafe { GlobalSize(data) };
+        if !(2..=MAX_COPY_BYTES).contains(&size) || size % 2 != 0 {
+            return Err("Copy a smaller list of site links, then try again.");
+        }
+        let buffer = unsafe { GlobalLock(data) }.cast::<u16>();
+        if buffer.is_null() {
+            return Err("Flit could not read the copied text.");
+        }
+        let units = unsafe { std::slice::from_raw_parts(buffer, size / 2) };
+        let result = units
+            .iter()
+            .position(|&unit| unit == 0)
+            .map(|end| String::from_utf16_lossy(&units[..end]))
+            .ok_or("Flit could not read the copied text.");
+        unsafe { GlobalUnlock(data) };
+        result
+    })();
+    unsafe { CloseClipboard() };
+    result
+}
+
+fn open_site_origins() -> BTreeSet<String> {
+    with_shell(|s| {
+        s.tabs
+            .iter()
+            .filter_map(|t| site_setup::site_origin(&t.url))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn prepare_site_tabs(window: HWND, label: &str, sites: Vec<String>) {
+    if sites.is_empty() {
+        site_setup_info(window, "There are no new site links to prepare.");
+        return;
+    }
+    let body = wide(&format!(
+        "{label}\n\nPrepare {} site tabs in this window?\n\n{}\n\nTabs load when selected. Sign in on each site as needed. Passwords and login sessions are not transferred.",
+        sites.len(),
+        sites.join("\n")
+    ));
+    if unsafe {
+        MessageBoxW(
+            window,
+            body.as_ptr(),
+            windows_sys::w!("Prepare sites in Flit"),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        )
+    } != IDYES
+        || exiting()
+    {
+        return;
+    }
+    if with_shell(|s| s.private || s.closing || s.active.is_none()) != Some(false) {
+        return;
+    }
+    let open = open_site_origins();
+    let mut added = false;
+    let mut failure = None;
+    for url in sites.into_iter().filter(|site| !open.contains(site)) {
+        if let Err(message) = append_tab(&url, url.trim_end_matches('/'), false, None) {
+            failure = Some(message);
+            break;
+        }
+        added = true;
+    }
+    if added {
+        if let Some(ui) = controls()
+            && !text(ui.filter, 256).is_empty()
+        {
+            set_text(ui.filter, "");
+        }
+        if with_shell(|s| s.sidebar_open) == Some(false) {
+            set_sidebar(true, true);
+        }
+        refresh_rows(false);
+        queue_session_save();
+    }
+    if let Some(message) = failure {
+        site_setup_info(window, message);
     }
 }
 
@@ -4933,6 +5209,38 @@ unsafe extern "system" fn window_proc(
                 PASSWORDS if !private() => open_builtin("chrome://password-manager/"),
                 IMPORT_PASSWORDS if !private() => {
                     open_builtin("chrome://password-manager/settings")
+                }
+                PREPARE_CHROME | PREPARE_EDGE if !private() => {
+                    if let Some(ui) = controls() {
+                        browser_site_setup(
+                            ui,
+                            if id == PREPARE_CHROME {
+                                SourceBrowser::Chrome
+                            } else {
+                                SourceBrowser::Edge
+                            },
+                        );
+                    }
+                }
+                PREPARE_CLIPBOARD if !private() => match copied_site_text(window) {
+                    Ok(text) => prepare_site_tabs(
+                        window,
+                        "Copied site links",
+                        site_setup::pasted_sites(&text, &open_site_origins()),
+                    ),
+                    Err(message) => site_setup_info(window, message),
+                },
+                IMPORT_CHROME_BOOKMARKS | IMPORT_EDGE_BOOKMARKS if !private() => {
+                    if let Some(ui) = controls() {
+                        import_browser_bookmarks(
+                            ui,
+                            if id == IMPORT_CHROME_BOOKMARKS {
+                                SourceBrowser::Chrome
+                            } else {
+                                SourceBrowser::Edge
+                            },
+                        );
+                    }
                 }
                 MATERIAL => {
                     let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;

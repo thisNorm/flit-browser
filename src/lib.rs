@@ -13,6 +13,7 @@ mod navigation;
 mod panel_motion;
 mod permissions;
 mod session;
+mod site_setup;
 mod updater;
 mod vault_login;
 mod vault_store;

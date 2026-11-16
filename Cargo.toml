@@ -1,6 +1,6 @@
 [package]
 name = "flit-browser"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 publish = false
 
@@ -25,7 +25,9 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_Console",
+    "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
   "Win32_System_SystemInformation",
   "Win32_System_SystemServices",
   "Win32_UI_Controls",
