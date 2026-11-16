@@ -28,6 +28,65 @@ pub(crate) struct Entry {
 pub(crate) struct WindowState {
     pub entries: Vec<Entry>,
     pub selected: usize,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_placement"
+    )]
+    pub placement: Option<WindowPlacement>,
+}
+
+// The outer window rectangle in physical screen pixels, before maximizing.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct WindowPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl WindowPlacement {
+    pub(crate) fn edges(self) -> Option<[i32; 4]> {
+        if self.width <= 0 || self.height <= 0 {
+            return None;
+        }
+        Some([
+            self.x,
+            self.y,
+            self.x.checked_add(self.width)?,
+            self.y.checked_add(self.height)?,
+        ])
+    }
+
+    pub(crate) fn fit(
+        self,
+        [left, top, right, bottom]: [i32; 4],
+        [min_width, min_height]: [i32; 2],
+    ) -> Option<Self> {
+        let work_width = right.checked_sub(left)?;
+        let work_height = bottom.checked_sub(top)?;
+        if work_width <= 0 || work_height <= 0 {
+            return None;
+        }
+        let width = self.width.clamp(min_width.min(work_width), work_width);
+        let height = self.height.clamp(min_height.min(work_height), work_height);
+        Some(Self {
+            x: self.x.clamp(left, right - width),
+            y: self.y.clamp(top, bottom - height),
+            width,
+            height,
+            ..self
+        })
+    }
+}
+
+fn read_placement<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<WindowPlacement>, D::Error> {
+    // Placement is optional metadata; a bad rectangle should not cost any tabs.
+    Ok(serde_json::from_value(serde_json::Value::deserialize(deserializer)?).ok())
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -182,6 +241,7 @@ fn validated(session: &Session) -> Session {
             WindowState {
                 entries: Vec::new(),
                 selected: 0,
+                placement: None,
             },
             Vec::new(),
         )
@@ -222,7 +282,13 @@ pub(crate) fn validated_window(window: &WindowState) -> WindowState {
             pinned: entry.pinned,
         });
     }
-    WindowState { entries, selected }
+    WindowState {
+        entries,
+        selected,
+        placement: window
+            .placement
+            .filter(|placement| placement.edges().is_some()),
+    }
 }
 
 pub(crate) fn stored_url(input: &str) -> Option<String> {
@@ -288,6 +354,7 @@ mod tests {
             primary: WindowState {
                 entries: vec![entry(url, "", false)],
                 selected: 0,
+                placement: None,
             },
             additional_windows: Vec::new(),
             restore: true,
@@ -329,6 +396,7 @@ mod tests {
                         entry("http://localhost:8080/a", "Local", false),
                     ],
                     selected: 1,
+                    placement: None,
                 },
                 additional_windows: Vec::new(),
                 restore: true,
@@ -355,7 +423,11 @@ mod tests {
             true,
         ));
         let selected = entries.len() - 1;
-        state.primary = WindowState { entries, selected };
+        state.primary = WindowState {
+            entries,
+            selected,
+            placement: None,
+        };
         state.additional_windows.push(state.primary.clone());
         save(&profile.0, &state).unwrap();
 
@@ -382,6 +454,7 @@ mod tests {
                 primary: WindowState {
                     entries: Vec::new(),
                     selected: 0,
+                    placement: None,
                 },
                 additional_windows: Vec::new(),
                 restore,
@@ -419,6 +492,7 @@ mod tests {
         save(&profile.0, &state).unwrap();
         let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(written.get("additional_windows").is_none());
+        assert!(written.get("placement").is_none());
 
         state.additional_windows = (0..17)
             .map(|i| session(&format!("https://example.com/window-{i}")).primary)
@@ -435,6 +509,105 @@ mod tests {
     }
 
     #[test]
+    fn keeps_each_windows_placement_in_the_session_and_its_backup() {
+        let profile = Profile::new();
+        let first = serde_json::json!({
+            "x": -920, "y": 80, "width": 860, "height": 640, "maximized": true
+        });
+        let second = serde_json::json!({
+            "x": 80, "y": 120, "width": 750, "height": 500, "maximized": false
+        });
+        let fixture = serde_json::json!({
+            "entries": [{"url": "https://example.com/first", "title": ""}],
+            "selected": 0,
+            "placement": first,
+            "additional_windows": [{
+                "entries": [{"url": "https://example.com/second", "title": ""}],
+                "selected": 0,
+                "placement": second
+            }]
+        });
+        fs::write(profile.0.join(FILE_NAME), fixture.to_string()).unwrap();
+        save(&profile.0, &load(&profile.0).unwrap()).unwrap();
+        backup_before_startup(&profile.0).unwrap();
+        for name in [FILE_NAME, BACKUP_FILE_NAME] {
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(profile.0.join(name)).unwrap()).unwrap();
+            assert_eq!(saved["placement"], first, "{name}: primary window");
+            assert_eq!(
+                saved["additional_windows"][0]["placement"], second,
+                "{name}: additional window"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_window_placement_does_not_discard_tabs() {
+        let profile = Profile::new();
+        for invalid in [
+            serde_json::json!("bad placement"),
+            serde_json::json!({"x": 0, "y": 0, "width": 0, "height": 500}),
+            serde_json::json!({"x": i32::MAX, "y": 0, "width": 600, "height": 500}),
+        ] {
+            let fixture = serde_json::json!({
+                "entries": [{"url": "https://example.com/kept", "title": ""}],
+                "selected": 0,
+                "placement": invalid,
+                "additional_windows": [{
+                    "entries": [{"url": "https://example.com/also-kept", "title": ""}],
+                    "selected": 0,
+                    "placement": invalid
+                }]
+            });
+            fs::write(profile.0.join(FILE_NAME), fixture.to_string()).unwrap();
+            let saved = load(&profile.0).unwrap();
+            assert_eq!(saved.primary, session("https://example.com/kept").primary);
+            assert_eq!(
+                saved.additional_windows,
+                [session("https://example.com/also-kept").primary]
+            );
+        }
+    }
+
+    #[test]
+    fn fits_saved_geometry_to_a_current_work_area() {
+        let normal = WindowPlacement {
+            x: -1100,
+            y: 50,
+            width: 800,
+            height: 600,
+            maximized: true,
+        };
+        let fit = |placement: WindowPlacement| placement.fit([-1280, 40, 0, 984], [530, 340]);
+        assert_eq!(fit(normal), Some(normal));
+        assert_eq!(
+            fit(WindowPlacement {
+                x: 4000,
+                y: -5000,
+                ..normal
+            }),
+            Some(WindowPlacement {
+                x: -800,
+                y: 40,
+                ..normal
+            })
+        );
+        assert_eq!(
+            fit(WindowPlacement {
+                width: 9000,
+                height: 1,
+                ..normal
+            }),
+            Some(WindowPlacement {
+                x: -1280,
+                width: 1280,
+                height: 340,
+                ..normal
+            })
+        );
+    }
+
+    #[test]
     fn drops_extra_windows_that_exceed_the_file_budget() {
         let profile = Profile::new();
         let url_prefix = "https://example.com/";
@@ -447,6 +620,7 @@ mod tests {
         let heavy = WindowState {
             entries: vec![entry(&long_url, &long_title, false); 128],
             selected: 127,
+            placement: None,
         };
         let mut state = session("https://example.com/primary");
         state.primary = heavy.clone();
@@ -534,6 +708,13 @@ mod tests {
         backup_before_startup(&profile.0).unwrap();
 
         let mut off = session("https://example.com/do-not-save");
+        off.primary.placement = Some(WindowPlacement {
+            x: 50,
+            y: 50,
+            width: 750,
+            height: 500,
+            maximized: true,
+        });
         off.additional_windows.push(off.primary.clone());
         off.restore = false;
         off.sidebar_open = false;
@@ -546,6 +727,7 @@ mod tests {
         assert!(restored.defer_background);
         assert!(restored.primary.entries.is_empty());
         assert_eq!(restored.primary.selected, 0);
+        assert!(restored.primary.placement.is_none());
         assert!(restored.additional_windows.is_empty());
         assert_eq!(load(&profile.0), Some(restored.clone()));
         backup_before_startup(&profile.0).unwrap();

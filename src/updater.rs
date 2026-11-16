@@ -131,7 +131,7 @@ pub(crate) fn check_manual() -> String {
     );
     let Some(update) = Update::discover() else {
         return format!(
-            "{headline}\n\nAutomatic updates are not configured for this installation."
+            "{headline}\n\nAutomatic updates are not configured for this installation.\nTo update an installed copy on Windows, close Flit and run the newer FlitSetup-x64.exe."
         );
     };
     if update.cache.join(READY).is_file() {

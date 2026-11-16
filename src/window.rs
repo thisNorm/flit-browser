@@ -7,7 +7,7 @@ use crate::{
     navigation::{self, HOME, SearchEngine},
     panel_motion::Motion,
     permissions,
-    session::{self, Entry, Session, WindowState},
+    session::{self, Entry, Session, WindowPlacement, WindowState},
     site_setup::{self, SourceBrowser},
     vault_ui,
 };
@@ -24,9 +24,9 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::{
         COLOR_HIGHLIGHT, CreateFontW, DEFAULT_GUI_FONT, DeleteObject, FillRect, GetMonitorInfoW,
-        GetStockObject, GetSysColorBrush, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-        MONITORINFO, MonitorFromWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RedrawWindow,
-        ScreenToClient, UpdateWindow,
+        GetStockObject, GetSysColorBrush, HDC, HFONT, HMONITOR, InvalidateRect,
+        MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow, OffsetRect,
+        RDW_ALLCHILDREN, RDW_INVALIDATE, RedrawWindow, ScreenToClient, UpdateWindow,
     },
     System::{
         DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
@@ -50,6 +50,9 @@ use windows_sys::Win32::{
         WindowsAndMessaging::*,
     },
 };
+
+const MIN_WINDOW_WIDTH: i32 = 530;
+const MIN_WINDOW_HEIGHT: i32 = 340;
 
 const ADDRESS: usize = 101;
 const BACK: usize = 102;
@@ -330,7 +333,7 @@ struct Shell {
     font: HFONT,
     font_dpi: i32,
     find_open: bool,
-    fullscreen: Option<WINDOWPLACEMENT>,
+    fullscreen: Option<(WINDOWPLACEMENT, Option<WindowPlacement>)>,
     recently_closed: Vec<ClosedRecord>,
     private: bool,
     address_edited: bool,
@@ -1234,6 +1237,30 @@ fn open_saved_windows(saved: Session, initial_url: Option<&str>) -> Result<(), &
     primary.map(|_| ())
 }
 
+fn monitor_info(monitor: HMONITOR) -> Option<MONITORINFO> {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    (unsafe { GetMonitorInfoW(monitor, &mut info) } != 0).then_some(info)
+}
+
+fn fitted_placement(saved: WindowPlacement) -> Option<WindowPlacement> {
+    let [left, top, right, bottom] = saved.edges()?;
+    let rect = RECT {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    let monitor = monitor_info(unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) })?;
+    let work = monitor.rcWork;
+    saved.fit(
+        [work.left, work.top, work.right, work.bottom],
+        [MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT],
+    )
+}
+
 fn create_window(
     private: bool,
     initial_url: Option<&str>,
@@ -1245,16 +1272,26 @@ fn create_window(
     }
     let name = wide(WINDOW_CLASS);
     let caption = wide(if private { PRIVATE_TITLE } else { APP_TITLE });
+    let placement = saved
+        .as_ref()
+        .filter(|_| !private)
+        .and_then(|state| state.placement)
+        .and_then(fitted_placement);
+    let (x, y, width, height) = placement.map_or((CW_USEDEFAULT, CW_USEDEFAULT, 1160, 790), |p| {
+        (p.x, p.y, p.width, p.height)
+    });
+    let maximized = placement.is_some_and(|p| p.maximized);
+    let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | if maximized { WS_MAXIMIZE } else { 0 };
     let window = unsafe {
         CreateWindowExW(
             0,
             name.as_ptr(),
             caption.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1160,
-            790,
+            style,
+            x,
+            y,
+            width,
+            height,
             null_mut(),
             null_mut(),
             GetModuleHandleW(null()),
@@ -1389,7 +1426,15 @@ fn create_window(
     chrome::apply_backdrop(window, 8 * dpi / 96);
     layout();
     unsafe {
-        ShowWindow(window, show);
+        // Keep the initial maximized state without activating a background window.
+        ShowWindow(
+            window,
+            if maximized && show == SW_SHOWNOACTIVATE {
+                SW_SHOWNA
+            } else {
+                show
+            },
+        );
         UpdateWindow(window);
     }
     let restored = if let Some(state) = saved.filter(|state| !private && !state.entries.is_empty())
@@ -3090,6 +3135,41 @@ fn continue_window_close(window: HWND) {
     }
 }
 
+fn native_placement(window: HWND) -> Option<WINDOWPLACEMENT> {
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    (unsafe { GetWindowPlacement(window, &mut placement) } != 0).then_some(placement)
+}
+
+fn session_placement(window: HWND, native: WINDOWPLACEMENT) -> Option<WindowPlacement> {
+    let mut rect = native.rcNormalPosition;
+    if native.showCmd == SW_SHOWNORMAL as u32 {
+        // An arranged (snapped) window's live bounds can differ from rcNormalPosition.
+        if unsafe { GetWindowRect(window, &mut rect) } == 0 {
+            return None;
+        }
+    } else {
+        let monitor = monitor_info(unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) })?;
+        // GetWindowPlacement reports workspace coordinates; creation uses screen coordinates.
+        unsafe {
+            OffsetRect(
+                &mut rect,
+                monitor.rcWork.left - monitor.rcMonitor.left,
+                monitor.rcWork.top - monitor.rcMonitor.top,
+            );
+        }
+    }
+    Some(WindowPlacement {
+        x: rect.left,
+        y: rect.top,
+        width: rect.right.checked_sub(rect.left)?,
+        height: rect.bottom.checked_sub(rect.top)?,
+        maximized: native.showCmd == SW_SHOWMAXIMIZED as u32,
+    })
+}
+
 fn window_snapshot(s: &Shell) -> WindowState {
     let mut entries = Vec::new();
     let mut selected = 0;
@@ -3110,7 +3190,16 @@ fn window_snapshot(s: &Shell) -> WindowState {
             pinned: tab.pinned,
         });
     }
-    WindowState { entries, selected }
+    let window = s.controls.window;
+    let placement = match s.fullscreen {
+        Some((_, placement)) => placement,
+        None => native_placement(window).and_then(|native| session_placement(window, native)),
+    };
+    WindowState {
+        entries,
+        selected,
+        placement,
+    }
 }
 
 fn last_normal_window() -> bool {
@@ -3123,6 +3212,7 @@ fn session_from(mut primary: WindowState, mut additional_windows: Vec<WindowStat
     if !restore {
         primary.entries.clear();
         primary.selected = 0;
+        primary.placement = None;
         additional_windows.clear();
     }
     Session {
@@ -3362,7 +3452,7 @@ fn toggle_sidebar() {
 }
 
 fn toggle_fullscreen(window: HWND) {
-    if let Some(placement) = change(|s| s.fullscreen.take()).flatten() {
+    if let Some((placement, _)) = change(|s| s.fullscreen.take()).flatten() {
         unsafe {
             SetWindowLongPtrW(
                 window,
@@ -3381,28 +3471,25 @@ fn toggle_fullscreen(window: HWND) {
             );
         }
     } else {
-        let mut saved = WINDOWPLACEMENT {
-            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-            ..Default::default()
+        let Some(saved) = native_placement(window) else {
+            return;
         };
-        let mut monitor = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
+        let Some(monitor) =
+            monitor_info(unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) })
+        else {
+            return;
         };
-        unsafe {
-            let display = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
-            if GetWindowPlacement(window, &mut saved) == 0
-                || GetMonitorInfoW(display, &mut monitor) == 0
-            {
-                return;
-            }
-        }
+        let placement = if private() {
+            None
+        } else {
+            session_placement(window, saved)
+        };
         close_find(false);
         unsafe {
             KillTimer(window, SIDEBAR_TIMER);
         }
         change(|s| {
-            s.fullscreen = Some(saved);
+            s.fullscreen = Some((saved, placement));
             s.sidebar_motion.to(s.sidebar_open, false);
         });
         let r = monitor.rcMonitor;
@@ -5296,16 +5383,21 @@ unsafe extern "system" fn window_proc(
                 unsafe { DefWindowProcW(window, message, wp, lp) }
             }
         }
+        WM_MOVE => {
+            queue_session_save();
+            0
+        }
         WM_SIZE => {
             layout();
+            queue_session_save();
             0
         }
         WM_GETMINMAXINFO if lp != 0 => {
             let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
             unsafe {
                 let info = &mut *(lp as *mut MINMAXINFO);
-                info.ptMinTrackSize.x = 530 * dpi / 96;
-                info.ptMinTrackSize.y = 340 * dpi / 96;
+                info.ptMinTrackSize.x = MIN_WINDOW_WIDTH * dpi / 96;
+                info.ptMinTrackSize.y = MIN_WINDOW_HEIGHT * dpi / 96;
             }
             0
         }
