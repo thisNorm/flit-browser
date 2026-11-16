@@ -34,9 +34,12 @@ SOURCE_TITLE = "Flit MCP 소스"
 TARGET_TITLE = "Flit MCP 링크 도착"
 OTHER_TITLE = "Flit MCP 두 번째 탭"
 COOKIE = "flit_fixture_session=owned"
+LINKS_TITLE = "Flit MCP link limit"
 PAGES = {
     "/source": f'''<title>{SOURCE_TITLE}</title><p id="dynamic">Waiting for the fixture</p>
 <label>Fixture password <input type="password" value="{PASSWORD}"></label>
+<div style="content-visibility:hidden"><a href="/never-visible">Hidden contents</a></div>
+<a href="/never-visible" style="visibility:hidden">Hidden visibility</a>
 <a href="/target">상세 보기</a><a href="/other">다른 페이지</a>
 <script>fetch('/blocked-post', {{method: 'POST', body: 'fixture'}}).catch(() => {{}});
 fetch('/dom-text').then(r => r.text()).then(text => {{
@@ -48,6 +51,11 @@ fetch('/dom-text').then(r => r.text()).then(text => {{
 <input type="password" disabled><input type="password" hidden>''',
     "/session": '<title>Flit MCP session</title><p>{}</p>',
 }
+for count in (60, 61):
+    PAGES[f"/links-{count}"] = (f"<title>{LINKS_TITLE}</title><p>Links in order</p>"
+                               '<a href="/target?attachment" download>Ignore download</a>'
+                               '<a href="mailto:fixture@example.test">Ignore non-web link</a>'
+                               + "".join(f'<a href="/target?index={i}">Link {i}</a> ' for i in range(count)))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -363,6 +371,16 @@ def exercise(mcp, peer, site, report):
     require(len(tabs) == 2 and {(t["tab"], t["url"], t["title"], t["status"]) for t in tabs}
             == {(first, source, SOURCE_TITLE, "ready"), (second, other, OTHER_TITLE, "ready")},
             f"Unexpected tab list: {tabs!r}")
+
+    report["stage"] = "verify link order and truncation"
+    for count in (60, 61):
+        url = site.origin + f"/links-{count}"
+        many = navigation(mcp.tool("flit_open", {"url": url}), url)
+        snapshot = mcp.ready_snapshot(many, url, LINKS_TITLE, "Links in order")
+        require([link["url"] for link in snapshot["links"]] == [f"{target}?index={i}" for i in range(60)]
+                and snapshot["truncated"] is (count > 60), f"Wrong 60-link boundary for {count} links")
+        mcp.tool("flit_close_tab", {"tab": many})
+    report["hidden_links_and_truncation_checked"] = True
 
     report["stage"] = "follow link and reject stale snapshot"
     follow = {"tab": first, "snapshot": page["snapshot"],

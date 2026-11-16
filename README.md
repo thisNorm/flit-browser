@@ -1,4 +1,4 @@
-# Flit Browser 0.28.0 · Windows 개발 미리보기
+# Flit Browser 0.29.0 · Windows 개발 미리보기
 
 Windows 11 x64 개발용 소스입니다. [설치 및 GitHub 배포 방법](installer/README.md)
 

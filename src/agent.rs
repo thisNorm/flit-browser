@@ -46,10 +46,16 @@ const READ_DOM: &str = r#"(() => {
   const visible = node => node.getClientRects().length && getComputedStyle(node).visibility === 'visible';
   const links = [];
   let linksTruncated = false;
-  if (root) for (const a of root.querySelectorAll('a[href]')) {
-    if (a.hasAttribute('download') || !visible(a)) continue;
+  const anchors = root?.getElementsByTagName('a');
+  const visibility = {visibilityProperty: true};
+  // Indexed access lets us stop at the first extra eligible link.
+  if (anchors) for (let i = 0; ; i++) {
+    const a = anchors.item(i);
+    if (!a) break;
+    if (a.hasAttribute('download')) continue;
     const href = a.href;
-    if (!/^https?:\/\//i.test(href) || href.length > 4096) continue;
+    if (typeof href !== 'string' || href.length > 4096 || !/^https?:\/\//i.test(href) ||
+        !a.checkVisibility(visibility)) continue;
     if (links.length >= 60) { linksTruncated = true; break; }
     links.push({ url: href, text: normalize((a.innerText || a.getAttribute('aria-label') || a.title || '').slice(0, 256)) });
   }

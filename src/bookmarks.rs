@@ -128,13 +128,17 @@ impl Request {
         const append = async (parentId, items) => {{
             if (!items.length) return;
             const existing = await chrome.bookmarks.getChildren(parentId);
-            const folders = new Map(existing.filter(n => !n.url && !n.unmodifiable).map(n => [n.title, n]));
+            const folders = new Map();
             const key = n => {{
                 let address = n.url;
                 try {{ address = new URL(address).href; }} catch {{}}
                 return JSON.stringify([n.title, address]);
             }};
-            const links = new Set(existing.filter(n => n.url).map(key));
+            const links = new Set();
+            for (const child of existing) {{
+                if (child.url) links.add(key(child));
+                else if (!child.unmodifiable) folders.set(child.title, child);
+            }}
             for (const node of items) {{
                 if (node.url) {{
                     const id = key(node);
