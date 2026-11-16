@@ -7,7 +7,7 @@ pub(crate) const MANAGER_URL: &str = "chrome://bookmarks/";
 pub(crate) enum Request {
     Save(CefString),
     Import,
-    ImportProfile(CefString),
+    Folder(CefString),
     Export,
 }
 
@@ -44,13 +44,24 @@ impl Request {
         title: &str,
         nodes: &[crate::site_setup::BookmarkNode],
     ) -> Option<Self> {
+        Self::folder(Some(title), nodes)
+    }
+
+    pub(crate) fn save_tabs(nodes: &[crate::site_setup::BookmarkNode]) -> Option<Self> {
+        if nodes.is_empty() {
+            return None;
+        }
+        Self::folder(None, nodes)
+    }
+
+    fn folder(title: Option<&str>, nodes: &[crate::site_setup::BookmarkNode]) -> Option<Self> {
         // String-encode the JSON once more before using it as a JS expression.
         let json = serde_json::to_string(&(title, nodes)).ok()?;
         if json.len() > 2 * 1024 * 1024 {
             return None;
         }
         let quoted = serde_json::to_string(&json).ok()?;
-        Some(Self::ImportProfile(CefString::from(quoted.as_str())))
+        Some(Self::Folder(CefString::from(quoted.as_str())))
     }
 
     /// Consume a pending request on the UI thread after the owned manager's main-frame load.
@@ -84,22 +95,35 @@ impl Request {
 }})();"#,
                 json
             ),
-            Self::ImportProfile(quoted_json) => format!(
+            Self::Folder(quoted_json) => format!(
                 r#"(async () => {{
     if (window !== window.top || location.href !== "chrome://bookmarks/") return;
-    if (window.flitBookmarkImportRunning) return;
-    window.flitBookmarkImportRunning = true;
-    document.title = "Bookmarks — Importing profile";
+    if (window.flitBookmarkFolderWriteRunning) return;
+    window.flitBookmarkFolderWriteRunning = true;
+    let saving = false;
     let added = 0;
     try {{
         const [title, nodes] = JSON.parse({});
+        saving = title === null;
+        document.title = saving ? "Bookmarks — Saving tabs" : "Bookmarks — Importing profile";
         const [root] = await chrome.bookmarks.getTree();
         const other = root.children.find(n => n.folderType === "other" && !n.syncing && !n.unmodifiable)
             ?? root.children.find(n => n.id === "2" && !n.syncing && !n.unmodifiable);
         if (!other) throw new Error("No local bookmark folder");
         const children = await chrome.bookmarks.getChildren(other.id);
-        const destination = children.find(n => !n.url && !n.unmodifiable && n.title === title)
-            ?? await chrome.bookmarks.create({{parentId: other.id, title}});
+        let destination;
+        if (saving) {{
+            const now = new Date();
+            const pad = n => String(n).padStart(2, "0");
+            const base = `Saved tabs - ${{now.getFullYear()}}-${{pad(now.getMonth() + 1)}}-${{pad(now.getDate())}} ${{pad(now.getHours())}}:${{pad(now.getMinutes())}}`;
+            const titles = new Set(children.map(n => n.title));
+            let name = base;
+            for (let i = 2; titles.has(name); i++) name = `${{base}} (${{i}})`;
+            destination = await chrome.bookmarks.create({{parentId: other.id, title: name}});
+        }} else {{
+            destination = children.find(n => !n.url && !n.unmodifiable && n.title === title)
+                ?? await chrome.bookmarks.create({{parentId: other.id, title}});
+        }}
 
         const append = async (parentId, items) => {{
             if (!items.length) return;
@@ -127,11 +151,13 @@ impl Request {
             }}
         }};
         await append(destination.id, nodes);
-        document.title = `Bookmarks — Imported ${{added}} bookmarks`;
+        document.title = saving
+            ? `Bookmarks — Saved ${{added}} tabs`
+            : `Bookmarks — Imported ${{added}} bookmarks`;
     }} catch {{
-        document.title = `Bookmarks — Import incomplete (${{added}} added)`;
+        document.title = `Bookmarks — ${{saving ? "Save" : "Import"}} incomplete (${{added}} added)`;
     }} finally {{
-        window.flitBookmarkImportRunning = false;
+        window.flitBookmarkFolderWriteRunning = false;
     }}
 }})();"#,
                 quoted_json

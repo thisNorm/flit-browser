@@ -124,6 +124,7 @@ const IMPORT_CHROME_BOOKMARKS: usize = 185;
 const IMPORT_EDGE_BOOKMARKS: usize = 186;
 const REOPEN_RECENT: usize = 187;
 pub(crate) const TAB_STATUS: usize = 188;
+const BOOKMARK_ALL_TABS: usize = 189;
 const RECENT_MENU_FIRST: usize = 0x400;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
@@ -3688,6 +3689,57 @@ fn run_bookmark_request(request: BookmarkRequest) {
     }
 }
 
+fn bookmark_all_tabs(window: HWND) {
+    let Some(tabs) = with_shell(|s| {
+        let mut seen = BTreeSet::new();
+        s.tabs
+            .iter()
+            .filter(|tab| !tab.close_requested && !tab.retiring)
+            .filter_map(|tab| {
+                let url = session::stored_url(&tab.url)?;
+                if !(url.starts_with("http://") || url.starts_with("https://"))
+                    || !seen.insert(url.clone())
+                {
+                    return None;
+                }
+                Some(site_setup::BookmarkNode {
+                    title: tab_label(tab),
+                    url: Some(url),
+                    children: Vec::new(),
+                })
+            })
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    let title = windows_sys::w!("Bookmark all tabs");
+    let count = tabs.len();
+    let Some(request) = BookmarkRequest::save_tabs(&tabs) else {
+        let body = if count == 0 {
+            windows_sys::w!("Open a web page to save its tab.")
+        } else {
+            windows_sys::w!("This window has too much bookmark data to save at once.")
+        };
+        unsafe { MessageBoxW(window, body, title, MB_OK | MB_ICONINFORMATION) };
+        return;
+    };
+    let body = wide(&format!(
+        "Save {count} web {} to a new folder under Other bookmarks?\n\nTabs will stay open, and tabs waiting to load will stay on demand.",
+        if count == 1 { "tab" } else { "tabs" }
+    ));
+    if unsafe {
+        MessageBoxW(
+            window,
+            body.as_ptr(),
+            title,
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        )
+    } == IDYES
+    {
+        run_bookmark_request(request);
+    }
+}
+
 fn finish_bookmark(key: usize, frame: &Frame) {
     if frame.is_main() == 0 || CefString::from(&frame.url()).to_string() != MANAGER_URL {
         return;
@@ -3850,6 +3902,11 @@ fn show_menu(ui: Controls) {
     add_search_engine_menu(menu, !private());
     add_site_setup_menu(menu, !private());
     add(SAVE_BOOKMARK, "Bookmark this page\tCtrl+D", !private());
+    add(
+        BOOKMARK_ALL_TABS,
+        "Bookmark all tabs…\tCtrl+Shift+D",
+        !private(),
+    );
     add(BOOKMARKS, "Manage bookmarks\tCtrl+Shift+O", !private());
     add(IMPORT_BOOKMARKS, "Import bookmarks from HTML…", !private());
     add(EXPORT_BOOKMARKS, "Export bookmarks to HTML…", !private());
@@ -4348,6 +4405,7 @@ fn shortcut_command(action: Shortcut) -> usize {
         Shortcut::FocusAddress => FOCUS_ADDRESS,
         Shortcut::FocusSearch => FOCUS_SEARCH,
         Shortcut::Bookmark => SAVE_BOOKMARK,
+        Shortcut::BookmarkAllTabs => BOOKMARK_ALL_TABS,
         Shortcut::ManageBookmarks => BOOKMARKS,
         Shortcut::NewTab => NEW_TAB,
         Shortcut::NewWindow => NEW_WINDOW,
@@ -5440,6 +5498,7 @@ unsafe extern "system" fn window_proc(
                 HISTORY if !private() => open_builtin("chrome://history/"),
                 BOOKMARKS if !private() => open_builtin(MANAGER_URL),
                 SAVE_BOOKMARK => bookmark_page(),
+                BOOKMARK_ALL_TABS if !private() => bookmark_all_tabs(window),
                 IMPORT_BOOKMARKS => run_bookmark_request(BookmarkRequest::Import),
                 EXPORT_BOOKMARKS => run_bookmark_request(BookmarkRequest::Export),
                 SITE_INFO => show_site_info(window),
