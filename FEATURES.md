@@ -1,13 +1,13 @@
-# Flit 0.17.0 기능 비교
+# Flit 0.18.0 기능 비교
 
 CEF는 Chromium의 렌더링, 네트워크, 프로필 저장소를 제공한다. 탭 목록, 단축키, 시작 방식처럼 실제 사용자가 조작하는 흐름은 Flit이 연결한다. 비교 기준은 [Chrome의 탭 관리](https://support.google.com/chrome/answer/2391819?co=GENIE.Platform%3DDesktop&hl=en), [북마크 가져오기](https://support.google.com/chrome/answer/96816?hl=en), [시작 시 복원](https://support.google.com/chrome/answer/95314), [사이트 권한](https://support.google.com/chrome/answer/114662), [Edge의 절전 탭](https://support.microsoft.com/en-us/edge/learn-about-performance-features-in-microsoft-edge)이다.
 
 검증 기록은 각 결과를 확인한 버전으로 연결했다.
 
-| 사용 흐름 | Flit 0.17.0 | 확인 범위 |
+| 사용 흐름 | Flit 0.18.0 | 확인 범위 |
 | --- | --- | --- |
 | 주소 탐색, 찾기, 세로 탭 | 뒤로·앞으로, 새로고침과 로딩 중지, 페이지 찾기, 탭 검색·닫기·접기 | Windows 실행, 로딩 중지와 새로고침 |
-| 주소창 검색 | `Ctrl+K`, `Ctrl+E`, `?`로 검색. DuckDuckGo·Google·Naver·Bing 중 기본값 선택 | 검색 모드 및 검색엔진 유지. 검색 추천과 주소 자동완성은 제공하지 않음 |
+| 주소창 검색 | `Ctrl+K`, `Ctrl+E`, `?`로 검색. DuckDuckGo·Google·Naver·Bing 중 기본값 선택. `Alt+Enter`로 입력한 주소나 검색어를 새 탭에 열기 | 네 검색 사이트의 실제 결과와 링크 탐색 · 검색 모드와 검색엔진 유지. 검색 추천과 주소 자동완성은 제공하지 않음 |
 | 탭 순서와 포커스 | 드래그나 메뉴로 순서를 변경. 클릭과 Enter는 페이지로 포커스를 보내고 목록의 방향키는 포커스를 유지 | 탭 이동 및 재실행 · Win32 포커스 검사 |
 | 조합 입력 | 주소창·탭 검색·페이지 찾기에서 조합 키를 입력기에 우선 전달 | 주소창의 Enter·Esc 회귀 검사. 실제 IME 타이핑과는 별도 |
 | 북마크 | 별 버튼과 `Ctrl+D`로 저장하고, 일반 창의 ⋯ 메뉴에서 북마크 HTML 가져오기·내보내기 | 기존 항목과 중첩 폴더 유지, 재실행, 새 프로필로 재가져오기 · 별 버튼과 중복 방지 |

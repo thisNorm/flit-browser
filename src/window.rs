@@ -112,6 +112,7 @@ const IMPORT_BOOKMARKS: usize = 174;
 const EXPORT_BOOKMARKS: usize = 175;
 const SEARCH_ENGINE_FIRST: usize = 176;
 const SEARCH_ENGINE_LAST: usize = SEARCH_ENGINE_FIRST + SearchEngine::ALL.len() - 1;
+const GO_NEW_TAB: usize = 180;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -1003,7 +1004,7 @@ fn tooltips(ui: Controls) -> HWND {
         (ui.back, w!("Back (Alt+Left)")),
         (ui.forward, w!("Forward (Alt+Right)")),
         (ui.reload, w!("Reload (Ctrl+R)")),
-        (ui.go, w!("Go to address (Enter)")),
+        (ui.go, w!("Open (Enter), or open in a new tab (Alt+Enter)")),
         (ui.add, w!("New tab (Ctrl+T)")),
         (ui.menu, w!("Flit menu")),
         (ui.bookmark, w!("Bookmark this page (Ctrl+D)")),
@@ -2264,7 +2265,7 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
     Ok(browser)
 }
 
-fn navigate() {
+fn navigate(new_tab: bool) {
     let Some(ui) = controls() else {
         return;
     };
@@ -2294,6 +2295,13 @@ fn navigate() {
     if settings_target(&url).is_some() {
         refresh(true);
         open_settings_window(&url);
+        return;
+    }
+    if new_tab {
+        match add_tab(&url) {
+            Ok(()) => focus_page(),
+            Err(message) => set_text(ui.window, &format!("{} — {message}", app_title())),
+        }
         return;
     }
     let Some(key) = with_shell(|s| s.active).flatten() else {
@@ -4358,11 +4366,13 @@ unsafe extern "system" fn chrome_proc(
     _id: usize,
     parent: usize,
 ) -> LRESULT {
+    const ALT_CONTEXT: LPARAM = 1 << 29;
+    const PREVIOUS_KEY_STATE: LPARAM = 1 << 30;
     let _scope = WindowScope::enter(parent);
     let id = unsafe { GetDlgCtrlID(hwnd) } as usize;
     if matches!(id, ADDRESS | FILTER | FIND_TEXT) {
         let composing = (matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN)
-            || (message == WM_CHAR && wp == VK_RETURN as usize))
+            || (matches!(message, WM_CHAR | WM_SYSCHAR) && wp == VK_RETURN as usize))
             && keyboard::edit_composing(hwnd);
         if let Some(result) = keyboard::handle_edit_message(hwnd, message, wp, lp, composing) {
             return result;
@@ -4373,6 +4383,18 @@ unsafe extern "system" fn chrome_proc(
     }
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
         let (ctrl, shift, alt) = modifiers();
+        if id == ADDRESS
+            && wp == VK_RETURN as usize
+            && message == WM_SYSKEYDOWN
+            && lp & ALT_CONTEXT != 0
+            && !ctrl
+            && !shift
+        {
+            if lp & PREVIOUS_KEY_STATE == 0 {
+                unsafe { PostMessageW(parent as HWND, WM_COMMAND, GO_NEW_TAB, 0) };
+            }
+            return 0;
+        }
         if let Some(action) = keyboard::shortcut(wp as u16, ctrl, shift, alt) {
             unsafe {
                 PostMessageW(parent as HWND, WM_COMMAND, shortcut_command(action), 0);
@@ -4446,6 +4468,14 @@ unsafe extern "system" fn chrome_proc(
             }
             _ => {}
         }
+    }
+    // TranslateMessage can queue the corresponding character before the keydown
+    // handler posts the command. Never submit it a second time in the old tab.
+    if id == ADDRESS
+        && wp == VK_RETURN as usize
+        && (message == WM_SYSCHAR || (message == WM_CHAR && lp & ALT_CONTEXT != 0))
+    {
+        return 0;
     }
     if message == WM_CHAR && wp == VK_RETURN as usize {
         match id {
@@ -4694,7 +4724,7 @@ unsafe extern "system" fn window_proc(
             let id = wp & 0xffff;
             let notification = ((wp >> 16) & 0xffff) as u32;
             match id {
-                GO => navigate(),
+                GO | GO_NEW_TAB => navigate(id == GO_NEW_TAB),
                 NEW_TAB => {
                     reveal_toolbar(window);
                     if let Some(ui) = controls() {
