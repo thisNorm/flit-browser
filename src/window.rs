@@ -122,6 +122,8 @@ const PREPARE_EDGE: usize = 183;
 const PREPARE_CLIPBOARD: usize = 184;
 const IMPORT_CHROME_BOOKMARKS: usize = 185;
 const IMPORT_EDGE_BOOKMARKS: usize = 186;
+const REOPEN_RECENT: usize = 187;
+const RECENT_MENU_FIRST: usize = 0x400;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -295,6 +297,11 @@ enum ClosedItem {
     Window(WindowState),
 }
 
+struct ClosedRecord {
+    id: usize,
+    item: ClosedItem,
+}
+
 struct PendingLink {
     url: String,
     disposition: WindowOpenDisposition,
@@ -318,7 +325,7 @@ struct Shell {
     font_dpi: i32,
     find_open: bool,
     fullscreen: Option<WINDOWPLACEMENT>,
-    recently_closed: Vec<ClosedItem>,
+    recently_closed: Vec<ClosedRecord>,
     private: bool,
     address_edited: bool,
     updating_address: bool,
@@ -337,7 +344,8 @@ struct Shell {
 thread_local! {
     static WINDOWS: RefCell<BTreeMap<usize, Shell>> = const { RefCell::new(BTreeMap::new()) };
     static NEXT_WINDOW_ID: Cell<usize> = const { Cell::new(1) };
-    static RECENT_NORMAL: RefCell<Vec<ClosedItem>> = const { RefCell::new(Vec::new()) };
+    static RECENT_NORMAL: RefCell<Vec<ClosedRecord>> = const { RefCell::new(Vec::new()) };
+    static NEXT_CLOSED_ID: Cell<usize> = const { Cell::new(1) };
     static CURRENT_WINDOW: Cell<usize> = const { Cell::new(0) };
     static LAST_NORMAL: Cell<usize> = const { Cell::new(0) };
     static PROFILE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
@@ -3153,19 +3161,32 @@ fn restore_recovery_copy(window: HWND) {
     }
 }
 
-fn remember_closed(items: &mut Vec<ClosedItem>, item: ClosedItem) {
+fn remember_closed(items: &mut Vec<ClosedRecord>, item: ClosedItem) {
     if items.len() >= 20 {
         items.remove(0);
     }
-    items.push(item);
+    let id = NEXT_CLOSED_ID.get();
+    NEXT_CLOSED_ID.set(id.wrapping_add(1).max(1));
+    items.push(ClosedRecord { id, item });
 }
 
-fn reopen_closed() {
+fn take_closed(items: &mut Vec<ClosedRecord>, choice: Option<usize>) -> Option<ClosedItem> {
+    let record = match choice {
+        Some(id) => items.remove(items.iter().position(|record| record.id == id)?),
+        None => items.pop()?,
+    };
+    Some(record.item)
+}
+
+fn reopen_closed(choice: Option<usize>) {
+    if with_shell(|s| !s.closing) != Some(true) {
+        return;
+    }
     let private = private();
     let item = if private {
-        change(|s| s.recently_closed.pop()).flatten()
+        change(|s| take_closed(&mut s.recently_closed, choice)).flatten()
     } else {
-        RECENT_NORMAL.with(|items| items.borrow_mut().pop())
+        RECENT_NORMAL.with(|items| take_closed(&mut items.borrow_mut(), choice))
     };
     let Some(item) = item else { return };
     match item {
@@ -3753,19 +3774,20 @@ fn show_menu(ui: Controls) {
     let separator = || unsafe {
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
     };
-    let restore = if private() {
-        with_shell(|s| !s.recently_closed.is_empty()).unwrap_or(false)
+    let recent = if private() {
+        with_shell(|s| closed_choices(&s.recently_closed)).unwrap_or_default()
     } else {
-        RECENT_NORMAL.with(|items| !items.borrow().is_empty())
+        RECENT_NORMAL.with(|items| closed_choices(&items.borrow()))
     };
     add(NEW_TAB, "New tab\tCtrl+T", true);
     add(NEW_WINDOW, "New window\tCtrl+N", true);
     add(PRIVATE_WINDOW, "New private window\tCtrl+Shift+N", true);
     add(
         RESTORE_TAB,
-        "Reopen closed tab or window\tCtrl+Shift+T",
-        restore,
+        "Reopen last closed\tCtrl+Shift+T",
+        !recent.is_empty(),
     );
+    add_recent_menu(menu, &recent);
     add(FOCUS_FILTER, "Search open tabs\tCtrl+Shift+A", true);
     add(CLOSE_WINDOW, "Close window\tCtrl+Shift+W", true);
     add(
@@ -3901,10 +3923,78 @@ fn show_menu(ui: Controls) {
                 vault_ui::manage(ui.window, &site, selection == VAULT_REMOVE, vault_site);
             }
         }
+        item if item >= RECENT_MENU_FIRST => {
+            if let Some((id, _)) = recent.get(item - RECENT_MENU_FIRST) {
+                // The list may have changed while Windows was tracking the menu.
+                unsafe { PostMessageW(ui.window, WM_COMMAND, REOPEN_RECENT, *id as isize) };
+            }
+        }
         0 => (),
         _ => unsafe {
             PostMessageW(ui.window, WM_COMMAND, selection, 0);
         },
+    }
+}
+
+fn closed_title(entry: &Entry) -> String {
+    let title = clean(entry.title.trim(), 64);
+    let host = url::Url::parse(&entry.url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| clean(host, 40)));
+    match (title.is_empty(), host) {
+        (true, Some(host)) => host,
+        (true, None) => "Untitled tab".into(),
+        (false, Some(host)) if title != host => format!("{title} — {host}"),
+        (false, _) => title,
+    }
+}
+
+fn closed_choices(items: &[ClosedRecord]) -> Vec<(usize, String)> {
+    items
+        .iter()
+        .rev()
+        .map(|record| {
+            let label = match &record.item {
+                ClosedItem::Tab { entry, .. } => closed_title(entry),
+                ClosedItem::Window(state) => {
+                    let title = state
+                        .entries
+                        .get(state.selected)
+                        .filter(|entry| entry.url != HOME)
+                        .or_else(|| state.entries.iter().find(|entry| entry.url != HOME))
+                        .map_or_else(|| "Untitled window".into(), closed_title);
+                    let count = state.entries.len();
+                    let noun = if count == 1 { "tab" } else { "tabs" };
+                    format!("Window: {title} ({count} {noun})")
+                }
+            };
+            (record.id, label.replace('&', "&&"))
+        })
+        .collect()
+}
+
+fn add_recent_menu(menu: HMENU, items: &[(usize, String)]) {
+    let label = windows_sys::w!("Recently closed");
+    if items.is_empty() {
+        unsafe { AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, label) };
+        return;
+    }
+    let submenu = unsafe { CreatePopupMenu() };
+    if submenu.is_null() {
+        return;
+    }
+    for (index, (_, title)) in items.iter().enumerate() {
+        unsafe {
+            AppendMenuW(
+                submenu,
+                MF_STRING,
+                RECENT_MENU_FIRST + index,
+                wide(title).as_ptr(),
+            );
+        }
+    }
+    if unsafe { AppendMenuW(menu, MF_POPUP, submenu as usize, label) } == 0 {
+        unsafe { DestroyMenu(submenu) };
     }
 }
 
@@ -5245,7 +5335,8 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 CLOSE_TAB => close_tab(None),
-                RESTORE_TAB => reopen_closed(),
+                RESTORE_TAB => reopen_closed(None),
+                REOPEN_RECENT if lp != 0 => reopen_closed(Some(lp as usize)),
                 FREE_MEMORY => free_background_memory(window),
                 TOGGLE_DEFER_BACKGROUND if !private() => {
                     DEFER_BACKGROUND.set(!DEFER_BACKGROUND.get());
