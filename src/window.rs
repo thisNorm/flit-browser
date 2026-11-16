@@ -6,7 +6,7 @@ use crate::{
     navigation::{self, HOME},
     panel_motion::Motion,
     permissions,
-    session::{self, Entry, Session},
+    session::{self, Entry, Session, WindowState},
     vault_ui,
 };
 use cef::*;
@@ -103,6 +103,8 @@ const TOGGLE_DEFER_BACKGROUND: usize = 168;
 const RELOAD_SHORTCUT: usize = 169;
 const VAULT_SAVE: usize = 170;
 const VAULT_REMOVE: usize = 171;
+const EXIT_FLIT: usize = 172;
+const RECOVERY_COPY: usize = 173;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -113,6 +115,7 @@ const POPUP_CLOSED: u32 = WM_APP + 7;
 const OPEN_SETTINGS_WINDOW: u32 = WM_APP + 8;
 const LOAD_STATE_CHANGED: u32 = WM_APP + 9;
 const STOP_LOADING: u32 = WM_APP + 10;
+const EXIT_NEXT_WINDOW: u32 = WM_APP + 11;
 const TAB_PIN: usize = 1;
 const TAB_DUPLICATE: usize = 2;
 const TAB_MUTE: usize = 3;
@@ -218,7 +221,7 @@ enum ClosedItem {
         entry: Entry,
         muted: bool,
     },
-    Window(Session),
+    Window(WindowState),
 }
 
 struct Shell {
@@ -248,7 +251,7 @@ struct Shell {
     settings_window: Option<Browser>,
     pending_settings: Option<(usize, String)>,
     closing: bool,
-    closing_session: Option<Session>,
+    closing_session: Option<WindowState>,
     memory_queue: VecDeque<usize>,
 }
 
@@ -264,7 +267,18 @@ thread_local! {
     static SIDEBAR_DEFAULT: Cell<bool> = const { Cell::new(true) };
     static DEFER_BACKGROUND: Cell<bool> = const { Cell::new(false) };
     static RECOVERY_WINDOW: Cell<usize> = const { Cell::new(0) };
+    static OPENING_SESSION: Cell<bool> = const { Cell::new(false) };
+    static EXIT_SESSION: RefCell<Option<ExitSession>> = const { RefCell::new(None) };
     static EXIT_CODE: Cell<i32> = const { Cell::new(0) };
+}
+
+struct ExitSession {
+    current: usize,
+    remaining: VecDeque<usize>,
+}
+
+fn exiting() -> bool {
+    EXIT_SESSION.with(|slot| slot.borrow().is_some())
 }
 
 struct WindowScope(usize);
@@ -347,20 +361,17 @@ fn queue_session_save() {
 }
 
 fn queue_profile_save() {
-    if with_shell(|s| !s.private && !s.closing) != Some(true) {
+    if OPENING_SESSION.get()
+        || exiting()
+        || RECOVERY_WINDOW.get() != 0
+        || with_shell(|s| !s.private && !s.closing) != Some(true)
+    {
         return;
     }
     if let Some(window) = normal_window() {
-        if RECOVERY_WINDOW.get() == window as usize {
-            return;
-        }
-        let previous = RECOVERY_WINDOW.replace(window as usize) as HWND;
         unsafe {
-            if !previous.is_null() && previous != window {
-                KillTimer(previous, RECOVERY_TIMER);
-            }
-            if SetTimer(window, RECOVERY_TIMER, 700, None) == 0 {
-                RECOVERY_WINDOW.set(0);
+            if SetTimer(window, RECOVERY_TIMER, 700, None) != 0 {
+                RECOVERY_WINDOW.set(window as usize);
             }
         }
     }
@@ -587,7 +598,7 @@ wrap_life_span_handler! {
             _settings: Option<&mut BrowserSettings>, _extra: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
-            if gesture == 0 {
+            if gesture == 0 || exiting() {
                 return 1;
             }
             let _scope = WindowScope::enter(self.window);
@@ -702,7 +713,7 @@ wrap_request_handler! {
                     let target = CefString::from(&request.url()).to_string();
                     if let Some(target) = settings_target(&target) {
                         let _scope = WindowScope::enter(self.window);
-                        if private() {
+                        if private() || exiting() {
                             return 1;
                         }
                         if change(|s| s.pending_settings = Some((self.key, target))).is_some() {
@@ -728,6 +739,9 @@ wrap_request_handler! {
 }
 
 fn queue_link(window: usize, url: Option<&CefString>, disposition: WindowOpenDisposition) -> bool {
+    if exiting() {
+        return true;
+    }
     let Some(url) = url.map(CefString::to_string) else {
         return false;
     };
@@ -1060,14 +1074,59 @@ pub(crate) fn open(
             return Err("Could not register the Flit window.");
         }
     }
-    open_window(false, initial_url, saved.filter(|_| !skip_restore)).map(|_| ())
+    if !skip_restore && RESTORE_TABS.get() {
+        if let Err(error) = session::backup_before_startup(profile) {
+            eprintln!("Flit Browser: Could not keep the previous session copy: {error}");
+        }
+    }
+    match saved.filter(|s| !skip_restore && s.restore) {
+        Some(saved) => open_saved_windows(saved, initial_url),
+        None => open_window(false, initial_url, None).map(|_| ()),
+    }
 }
 
 fn open_window(
     private: bool,
     initial_url: Option<&str>,
-    saved: Option<Session>,
+    saved: Option<WindowState>,
 ) -> Result<HWND, &'static str> {
+    create_window(private, initial_url, saved, SW_SHOW)
+}
+
+fn open_saved_windows(saved: Session, initial_url: Option<&str>) -> Result<(), &'static str> {
+    OPENING_SESSION.set(true);
+    // Start each additional window behind the previously selected one.
+    let mut incomplete = false;
+    for window in saved.additional_windows {
+        if create_window(false, None, Some(window), SW_SHOWNOACTIVATE).is_err() {
+            incomplete = true;
+        }
+    }
+    let primary = open_window(false, initial_url, Some(saved.primary));
+    OPENING_SESSION.set(false);
+    if let Some(window) = primary.as_ref().ok().copied().or_else(normal_window) {
+        let _scope = WindowScope::enter(window as usize);
+        queue_session_save();
+        if incomplete || primary.is_err() {
+            set_text(
+                window,
+                "Flit Browser — Some saved windows could not be opened.",
+            );
+        }
+        return Ok(());
+    }
+    primary.map(|_| ())
+}
+
+fn create_window(
+    private: bool,
+    initial_url: Option<&str>,
+    saved: Option<WindowState>,
+    show: SHOW_WINDOW_CMD,
+) -> Result<HWND, &'static str> {
+    if exiting() {
+        return Err("Flit is exiting.");
+    }
     let name = wide(WINDOW_CLASS);
     let caption = wide(if private { PRIVATE_TITLE } else { APP_TITLE });
     let window = unsafe {
@@ -1197,22 +1256,21 @@ fn open_window(
             },
         );
     });
-    if !private {
-        LAST_NORMAL.set(window as usize);
-    } else {
+    if private {
         unsafe {
             EnableWindow(ui.bookmark, 0);
         }
+    } else if show == SW_SHOW {
+        LAST_NORMAL.set(window as usize);
     }
     let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
     chrome::apply_backdrop(window, 8 * dpi / 96);
     layout();
     unsafe {
-        ShowWindow(window, SW_SHOW);
+        ShowWindow(window, show);
         UpdateWindow(window);
     }
-    let restored = if let Some(state) =
-        saved.filter(|state| !private && state.restore && !state.entries.is_empty())
+    let restored = if let Some(state) = saved.filter(|state| !private && !state.entries.is_empty())
     {
         for entry in state.entries {
             append_tab(&entry.url, &entry.title, entry.pinned)?;
@@ -1230,7 +1288,7 @@ fn open_window(
     } else {
         add_tab(HOME)?;
     }
-    if active().is_none() {
+    if show == SW_SHOW && active().is_none() {
         unsafe {
             SetFocus(ui.address);
             SendMessageW(ui.address, EM_SETSEL, 0, -1);
@@ -1263,13 +1321,21 @@ fn normal_window() -> Option<HWND> {
         let windows = windows.borrow();
         windows
             .get(&LAST_NORMAL.get())
-            .filter(|s| !s.closing)
-            .or_else(|| windows.values().find(|s| !s.private && !s.closing))
+            .filter(|s| !s.private && !s.closing)
+            .or_else(|| {
+                windows
+                    .values()
+                    .filter(|s| !s.private && !s.closing)
+                    .max_by_key(|s| s.id)
+            })
             .map(|s| s.controls.window)
     })
 }
 
 pub(crate) fn show_existing(url: Option<&str>) {
+    if exiting() {
+        return;
+    }
     if let Some(window) = normal_window() {
         let _scope = WindowScope::enter(window as usize);
         if let Some(url) = url {
@@ -2464,9 +2530,18 @@ fn close_tab(key: Option<usize>) {
 }
 
 fn close_window(window: HWND) {
-    if with_shell(|s| s.closing) != Some(false) || !confirm_download_close(window, None) {
+    if exiting()
+        || with_shell(|s| s.closing) != Some(false)
+        || !confirm_download_close(window, None)
+    {
         return;
     }
+    if !exiting() {
+        begin_window_close(window);
+    }
+}
+
+fn begin_window_close(window: HWND) {
     permissions::cancel_window(window as usize);
     close_find(false);
     if RECOVERY_WINDOW.get() == window as usize {
@@ -2487,6 +2562,105 @@ fn close_window(window: HWND) {
     }) == Some(true)
     {
         continue_window_close(window);
+    }
+}
+
+fn exit_flit(window: HWND) {
+    if exiting()
+        || OPENING_SESSION.get()
+        || WINDOWS.with(|windows| windows.borrow().values().any(|s| s.closing))
+    {
+        return;
+    }
+    let count = WINDOWS.with(|windows| {
+        windows
+            .borrow()
+            .keys()
+            .map(|&window| download_guard::count(window, None))
+            .sum::<usize>()
+    });
+    if count != 0 {
+        let message = wide(&format!(
+            "Downloads in progress: {count}\nExiting Flit may interrupt them. Exit anyway?"
+        ));
+        if unsafe {
+            MessageBoxW(
+                window,
+                message.as_ptr(),
+                windows_sys::w!("Download in progress"),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        } != IDYES
+        {
+            return;
+        }
+    }
+    if exiting() || WINDOWS.with(|windows| windows.borrow().values().any(|s| s.closing)) {
+        return;
+    }
+    let mut order = WINDOWS.with(|windows| {
+        let windows = windows.borrow();
+        let mut order = windows
+            .iter()
+            .map(|(&hwnd, s)| (hwnd, s.id))
+            .collect::<Vec<_>>();
+        order.sort_unstable_by_key(|&(hwnd, id)| (hwnd != window as usize, id));
+        order
+            .into_iter()
+            .map(|(hwnd, _)| hwnd)
+            .collect::<VecDeque<_>>()
+    });
+    let Some(current) = order.pop_front() else {
+        return;
+    };
+    // Save once before asking CEF to tear down any window. Mid-exit writes
+    // would lose the windows that already closed.
+    if let Some(state) = profile_snapshot() {
+        store_session(state);
+    }
+    let timer = RECOVERY_WINDOW.replace(0);
+    if timer != 0 {
+        unsafe {
+            KillTimer(timer as HWND, RECOVERY_TIMER);
+        }
+    }
+    EXIT_SESSION.with(|slot| {
+        slot.replace(Some(ExitSession {
+            current,
+            remaining: order,
+        }))
+    });
+    let _scope = WindowScope::enter(current);
+    begin_window_close(current as HWND);
+}
+
+fn advance_exit(closed: HWND) {
+    let next = EXIT_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let exit = slot
+            .as_mut()
+            .filter(|exit| exit.current == closed as usize)?;
+        let next = WINDOWS.with(|windows| {
+            let windows = windows.borrow();
+            exit.remaining
+                .iter()
+                .position(|window| windows.contains_key(window))
+        });
+        if let Some(next) = next {
+            exit.remaining.drain(..next);
+            exit.current = exit.remaining.pop_front()?;
+            Some(exit.current as HWND)
+        } else {
+            *slot = None;
+            None
+        }
+    });
+    if let Some(next) = next {
+        // Run outside the destroyed window's CEF/Win32 teardown.
+        if unsafe { PostMessageW(next, EXIT_NEXT_WINDOW, 0, 0) } == 0 {
+            EXIT_SESSION.with(|slot| slot.borrow_mut().take());
+            save_session();
+        }
     }
 }
 
@@ -2543,14 +2717,17 @@ fn continue_window_close(window: HWND) {
         close_embedded_page(window, key);
     } else if !waiting {
         if let Some(state) = change(|s| s.closing_session.take()).flatten() {
-            if last_normal_window() {
-                store_session(state.clone());
-            } else if let Some(remaining) = normal_window() {
-                let _scope = WindowScope::enter(remaining as usize);
-                queue_profile_save();
+            if !exiting() {
+                if last_normal_window() {
+                    store_session(session_from(state.clone(), vec![]));
+                } else if let Some(remaining) = profile_snapshot_without(window as usize) {
+                    store_session(remaining);
+                }
             }
             if state.entries.iter().any(|entry| entry.url != HOME) && normal_window().is_some() {
-                let state = session::validated(&state);
+                // If Exit is canceled in a later window, Ctrl+Shift+T can reopen
+                // the normal windows that already closed.
+                let state = session::validated_window(&state);
                 RECENT_NORMAL.with(|items| {
                     remember_closed(&mut items.borrow_mut(), ClosedItem::Window(state))
                 });
@@ -2562,7 +2739,7 @@ fn continue_window_close(window: HWND) {
     }
 }
 
-fn window_snapshot(s: &Shell) -> Session {
+fn window_snapshot(s: &Shell) -> WindowState {
     let mut entries = Vec::new();
     let mut selected = 0;
     for tab in &s.tabs {
@@ -2582,13 +2759,7 @@ fn window_snapshot(s: &Shell) -> Session {
             pinned: tab.pinned,
         });
     }
-    Session {
-        entries,
-        selected,
-        restore: true,
-        sidebar_open: SIDEBAR_DEFAULT.get(),
-        defer_background: DEFER_BACKGROUND.get(),
-    }
+    WindowState { entries, selected }
 }
 
 fn last_normal_window() -> bool {
@@ -2596,14 +2767,46 @@ fn last_normal_window() -> bool {
         && WINDOWS.with(|windows| windows.borrow().values().filter(|s| !s.private).count() == 1)
 }
 
-fn store_session(mut state: Session) {
-    state.sidebar_open = SIDEBAR_DEFAULT.get();
-    state.defer_background = DEFER_BACKGROUND.get();
-    state.restore = RESTORE_TABS.get();
-    if !state.restore {
-        state.entries.clear();
-        state.selected = 0;
+fn session_from(mut primary: WindowState, mut additional_windows: Vec<WindowState>) -> Session {
+    let restore = RESTORE_TABS.get();
+    if !restore {
+        primary.entries.clear();
+        primary.selected = 0;
+        additional_windows.clear();
     }
+    Session {
+        primary,
+        additional_windows,
+        restore,
+        sidebar_open: SIDEBAR_DEFAULT.get(),
+        defer_background: DEFER_BACKGROUND.get(),
+    }
+}
+
+fn profile_snapshot() -> Option<Session> {
+    profile_snapshot_without(0)
+}
+
+fn profile_snapshot_without(excluded: usize) -> Option<Session> {
+    WINDOWS.with(|windows| {
+        let windows = windows.borrow();
+        let mut normal = windows
+            .iter()
+            .filter(|&(&hwnd, s)| !s.private && hwnd != excluded)
+            .collect::<Vec<_>>();
+        normal.sort_unstable_by_key(|&(&hwnd, s)| {
+            (hwnd != LAST_NORMAL.get(), std::cmp::Reverse(s.id))
+        });
+        let mut states = normal.into_iter().take(session::MAX_WINDOWS).map(|(_, s)| {
+            s.closing_session
+                .clone()
+                .unwrap_or_else(|| window_snapshot(s))
+        });
+        Some(session_from(states.next()?, states.collect()))
+    })
+}
+
+fn store_session(state: Session) {
     PROFILE.with(|slot| {
         if let Some(profile) = slot.borrow().as_deref() {
             if let Err(error) = session::save(profile, &state) {
@@ -2614,8 +2817,63 @@ fn store_session(mut state: Session) {
 }
 
 fn save_session() {
-    if let Some(state) = with_shell(|s| (!s.private).then(|| window_snapshot(s))).flatten() {
-        store_session(state);
+    if !exiting() && !OPENING_SESSION.get() {
+        if let Some(state) = profile_snapshot() {
+            store_session(state);
+        }
+    }
+}
+
+fn restore_recovery_copy(window: HWND) {
+    if !RESTORE_TABS.get() {
+        return;
+    }
+    let saved = PROFILE.with(|slot| slot.borrow().as_deref().and_then(session::read_backup));
+    let Some(saved) = saved else {
+        set_text(
+            window,
+            "Flit Browser — No previous session backup is available.",
+        );
+        return;
+    };
+    let mut open = WINDOWS.with(|windows| {
+        windows
+            .borrow()
+            .values()
+            .filter(|s| !s.private && !s.closing)
+            .map(window_snapshot)
+            .collect::<Vec<_>>()
+    });
+    let mut opened = 0;
+    let mut failed = false;
+    for previous in std::iter::once(saved.primary).chain(saved.additional_windows) {
+        // Match each current window at most once, keeping duplicates the user
+        // deliberately had open in separate windows.
+        let same = open.iter().position(|other| {
+            other
+                .entries
+                .iter()
+                .map(|e| (&e.url, e.pinned))
+                .eq(previous.entries.iter().map(|e| (&e.url, e.pinned)))
+        });
+        if let Some(index) = same {
+            open.swap_remove(index);
+        } else if create_window(false, None, Some(previous), SW_SHOWNOACTIVATE).is_ok() {
+            opened += 1;
+        } else {
+            failed = true;
+        }
+    }
+    if failed {
+        set_text(
+            window,
+            "Flit Browser — Some windows in the previous session could not be opened.",
+        );
+    } else if opened == 0 {
+        set_text(
+            window,
+            "Flit Browser — Windows from the previous session are already open.",
+        );
     }
 }
 
@@ -3307,7 +3565,14 @@ fn show_menu(ui: Controls) {
                 }
                 | if private() { MF_GRAYED } else { 0 },
             TOGGLE_RESTORE,
-            windows_sys::w!("Continue last tabs on startup"),
+            windows_sys::w!("Restore windows and tabs on startup"),
+        );
+    }
+    if !private() && RESTORE_TABS.get() {
+        add(
+            RECOVERY_COPY,
+            "Open previous session backup",
+            PROFILE.with(|slot| slot.borrow().as_deref().is_some_and(session::has_backup)),
         );
     }
     separator();
@@ -3321,6 +3586,7 @@ fn show_menu(ui: Controls) {
         true,
     );
     add(UPDATE, "About Flit and updates", true);
+    add(EXIT_FLIT, "Exit Flit (all windows)", true);
     let mut rect = RECT::default();
     let selection = unsafe {
         GetWindowRect(ui.menu, &mut rect);
@@ -3877,8 +4143,11 @@ unsafe extern "system" fn window_proc(
     let _scope = WindowScope::enter(window as usize);
     match message {
         WM_ACTIVATE => {
-            if wp & 0xffff != WA_INACTIVE as usize && with_shell(|s| !s.private) == Some(true) {
-                LAST_NORMAL.set(window as usize);
+            if wp & 0xffff != WA_INACTIVE as usize
+                && with_shell(|s| !s.private && !s.closing) == Some(true)
+                && LAST_NORMAL.replace(window as usize) != window as usize
+            {
+                queue_session_save();
             }
             unsafe { DefWindowProcW(window, message, wp, lp) }
         }
@@ -3977,6 +4246,9 @@ unsafe extern "system" fn window_proc(
             chrome::field_colors(wp as HDC, unsafe { GetDlgCtrlID(lp as HWND) } as usize) as isize
         }
         WM_COMMAND => {
+            if exiting() {
+                return 0;
+            }
             let id = wp & 0xffff;
             let notification = ((wp >> 16) & 0xffff) as u32;
             match id {
@@ -4091,7 +4363,17 @@ unsafe extern "system" fn window_proc(
                 TOGGLE_RESTORE if !private() => {
                     RESTORE_TABS.set(!RESTORE_TABS.get());
                     save_session();
+                    if !RESTORE_TABS.get() {
+                        PROFILE.with(|slot| {
+                            if let Some(profile) = slot.borrow().as_deref()
+                                && let Err(error) = session::remove_backup(profile)
+                            {
+                                eprintln!("Flit Browser: Could not remove the previous session copy: {error}");
+                            }
+                        });
+                    }
                 }
+                RECOVERY_COPY if !private() => restore_recovery_copy(window),
                 EXTENSIONS if !private() => open_builtin("chrome://extensions/"),
                 PASSWORDS if !private() => open_builtin("chrome://password-manager/"),
                 MATERIAL => {
@@ -4146,6 +4428,7 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 CLOSE_WINDOW => close_window(window),
+                EXIT_FLIT => exit_flit(window),
                 ADDRESS if notification == EN_CHANGE => {
                     change(|s| {
                         if !s.updating_address {
@@ -4176,11 +4459,15 @@ unsafe extern "system" fn window_proc(
             0
         }
         CLOSE_BY_KEY => {
-            close_tab(Some(wp));
+            if !exiting() {
+                close_tab(Some(wp));
+            }
             0
         }
         TAB_MENU_ACTION => {
-            tab_action(wp, lp as usize);
+            if !exiting() {
+                tab_action(wp, lp as usize);
+            }
             0
         }
         TAB_CLOSE_CANCELLED => {
@@ -4198,6 +4485,15 @@ unsafe extern "system" fn window_proc(
                 }
                 return 0;
             }
+            EXIT_SESSION.with(|slot| {
+                let mut exit = slot.borrow_mut();
+                if exit
+                    .as_ref()
+                    .is_some_and(|exit| exit.current == window as usize)
+                {
+                    *exit = None;
+                }
+            });
             let native = change(|s| {
                 let tab = s.tabs.iter_mut().find(|tab| tab.key == wp)?;
                 if std::mem::take(&mut tab.close_requested) {
@@ -4222,7 +4518,9 @@ unsafe extern "system" fn window_proc(
             0
         }
         OPEN_SETTINGS_WINDOW => {
-            if let Some((key, url)) = change(|s| s.pending_settings.take()).flatten() {
+            if let Some((key, url)) = change(|s| s.pending_settings.take()).flatten()
+                && !exiting()
+            {
                 let restore = change(|s| {
                     let tab = s.tabs.iter_mut().find(|tab| tab.key == key)?;
                     if settings_target(&tab.url).is_some() && tab.browser.is_some() {
@@ -4241,7 +4539,10 @@ unsafe extern "system" fn window_proc(
         }
         OPEN_LINK => {
             let link = change(|s| s.links.pop_front()).flatten();
-            if let Some((url, disposition)) = link {
+            if let Some((url, disposition)) = link
+                && !exiting()
+                && with_shell(|s| s.closing) == Some(false)
+            {
                 if disposition == WindowOpenDisposition::NEW_WINDOW {
                     let _ = open_window(private(), Some(&url), None);
                 } else {
@@ -4280,6 +4581,16 @@ unsafe extern "system" fn window_proc(
             close_window(window);
             0
         }
+        EXIT_NEXT_WINDOW => {
+            if EXIT_SESSION.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|exit| exit.current == window as usize)
+            }) {
+                begin_window_close(window);
+            }
+            0
+        }
         WM_DESTROY => 0,
         WM_NCDESTROY => {
             unsafe {
@@ -4309,6 +4620,7 @@ unsafe extern "system" fn window_proc(
                 if state.private && !any_private {
                     PRIVATE_CONTEXT.with(|slot| drop(slot.take()));
                 }
+                advance_exit(window);
                 if empty {
                     quit_message_loop();
                 }
