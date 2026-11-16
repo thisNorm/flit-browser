@@ -162,6 +162,9 @@ wrap_request_handler! {
                 return 0;
             }
             let url = CefString::from(&request.url()).to_string();
+            if !agent::vault_allows_navigation(self.tab, &url, redirect != 0) {
+                return 1;
+            }
             let method = CefString::from(&request.method()).to_string();
             if agent::web_url(&url).is_some() && matches!(method.as_str(), "GET" | "HEAD") {
                 let current = CefString::from(&frame.url()).to_string();

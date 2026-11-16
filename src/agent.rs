@@ -1,6 +1,6 @@
 use crate::{
     agent_protocol::{self, Command},
-    agent_view, launch_url,
+    agent_view, launch_url, vault_login, vault_store,
 };
 use cef::*;
 use serde::Deserialize;
@@ -68,6 +68,7 @@ struct State {
     next_tab: u32,
     next_snapshot: u32,
     next_method: i32,
+    next_login: u32,
     context: Option<RequestContext>,
     stopping: Option<Reply>,
 }
@@ -83,6 +84,7 @@ struct Tab {
     observer: Option<Registration>,
     pending: Option<Pending>,
     last_snapshot: Option<(u32, String, Vec<Link>)>,
+    login: Option<Login>,
 }
 
 impl Tab {
@@ -98,15 +100,25 @@ impl Tab {
             observer: None,
             pending: None,
             last_snapshot: None,
+            login: None,
         }
     }
     fn info(&self, id: u32) -> Value {
-        json!({"tab": id, "url": self.url, "title": self.title, "status": self.status,
-               "http_status": self.http_status, "error": self.error})
+        if self.login.is_some() {
+            json!({"tab": id, "status": "signing_in"})
+        } else {
+            json!({"tab": id, "url": self.url, "title": self.title, "status": self.status,
+                   "http_status": self.http_status, "error": self.error})
+        }
     }
     fn invalidate(&mut self) {
         self.last_snapshot = None;
-        if let Some(pending) = self.pending.take() {
+        if let Some(pending) = self.pending.take().filter(|p| {
+            matches!(
+                p.stage,
+                Stage::Frame(Query::Snapshot) | Stage::World(Query::Snapshot) | Stage::Read
+            )
+        }) {
             let _ = pending.reply.send(Err(PAGE_CHANGED.into()));
         }
     }
@@ -136,9 +148,43 @@ struct Pending {
 
 #[derive(Clone, Copy)]
 enum Stage {
-    Frame,
-    World,
+    Frame(Query),
+    World(Query),
     Read,
+    LoginForm,
+    LoginVerify,
+}
+
+#[derive(Clone, Copy)]
+enum Query {
+    Snapshot,
+    LoginForm,
+    LoginVerify,
+}
+
+struct Login {
+    attempt: u32,
+    origin: String,
+    page: String,
+    reply: Reply,
+    request: Option<Urlrequest>,
+    destination: Option<(String, bool)>,
+    submitted_credential: Option<vault_store::Credential>,
+}
+
+const VERIFY_LOGIN: &str = r#"(() => ({
+    url: location.href,
+    has_password: [...document.querySelectorAll('input[type=password]:enabled')]
+        .some(x => x.getClientRects().length && getComputedStyle(x).visibility === 'visible'),
+    needs_mfa: [...document.querySelectorAll('input[autocomplete~=one-time-code]:enabled')]
+        .some(x => x.getClientRects().length && getComputedStyle(x).visibility === 'visible')
+}))()"#;
+
+#[derive(Deserialize)]
+struct LoginPage {
+    url: String,
+    has_password: bool,
+    needs_mfa: bool,
 }
 
 pub(crate) fn web_url(input: &str) -> Option<String> {
@@ -174,8 +220,47 @@ pub(crate) fn loading(id: u32) {
     });
 }
 
+pub(crate) fn vault_allows_navigation(id: u32, url: &str, redirect: bool) -> bool {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(tab) = state.tabs.get_mut(&id) else {
+            return false;
+        };
+        let Some(login) = &mut tab.login else {
+            return true;
+        };
+        if redirect {
+            return false;
+        }
+        if let Some((target, used)) = &mut login.destination {
+            if !*used && target == url {
+                *used = true;
+                return true;
+            }
+        }
+        false
+    })
+}
+
 pub(crate) fn address(id: u32, url: String) {
     if let Some(url) = web_url(&url) {
+        let unexpected = STATE.with(|state| {
+            state
+                .borrow()
+                .tabs
+                .get(&id)
+                .and_then(|tab| tab.login.as_ref())
+                .is_some_and(|login| {
+                    login.page != url
+                        && !login
+                            .destination
+                            .as_ref()
+                            .is_some_and(|(target, _)| *target == url)
+                })
+        });
+        if unexpected {
+            finish_login(id, "action_required", "page_changed");
+        }
         update(id, |tab| {
             if tab.url != url {
                 tab.invalidate();
@@ -194,6 +279,30 @@ pub(crate) fn loaded(id: u32, url: String, http_status: i32) {
                 tab.http_status = (http_status > 0).then_some(http_status);
             }
         });
+        let verify = STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            let tab = s.tabs.get_mut(&id)?;
+            let login = tab.login.as_ref()?;
+            (tab.status == "ready"
+                && login
+                    .destination
+                    .as_ref()
+                    .is_some_and(|(url, used)| *used && *url == tab.url))
+            .then(|| login.reply.clone())
+        });
+        if let Some(reply) = verify {
+            if (200..300).contains(&http_status) {
+                method(
+                    id,
+                    Stage::Frame(Query::LoginVerify),
+                    reply,
+                    "Page.getFrameTree",
+                    None,
+                );
+            } else {
+                finish_login(id, "action_required", "verification_page_failed");
+            }
+        }
     }
 }
 
@@ -203,6 +312,7 @@ pub(crate) fn failed(id: u32, reason: &'static str) {
         tab.status = "error";
         tab.error = Some(reason);
     });
+    finish_login(id, "action_required", "navigation_failed");
 }
 
 pub(crate) fn title(id: u32, title: String) {
@@ -212,6 +322,14 @@ pub(crate) fn title(id: u32, title: String) {
 pub(crate) fn closed(id: u32) {
     let tab = STATE.with(|state| state.borrow_mut().tabs.remove(&id));
     if let Some(mut tab) = tab {
+        if let Some(login) = tab.login.take() {
+            if let Some(request) = login.request {
+                request.cancel();
+            }
+            let _ = login
+                .reply
+                .send(Ok(login_state(id, "action_required", "tab_closed")));
+        }
         tab.invalidate();
         drop(tab);
     }
@@ -280,12 +398,13 @@ fn open(url: &str) -> Result<Value, String> {
 }
 
 fn close(id: u32) -> Result<Value, String> {
+    finish_login(id, "action_required", "tab_closed");
     let browser = STATE.with(|state| {
         let mut s = state.borrow_mut();
         let tab = s
             .tabs
             .get_mut(&id)
-            .filter(|t| !t.closing)
+            .filter(|t| !t.closing && t.login.is_none())
             .ok_or("No such agent tab.")?;
         tab.invalidate();
         tab.closing = true;
@@ -305,7 +424,7 @@ fn follow(id: u32, snapshot: u32, link: u32) -> Result<Value, String> {
         let tab = s
             .tabs
             .get_mut(&id)
-            .filter(|t| !t.closing)
+            .filter(|t| !t.closing && t.login.is_none())
             .ok_or("No such agent tab.")?;
         let (_, _, links) = tab
             .last_snapshot
@@ -335,6 +454,190 @@ fn follow(id: u32, snapshot: u32, link: u32) -> Result<Value, String> {
     Ok(json!({"tab": id, "url": url, "status": if same_document { "ready" } else { "loading" }}))
 }
 
+fn login_state(id: u32, status: &str, reason: &str) -> Value {
+    json!({"tab": id, "status": status, "reason": reason})
+}
+
+fn finish_login(id: u32, status: &str, reason: &str) {
+    let login = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        let tab = s.tabs.get_mut(&id)?;
+        let login = tab.login.take()?;
+        tab.invalidate();
+        Some(login)
+    });
+    if let Some(login) = login {
+        if let Some(request) = login.request {
+            request.cancel();
+        }
+        let _ = login.reply.send(Ok(login_state(id, status, reason)));
+    }
+}
+
+fn sign_in(id: u32, reply: Reply) {
+    let start = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.next_login = s.next_login.checked_add(1).ok_or("attempt_limit")?;
+        let attempt = s.next_login;
+        let tab = s
+            .tabs
+            .get_mut(&id)
+            .filter(|t| !t.closing)
+            .ok_or("no_such_tab")?;
+        if tab.login.is_some() {
+            return Err("already_signing_in");
+        }
+        if tab.status != "ready"
+            || !tab
+                .http_status
+                .is_some_and(|code| (200..300).contains(&code))
+        {
+            return Err("page_not_ready");
+        }
+        let origin = vault_store::origin(&tab.url).ok_or("https_required")?;
+        if !vault_store::has(&origin).map_err(|_| "vault_unavailable")? {
+            return Err("not_saved");
+        }
+        tab.invalidate();
+        tab.login = Some(Login {
+            attempt,
+            origin,
+            page: tab.url.clone(),
+            reply: reply.clone(),
+            request: None,
+            destination: None,
+            submitted_credential: None,
+        });
+        Ok::<_, &str>(attempt)
+    });
+    let attempt = match start {
+        Ok(attempt) => attempt,
+        Err(reason) => {
+            let _ = reply.send(Ok(login_state(id, "action_required", reason)));
+            return;
+        }
+    };
+    let mut timeout = LoginTimeout::new(id, attempt);
+    if post_delayed_task(ThreadId::UI, Some(&mut timeout), 9000) == 0 {
+        finish_login(id, "action_required", "could_not_start");
+        return;
+    }
+    method(
+        id,
+        Stage::Frame(Query::LoginForm),
+        reply,
+        "Page.getFrameTree",
+        None,
+    );
+}
+
+wrap_task! {
+    struct LoginTimeout { tab: u32, attempt: u32 }
+    impl Task {
+        fn execute(&self) {
+            let still_waiting = STATE.with(|state| {
+                state.borrow().tabs.get(&self.tab).and_then(|tab| tab.login.as_ref())
+                    .is_some_and(|login| login.attempt == self.attempt)
+            });
+            if still_waiting {
+                finish_login(self.tab, "action_required", "timed_out");
+            }
+        }
+    }
+}
+
+fn send_login(id: u32, data: vault_login::Probe) -> Result<(), &'static str> {
+    let form = data.form.ok_or(match data.reason.as_deref() {
+        Some("different_origin") => "different_origin",
+        Some("no_password_form") => "no_password_form",
+        _ => vault_login::UNSUPPORTED,
+    })?;
+    let (attempt, origin, mut context) = STATE.with(|state| {
+        let s = state.borrow();
+        let tab = s.tabs.get(&id).ok_or("no_such_tab")?;
+        let login = tab.login.as_ref().ok_or("page_changed")?;
+        if web_url(&form.page).as_deref() != Some(login.page.as_str()) || tab.url != login.page {
+            return Err("page_changed");
+        }
+        Ok((
+            login.attempt,
+            login.origin.clone(),
+            s.context.clone().ok_or("vault_unavailable")?,
+        ))
+    })?;
+    let credential = vault_store::load(&origin)
+        .map_err(|_| "vault_unavailable")?
+        .ok_or("not_saved")?;
+    let (action, mut request) = vault_login::request(&origin, &form, &credential)?;
+    let mut client = VaultRequest::new(id, attempt, action);
+    let request = urlrequest_create(Some(&mut request), Some(&mut client), Some(&mut context))
+        .ok_or("could_not_start")?;
+    update(id, |tab| {
+        if let Some(login) = tab.login.as_mut().filter(|login| login.attempt == attempt) {
+            login.request = Some(request);
+            login.submitted_credential = Some(credential);
+        }
+    });
+    Ok(())
+}
+
+wrap_urlrequest_client! {
+    struct VaultRequest { tab: u32, attempt: u32, action: Url }
+    impl UrlrequestClient {
+        fn on_request_complete(&self, request: Option<&mut Urlrequest>) {
+            let current = STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                let tab = state.tabs.get_mut(&self.tab)?;
+                let login = tab.login.as_mut().filter(|login| login.attempt == self.attempt)?;
+                login.request.take();
+                Some((login.origin.clone(), login.page.clone(), tab.browser.clone()?,
+                      login.submitted_credential.take()?))
+            });
+            let Some((origin, page, browser, credential)) = current else { return };
+            let target = request.and_then(|request|
+                vault_login::continuation(request, &self.action, &origin, &credential))
+                .filter(|url| url != &page);
+            drop(credential);
+            let Some((target, frame)) = target.zip(browser.main_frame()) else {
+                finish_login(self.tab, "action_required", "login_not_verified");
+                return;
+            };
+            update(self.tab, |tab| {
+                if let Some(login) = tab.login.as_mut() {
+                    login.destination = Some((target.clone(), false));
+                }
+            });
+            frame.load_url(Some(&CefString::from(target.as_str())));
+        }
+    }
+}
+
+fn verify_login(id: u32, page: LoginPage) {
+    let verified = STATE.with(|state| {
+        let s = state.borrow();
+        s.tabs.get(&id).and_then(|tab| {
+            let login = tab.login.as_ref()?;
+            Some(
+                web_url(&page.url).as_deref() == Some(tab.url.as_str())
+                    && login
+                        .destination
+                        .as_ref()
+                        .is_some_and(|(url, used)| *used && url == &page.url)
+                    && page.url != login.page
+                    && !page.has_password
+                    && vault_store::origin(&page.url).as_deref() == Some(login.origin.as_str()),
+            )
+        }) == Some(true)
+    });
+    if page.needs_mfa {
+        finish_login(id, "action_required", "additional_verification");
+    } else if verified {
+        finish_login(id, "submitted", "destination_verified");
+    } else {
+        finish_login(id, "action_required", "login_not_verified");
+    }
+}
+
 fn dictionary() -> Result<DictionaryValue, String> {
     dictionary_value_create().ok_or_else(|| "Flit could not allocate a page query.".into())
 }
@@ -358,18 +661,33 @@ fn method(id: u32, stage: Stage, reply: Reply, name: &str, mut params: Option<Di
         Some((browser, method))
     });
     let Some((browser, method_id)) = browser else {
-        let _ = reply.send(Err("No such agent tab.".into()));
+        if is_login_stage(stage) {
+            finish_login(id, "action_required", "page_changed");
+        } else {
+            let _ = reply.send(Err("No such agent tab.".into()));
+        }
         return;
     };
     if browser.host().is_none_or(|host| {
         host.execute_dev_tools_method(method_id, Some(&CefString::from(name)), params.as_mut()) == 0
     }) {
         if let Some(pending) = take_pending(id, method_id) {
-            let _ = pending
-                .reply
-                .send(Err("The page query could not start.".into()));
+            if is_login_stage(pending.stage) {
+                finish_login(id, "action_required", "could_not_start");
+            } else {
+                let _ = pending
+                    .reply
+                    .send(Err("The page query could not start.".into()));
+            }
         }
     }
+}
+
+fn is_login_stage(stage: Stage) -> bool {
+    !matches!(
+        stage,
+        Stage::Frame(Query::Snapshot) | Stage::World(Query::Snapshot) | Stage::Read
+    )
 }
 
 fn take_pending(id: u32, method: i32) -> Option<Pending> {
@@ -392,11 +710,20 @@ fn snapshot(id: u32, reply: Reply) {
             .get_mut(&id)
             .filter(|t| !t.closing)
             .ok_or("No such agent tab.")?;
+        if tab.login.is_some() {
+            return Ok::<_, &str>(("signing_in", tab.info(id)));
+        }
         tab.invalidate();
         Ok::<_, &str>((tab.status, tab.info(id)))
     });
     match state {
-        Ok(("ready", _)) => method(id, Stage::Frame, reply, "Page.getFrameTree", None),
+        Ok(("ready", _)) => method(
+            id,
+            Stage::Frame(Query::Snapshot),
+            reply,
+            "Page.getFrameTree",
+            None,
+        ),
         Ok((_, info)) => {
             let _ = reply.send(Ok(info));
         }
@@ -457,7 +784,7 @@ fn receive(id: u32, pending: Pending, bytes: Option<&[u8]>) -> Result<(), String
         .and_then(|bytes| serde_json::from_slice(bytes).ok())
         .ok_or("The page was unavailable or the page query exceeded its size limit.")?;
     match pending.stage {
-        Stage::Frame => {
+        Stage::Frame(query) => {
             let frame = result
                 .pointer("/frameTree/frame/id")
                 .and_then(Value::as_str)
@@ -467,30 +794,29 @@ fn receive(id: u32, pending: Pending, bytes: Option<&[u8]>) -> Result<(), String
             set_string(&params, "worldName", "Flit Agent Reader");
             method(
                 id,
-                Stage::World,
+                Stage::World(query),
                 pending.reply,
                 "Page.createIsolatedWorld",
                 Some(params),
             );
         }
-        Stage::World => {
+        Stage::World(query) => {
             let context = result
                 .get("executionContextId")
                 .and_then(Value::as_i64)
                 .and_then(|id| i32::try_from(id).ok())
                 .ok_or("Could not create the local page reader.")?;
             let params = dictionary()?;
-            set_string(&params, "expression", READ_DOM);
+            let (stage, expression) = match query {
+                Query::Snapshot => (Stage::Read, READ_DOM),
+                Query::LoginForm => (Stage::LoginForm, vault_login::FORM_SCRIPT),
+                Query::LoginVerify => (Stage::LoginVerify, VERIFY_LOGIN),
+            };
+            set_string(&params, "expression", expression);
             params.set_int(Some(&CefString::from("contextId")), context);
             params.set_bool(Some(&CefString::from("returnByValue")), 1);
             params.set_bool(Some(&CefString::from("silent")), 1);
-            method(
-                id,
-                Stage::Read,
-                pending.reply,
-                "Runtime.evaluate",
-                Some(params),
-            );
+            method(id, stage, pending.reply, "Runtime.evaluate", Some(params));
         }
         Stage::Read => {
             let page = result
@@ -499,6 +825,24 @@ fn receive(id: u32, pending: Pending, bytes: Option<&[u8]>) -> Result<(), String
                 .and_then(|data| serde_json::from_value(data).ok())
                 .ok_or("This document did not return a readable page snapshot.")?;
             let _ = pending.reply.send(page_result(id, page));
+        }
+        Stage::LoginForm => {
+            let data = result
+                .pointer("/result/value")
+                .cloned()
+                .and_then(|data| serde_json::from_value(data).ok())
+                .ok_or("Could not check the login form.")?;
+            if let Err(reason) = send_login(id, data) {
+                finish_login(id, "action_required", reason);
+            }
+        }
+        Stage::LoginVerify => {
+            let page = result
+                .pointer("/result/value")
+                .cloned()
+                .and_then(|data| serde_json::from_value(data).ok())
+                .ok_or("Could not verify the destination page.")?;
+            verify_login(id, page);
         }
     }
     Ok(())
@@ -512,8 +856,13 @@ wrap_dev_tools_message_observer! {
         ) {
             if let Some(pending) = take_pending(self.tab, method) {
                 let reply = pending.reply.clone();
+                let login = is_login_stage(pending.stage);
                 if let Err(error) = receive(self.tab, pending, if success == 0 { None } else { result }) {
-                    let _ = reply.send(Err(error));
+                    if login {
+                        finish_login(self.tab, "action_required", "page_changed");
+                    } else {
+                        let _ = reply.send(Err(error));
+                    }
                 }
             }
         }
@@ -537,6 +886,10 @@ fn execute(command: Command, reply: Reply) {
             link,
         } => follow(tab, snapshot, link),
         Command::Close { tab } => close(tab),
+        Command::SignIn { tab } => {
+            sign_in(tab, reply);
+            return;
+        }
     };
     let _ = reply.send(value);
 }
@@ -605,6 +958,11 @@ wrap_app! {
                     command.append_switch(Some(&CefString::from("disable-component-extensions-with-background-pages")));
                     command.append_switch(Some(&CefString::from("disable-background-networking")));
                     command.append_switch(Some(&CefString::from("disable-extensions")));
+                    #[cfg(feature = "vault-fixture")]
+                    command.append_switch_with_value(
+                        Some(&CefString::from("ignore-certificate-errors-spki-list")),
+                        Some(&CefString::from(env!("FLIT_FIXTURE_SPKI"))),
+                    );
                 }
             }
         }

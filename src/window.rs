@@ -7,6 +7,7 @@ use crate::{
     panel_motion::Motion,
     permissions,
     session::{self, Entry, Session},
+    vault_ui,
 };
 use cef::*;
 use std::{
@@ -100,6 +101,8 @@ const SITE_INFO: usize = 166;
 const FREE_MEMORY: usize = 167;
 const TOGGLE_DEFER_BACKGROUND: usize = 168;
 const RELOAD_SHORTCUT: usize = 169;
+const VAULT_SAVE: usize = 170;
+const VAULT_REMOVE: usize = 171;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -3176,6 +3179,20 @@ pub(crate) fn find_update(key: usize, count: i32, active_match: i32) {
     }
 }
 
+fn vault_site() -> Option<vault_ui::Site> {
+    let browser = with_shell(|s| {
+        if s.private || s.closing {
+            return None;
+        }
+        let tab = s.tabs.iter().find(|t| Some(t.key) == s.active)?;
+        if tab.unloaded || tab.unloading || tab.close_requested || tab.retiring {
+            return None;
+        }
+        tab.browser.clone()
+    })??;
+    vault_ui::site(&browser)
+}
+
 fn show_menu(ui: Controls) {
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
@@ -3261,6 +3278,15 @@ fn show_menu(ui: Controls) {
         !private(),
     );
     add(PASSWORDS, "Password manager", !private());
+    let vault_site_at_open = vault_site();
+    if let Some(site) = &vault_site_at_open {
+        add(VAULT_SAVE, "Add or update Flit Vault login…", true);
+        add(
+            VAULT_REMOVE,
+            "Remove Flit Vault login…",
+            matches!(crate::vault_store::has(&site.origin), Ok(true)),
+        );
+    }
     add(EXTENSIONS, "Extensions", !private());
     add(
         DEVTOOLS,
@@ -3296,7 +3322,7 @@ fn show_menu(ui: Controls) {
     );
     add(UPDATE, "About Flit and updates", true);
     let mut rect = RECT::default();
-    unsafe {
+    let selection = unsafe {
         GetWindowRect(ui.menu, &mut rect);
         let selection = TrackPopupMenu(
             menu,
@@ -3308,9 +3334,19 @@ fn show_menu(ui: Controls) {
             null(),
         );
         DestroyMenu(menu);
-        if selection != 0 {
-            PostMessageW(ui.window, WM_COMMAND, selection as usize, 0);
+        selection as usize
+    };
+    match selection {
+        // Handle Vault actions only as a native menu selection, outside WM_COMMAND.
+        VAULT_SAVE | VAULT_REMOVE => {
+            if let Some(site) = vault_site_at_open {
+                vault_ui::manage(ui.window, &site, selection == VAULT_REMOVE, vault_site);
+            }
         }
+        0 => (),
+        _ => unsafe {
+            PostMessageW(ui.window, WM_COMMAND, selection, 0);
+        },
     }
 }
 

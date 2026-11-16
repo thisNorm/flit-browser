@@ -25,6 +25,7 @@ TOOLS = {
     "flit_snapshot": {"tab"},
     "flit_follow_link": {"tab", "snapshot", "link"},
     "flit_close_tab": {"tab"},
+    "flit_sign_in": {"tab"},
 }
 DOM_TEXT = "렌더링된 한국어 문장: 사과와 포도"
 PASSWORD = "FLIT_FIXTURE_DUMMY_VALUE_6D94"

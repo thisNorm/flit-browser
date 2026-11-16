@@ -1,12 +1,15 @@
 [package]
 name = "flit-browser"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 publish = false
 
 [lib]
 name = "flit"
 crate-type = ["cdylib"]
+
+[features]
+vault-fixture = []
 
 [dependencies]
 cef = { version = "=156.4.0", default-features = false, features = ["sandbox"] }
@@ -17,6 +20,8 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
+  "Win32_Security_Credentials",
+  "Win32_Security_Cryptography",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_Console",

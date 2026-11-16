@@ -13,6 +13,9 @@ mod panel_motion;
 mod permissions;
 mod session;
 mod updater;
+mod vault_login;
+mod vault_store;
+mod vault_ui;
 mod window;
 
 use cef::*;

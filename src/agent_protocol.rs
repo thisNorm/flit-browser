@@ -15,6 +15,7 @@ const LIST: &str = "flit_list_tabs";
 const SNAPSHOT: &str = "flit_snapshot";
 const FOLLOW: &str = "flit_follow_link";
 const CLOSE: &str = "flit_close_tab";
+const SIGN_IN: &str = "flit_sign_in";
 
 #[derive(Clone, Debug)]
 pub(crate) enum Command {
@@ -23,6 +24,7 @@ pub(crate) enum Command {
     Snapshot { tab: u32 },
     Follow { tab: u32, snapshot: u32, link: u32 },
     Close { tab: u32 },
+    SignIn { tab: u32 },
 }
 
 pub(crate) fn serve(
@@ -192,7 +194,7 @@ fn initialize(params: Option<&Map<String, Value>>) -> RpcResult {
         "protocolVersion":version,
         "capabilities":{"tools":{"listChanged":false}},
         "serverInfo":{"name":"flit-browser","version":env!("CARGO_PKG_VERSION")},
-        "instructions":"Use only public pages in isolated agent tabs. Do not use credentials, submit forms, interact with chats, or run scripts."
+        "instructions":"Use isolated agent tabs for public browsing. Use flit_sign_in only with explicit Flit Vault enrollment for the tab's current approved HTTPS origin and a supported login form. Never request or pass credentials. Ordinary form submission, chat interaction, and arbitrary scripts are unavailable. A submitted status with reason destination_verified means the same-origin destination returned HTTP 2xx with no visible login or OTP prompt. Use a fresh flit_snapshot to look for site-specific confirmation before reporting that the user is signed in. If the tool returns action_required, report the reason."
     }))
 }
 
@@ -220,6 +222,8 @@ fn tool_catalog() -> Value {
         tool(FOLLOW, "Navigate an isolated agent tab using a public link ID from the specified snapshot. No arbitrary clicks, form submission, or chat interaction.",
             json!({"tab":id,"snapshot":id,"link":id}), &["tab", "snapshot", "link"]),
         tool(CLOSE, "Close an isolated agent tab used for a public page.",
+            json!({"tab":id}), &["tab"]),
+        tool(SIGN_IN, "Attempt sign-in on the current page of an isolated agent tab. Requires a supported login form and a saved Flit Vault credential explicitly enrolled for the tab's current approved HTTPS origin. Supply only the tab ID. Returns status submitted with reason destination_verified after a same-origin destination returns HTTP 2xx with no visible login or OTP prompt, or action_required with a reason. Use a fresh flit_snapshot to confirm sign-in on the site.",
             json!({"tab":id}), &["tab"])
     ]})
 }
@@ -267,7 +271,8 @@ fn call_tool(
             _ => None,
         },
         (CLOSE, 1) => number("tab").map(|tab| Command::Close { tab }),
-        (OPEN | LIST | SNAPSHOT | FOLLOW | CLOSE, _) => None,
+        (SIGN_IN, 1) => number("tab").map(|tab| Command::SignIn { tab }),
+        (OPEN | LIST | SNAPSHOT | FOLLOW | CLOSE | SIGN_IN, _) => None,
         _ => return Err((-32602, "Unknown tool")),
     };
 
@@ -377,7 +382,8 @@ mod tests {
                     "flit_list_tabs",
                     "flit_snapshot",
                     "flit_follow_link",
-                    "flit_close_tab"
+                    "flit_close_tab",
+                    "flit_sign_in"
                 ]
             );
             assert!(
@@ -385,6 +391,34 @@ mod tests {
                     .iter()
                     .all(|tool| tool["inputSchema"]["additionalProperties"] == false)
             );
+            assert_eq!(
+                tools[5]["inputSchema"],
+                json!({
+                    "type":"object",
+                    "properties":{"tab":{"type":"integer","minimum":0,"maximum":u32::MAX}},
+                    "required":["tab"],
+                    "additionalProperties":false
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_sign_in_arguments_without_dispatch() {
+        for arguments in [
+            json!({}),
+            json!({"tab":-1}),
+            json!({"tab":1.5}),
+            json!({"tab":"1"}),
+            json!({"tab":u64::from(u32::MAX) + 1}),
+            json!({"tab":1,"credentials":{}}),
+            json!({"tab":1,"selector":"form"}),
+            json!({"tab":1,"url":"https://example.invalid/"}),
+        ] {
+            let request = call(1, "flit_sign_in", arguments);
+            let reply =
+                dispatch(&request, &mut |_| panic!("invalid sign-in call dispatched")).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{request}");
         }
     }
 
@@ -475,6 +509,7 @@ mod tests {
         let url = "HTTPS://example.com/%2F?q=a@b";
         let snapshot = json!({"snapshot":2,"text":"첫 줄\n다음 줄",
                              "links":[{"id":3,"text":"example","url":url}]});
+        let sign_in = json!({"tab":u32::MAX,"status":"submitted","reason":"destination_verified"});
         let mut executed = 0;
         let replies = requests(
             &[
@@ -487,6 +522,7 @@ mod tests {
                     json!({"tab":1,"snapshot":2,"link":3}),
                 ),
                 call(5, "flit_close_tab", json!({"tab":1})),
+                call(6, "flit_sign_in", json!({"tab":u32::MAX})),
             ],
             |command| {
                 executed += 1;
@@ -503,11 +539,12 @@ mod tests {
                         },
                     ) => Err("stale snapshot".into()),
                     (5, Command::Close { tab: 1 }) => Ok(json!("closed")),
+                    (6, Command::SignIn { tab: u32::MAX }) => Ok(sign_in.clone()),
                     other => panic!("unexpected dispatch: {other:?}"),
                 }
             },
         );
-        assert_eq!(executed, 5);
+        assert_eq!(executed, 6);
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(replies[2]["result"]["structuredContent"], snapshot);
         assert_eq!(
@@ -522,5 +559,7 @@ mod tests {
         assert!(replies[3]["result"].get("structuredContent").is_none());
         assert_eq!(replies[4]["result"]["content"][0]["text"], "closed");
         assert!(replies[4]["result"].get("structuredContent").is_none());
+        assert_eq!(replies[5]["result"]["isError"], false);
+        assert_eq!(replies[5]["result"]["structuredContent"], sign_in);
     }
 }

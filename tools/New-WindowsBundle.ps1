@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory)][string]$CefRuntime,
     [Parameter(Mandatory)][string]$FlitDll,
     [Parameter(Mandatory)][string]$Destination,
-    [string]$Version = '0.11.0'
+    [string]$Version = '0.12.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,7 +39,7 @@ You can choose a different absolute path with --flit-profile=PATH.
 The folder must be empty or already initialized by Flit. Other browsers' profiles are not supported.
 
 For local MCP, configure Flit.exe with the single argument --flit-agent and stdio transport.
-This preview has no connected update channel or Vault sign-in tool.
+Flit Vault supports selected HTTPS password forms. The preview has no connected update channel.
 Review LICENSE.txt and CREDITS.html for CEF and the bundled Chromium components.
 "@ | Set-Content -LiteralPath (Join-Path $destinationPath 'README.txt') -Encoding UTF8
 Get-Item -LiteralPath (Join-Path $destinationPath 'Flit.exe')
