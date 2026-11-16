@@ -228,6 +228,7 @@ enum DownloadClose {
 
 struct Tab {
     key: usize,
+    return_tab: Option<usize>,
     panel: HWND,
     browser: Option<Browser>,
     native_window: Option<Window>,
@@ -259,6 +260,12 @@ enum ClosedItem {
     Window(WindowState),
 }
 
+struct PendingLink {
+    url: String,
+    disposition: WindowOpenDisposition,
+    source: Option<usize>,
+}
+
 struct Shell {
     controls: Controls,
     id: usize,
@@ -281,7 +288,7 @@ struct Shell {
     updating_address: bool,
     row_close: Option<(usize, u32)>,
     tab_drag: Option<TabDrag>,
-    links: VecDeque<(String, WindowOpenDisposition)>,
+    links: VecDeque<PendingLink>,
     popups: Vec<Browser>,
     pending_popups: BTreeSet<(usize, i32)>,
     settings_window: Option<Browser>,
@@ -450,7 +457,7 @@ wrap_request_handler! {
         ) -> i32 {
             if frame.is_none_or(|frame| frame.is_main() != 0) {
                 if let Some(url) = request.map(|request| CefString::from(&request.url())) {
-                    if queue_link(self.window, Some(&url), WindowOpenDisposition::NEW_FOREGROUND_TAB) {
+                    if queue_link(self.window, Some(&url), WindowOpenDisposition::NEW_FOREGROUND_TAB, None) {
                         return 1;
                     }
                 }
@@ -465,7 +472,7 @@ wrap_request_handler! {
                 WindowOpenDisposition::NEW_BACKGROUND_TAB | WindowOpenDisposition::NEW_WINDOW => disposition,
                 _ => WindowOpenDisposition::NEW_FOREGROUND_TAB,
             };
-            i32::from(queue_link(self.window, url, disposition))
+            i32::from(queue_link(self.window, url, disposition, None))
         }
     }
 }
@@ -508,7 +515,7 @@ wrap_life_span_handler! {
             _extra: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
             if gesture != 0 {
-                queue_link(self.window, url, disposition);
+                queue_link(self.window, url, disposition, None);
             }
             1
         }
@@ -656,7 +663,7 @@ wrap_life_span_handler! {
                 }
             } else if matches!(disposition, WindowOpenDisposition::NEW_FOREGROUND_TAB
                 | WindowOpenDisposition::NEW_BACKGROUND_TAB | WindowOpenDisposition::NEW_WINDOW) {
-                queue_link(self.window, target_url, disposition);
+                queue_link(self.window, target_url, disposition, Some(self.key));
             }
             1
         }
@@ -769,14 +776,19 @@ wrap_request_handler! {
         ) -> i32 {
             if gesture != 0 && matches!(disposition, WindowOpenDisposition::NEW_FOREGROUND_TAB
                 | WindowOpenDisposition::NEW_BACKGROUND_TAB | WindowOpenDisposition::NEW_WINDOW)
-                && queue_link(self.window, url, disposition) {
+                && queue_link(self.window, url, disposition, Some(self.key)) {
                 1
             } else { 0 }
         }
     }
 }
 
-fn queue_link(window: usize, url: Option<&CefString>, disposition: WindowOpenDisposition) -> bool {
+fn queue_link(
+    window: usize,
+    url: Option<&CefString>,
+    disposition: WindowOpenDisposition,
+    source: Option<usize>,
+) -> bool {
     if exiting() {
         return true;
     }
@@ -793,7 +805,11 @@ fn queue_link(window: usize, url: Option<&CefString>, disposition: WindowOpenDis
         if s.closing {
             return false;
         }
-        s.links.push_back((url, disposition));
+        s.links.push_back(PendingLink {
+            url,
+            disposition,
+            source,
+        });
         if unsafe { PostMessageW(window as HWND, OPEN_LINK, 0, 0) } == 0 {
             s.links.pop_back();
             false
@@ -1321,7 +1337,7 @@ fn create_window(
     let restored = if let Some(state) = saved.filter(|state| !private && !state.entries.is_empty())
     {
         for entry in state.entries {
-            append_tab(&entry.url, &entry.title, entry.pinned)?;
+            append_tab(&entry.url, &entry.title, entry.pinned, None)?;
         }
         Some(state.selected)
     } else {
@@ -2056,11 +2072,12 @@ fn select(index: usize) {
 }
 
 fn add_tab(url: &str) -> Result<(), &'static str> {
-    open_tab(url, true)
+    open_tab(url, true, None)
 }
 
-fn open_tab(url: &str, foreground: bool) -> Result<(), &'static str> {
-    let (key, index) = append_tab(url, "", false)?;
+fn open_tab(url: &str, foreground: bool, source: Option<usize>) -> Result<(), &'static str> {
+    let return_tab = if foreground { source } else { None };
+    let (key, index) = append_tab(url, "", false, return_tab)?;
     if foreground || with_shell(|s| s.active.is_none()) == Some(true) {
         select(index);
     } else {
@@ -2083,7 +2100,12 @@ fn physical_memory_low() -> bool {
     ok && status.ullAvailPhys < (status.ullTotalPhys / 16).clamp(512 << 20, 3 << 30)
 }
 
-fn append_tab(url: &str, title: &str, pinned: bool) -> Result<(usize, usize), &'static str> {
+fn append_tab(
+    url: &str,
+    title: &str,
+    pinned: bool,
+    return_tab: Option<usize>,
+) -> Result<(usize, usize), &'static str> {
     let (ui, key) = change(|s| {
         if s.closing {
             return None;
@@ -2118,6 +2140,7 @@ fn append_tab(url: &str, title: &str, pinned: bool) -> Result<(usize, usize), &'
     let index = change(|s| {
         s.tabs.push(Tab {
             key,
+            return_tab,
             panel,
             browser: None,
             native_window: None,
@@ -2298,7 +2321,8 @@ fn navigate(new_tab: bool) {
         return;
     }
     if new_tab {
-        match add_tab(&url) {
+        let source = with_shell(|s| s.active).flatten();
+        match open_tab(&url, true, source) {
             Ok(()) => focus_page(),
             Err(message) => set_text(ui.window, &format!("{} — {message}", app_title())),
         }
@@ -2417,21 +2441,19 @@ fn closed(key: usize) {
                 RECENT_NORMAL.with(|items| remember_closed(&mut items.borrow_mut(), item));
             }
         }
-        let next = if s.tabs.is_empty() {
-            None
-        } else {
-            s.tabs
-                .iter()
-                .position(|t| Some(t.key) == s.active)
-                .or_else(|| Some(index.min(s.tabs.len() - 1)))
-        };
-        Some((
-            s.controls.window,
-            tab.panel,
-            next,
-            Some(key) == s.active,
-            s.closing,
-        ))
+        let was_active = s.active == Some(key);
+        let next = (!s.tabs.is_empty()).then(|| {
+            if was_active
+                && let Some(source) = tab.return_tab
+                && let Some(source_index) = s.tabs.iter().position(|t| {
+                    t.key == source && !t.unloading && !t.retiring && !t.close_requested
+                })
+            {
+                return source_index;
+            }
+            index.min(s.tabs.len() - 1)
+        });
+        Some((s.controls.window, tab.panel, next, was_active, s.closing))
     })
     .flatten() else {
         return;
@@ -3059,7 +3081,8 @@ fn reopen_closed() {
                 })
             };
             let _scope = WindowScope::enter(target);
-            let Ok((key, appended)) = append_tab(&entry.url, &entry.title, entry.pinned) else {
+            let Ok((key, appended)) = append_tab(&entry.url, &entry.title, entry.pinned, None)
+            else {
                 let item = ClosedItem::Tab {
                     owner,
                     index,
@@ -3472,7 +3495,7 @@ fn run_bookmark_request(request: BookmarkRequest) {
     .flatten();
     let key = match existing
         .map(Ok)
-        .unwrap_or_else(|| append_tab(MANAGER_URL, "", false).map(|(key, _)| key))
+        .unwrap_or_else(|| append_tab(MANAGER_URL, "", false, None).map(|(key, _)| key))
     {
         Ok(key) => key,
         Err(message) => {
@@ -5033,7 +5056,11 @@ unsafe extern "system" fn window_proc(
         }
         OPEN_LINK => {
             let link = change(|s| s.links.pop_front()).flatten();
-            if let Some((url, disposition)) = link
+            if let Some(PendingLink {
+                url,
+                disposition,
+                source,
+            }) = link
                 && !exiting()
                 && with_shell(|s| s.closing) == Some(false)
             {
@@ -5043,6 +5070,7 @@ unsafe extern "system" fn window_proc(
                     let _ = open_tab(
                         &url,
                         disposition != WindowOpenDisposition::NEW_BACKGROUND_TAB,
+                        source,
                     );
                 }
             }

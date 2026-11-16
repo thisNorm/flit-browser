@@ -1,4 +1,4 @@
-"""Verify address submission to a foreground tab in an owned Flit window."""
+"""Verify foreground address submission and source selection on close in an owned Flit window."""
 
 import argparse
 import json
@@ -6,12 +6,13 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import time
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 from windows_multi_session import clean_scratch
 from windows_search import ENGINES, PAGES, TERM, page, proxy
 from windows_session import loaded_panels, select
-from windows_smoke import ADDRESS, OwnedProcess, WORKSPACE, Win32, require
+from windows_smoke import ADDRESS, NEW_TAB, OwnedProcess, WORKSPACE, Win32, require
 from windows_tab_order import dll_sha256
 from windows_windows import Window, seed_profile
 
@@ -19,7 +20,7 @@ from windows_windows import Window, seed_profile
 FOCUS_ADDRESS, GO_NEW_TAB, CLOSE_TAB = 113, 180, 106
 WM_SYSKEYDOWN, WM_SYSCHAR, VK_RETURN = 0x0104, 0x0106, 0x0D
 ALT_ENTER = 0x201C0001  # Alt context, Enter scan code, one keystroke.
-START, TARGET = "/start", "/normal"
+START, TARGET, PEER = "/start", "/normal", "/peer"
 
 
 def exercise(browser, checks):
@@ -42,11 +43,11 @@ def exercise(browser, checks):
         unchanged_source()
         checks[label] = True
 
-    def foreground(label):
+    def foreground(label, tabs=2):
         def new_panel():
             panel = browser.page_panel()
-            if (browser.tab_count() == 2 and browser.selected() == 1
-                    and loaded_panels(browser) == 2 and panel and panel != source_panel):
+            if (browser.tab_count() == tabs and browser.selected() == tabs - 1
+                    and loaded_panels(browser) == tabs and panel and panel != source_panel):
                 return panel
 
         panel = browser.wait(label, new_panel, 6)
@@ -118,9 +119,45 @@ def exercise(browser, checks):
     quiet("empty_draft_did_not_open_tab", pages)
     unchanged_source()
 
+    browser.command(NEW_TAB)
+    page(browser, PEER, site.snapshot()[0], submit=True)
+    peer_panel = foreground("unrelated_tab_to_right")
+    select(browser, 0)
+    original("source_is_not_last", 2)
+
+    def open_from_source(label):
+        edit(target_url)
+        before = site.snapshot()[0]
+        alt_enter()
+        panel = foreground(label, tabs=3)
+        page(browser, TARGET, before)
+        require(panel != peer_panel, "Alt+Enter reused the unrelated tab's native panel")
+        unchanged_source()
+        return panel
+
+    open_from_source("alt_enter_url_from_non_last_source")
+    browser.command(CLOSE_TAB)
+    original("close_alt_enter_restores_non_last_source", 2)
+
+    opened_panel = open_from_source("alt_enter_url_before_source_close")
+    browser.close_row(0)
+    browser.wait("Alt+Enter tab still active after the source closed", lambda: (
+        browser.tab_count() == 2 and browser.selected() == 1
+        and browser.page_panel() == opened_panel and browser.address() == target_url
+    ), 6)
+    browser.command(CLOSE_TAB)
+    label = "close_alt_enter_after_source_closed_selects_survivor"
+    browser.wait(label, lambda: (
+        browser.tab_count() == 1 and browser.selected() == 0
+        and browser.page_panel() == peer_panel and browser.address() == site.origin + PEER
+        and browser.has_page_title(PAGES[PEER])
+    ), 6)
+    unchanged_source()
+    checks[label] = True
+
 
 def run(exe, profile, report):
-    with proxy() as site:
+    with patch.dict(PAGES, {PEER: "Flit unrelated tab"}), proxy() as site:
         try:
             seed_profile(profile, site.origin)
             args = [f"--flit-profile={profile}", f"--flit-url={site.origin}{START}"]

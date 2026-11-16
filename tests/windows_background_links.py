@@ -1,4 +1,4 @@
-"""Verify Flit's opt-in background link deferral with an owned Win32 window."""
+"""Verify background link deferral and foreground link return in an owned Flit window."""
 
 import argparse
 from hashlib import file_digest
@@ -10,7 +10,8 @@ import tempfile
 import time
 
 sys.dont_write_bytecode = True
-from windows_downloads import seed_profile
+from windows_downloads import click_attachment, seed_profile
+from windows_multi_session import clean_scratch
 from windows_session import loaded_panels, select, send
 from windows_smoke import Browser, OwnedProcess, WORKSPACE, Win32, fixture, page_counts, require
 
@@ -20,6 +21,8 @@ WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON, MK_CONTROL = 0x0201, 0x0202, 0x0001, 0
 WM_MBUTTONDOWN, WM_MBUTTONUP, MK_MBUTTON = 0x0207, 0x0208, 0x0010
 SOURCE, TARGET, TRUSTED_CLICK = "/source", "/target", "/trusted-middle-click"
 TRUSTED_CTRL_CLICK = "/trusted-ctrl-click"
+FOREGROUND_SOURCE, FOREGROUND_TARGET = "/foreground-source", "/foreground-target"
+FOREGROUND_CLICK = "/trusted-foreground-click"
 MOUSE_EVENTS = ("mousedown", "mouseup", "click", "auxclick")
 TARGET_TITLE = "Flit background link target"
 PAGES = {
@@ -46,6 +49,13 @@ for (const type of {json.dumps(MOUSE_EVENTS)}) {{
 }}
 </script>''',
     TARGET: f"<title>{TARGET_TITLE}</title><h1>{TARGET_TITLE}</h1>",
+    FOREGROUND_SOURCE: f'''<title>Flit foreground link source</title>
+<style>a {{ position:fixed; inset:0; display:grid; place-items:center }}</style>
+<a href="{FOREGROUND_TARGET}" target="_blank" rel="noopener">Open foreground link</a>
+<script>document.querySelector("a").onclick = event => {{
+    if (event.isTrusted && navigator.userActivation.isActive) fetch("{FOREGROUND_CLICK}");
+}};</script>''',
+    FOREGROUND_TARGET: "<title>Flit foreground link target</title><h1>Flit foreground link target</h1>",
 }
 
 
@@ -69,8 +79,9 @@ class LinkHandler(BaseHTTPRequestHandler):
 {PAGES[path]}
 <script>addEventListener("pageshow", () => requestAnimationFrame(() =>
     requestAnimationFrame(() => fetch("/shown" + location.pathname))));</script>'''.encode("ascii")
-        elif path in ("/shown" + SOURCE, "/shown" + TARGET, TRUSTED_CLICK, TRUSTED_CTRL_CLICK,
-                      *("/input/" + name for name in MOUSE_EVENTS)):
+        elif (path.startswith("/shown") and path[len("/shown"):] in PAGES) or path in (
+            TRUSTED_CLICK, TRUSTED_CTRL_CLICK, FOREGROUND_CLICK, *("/input/" + name for name in MOUSE_EVENTS)
+        ):
             body = b""
         else:
             self.send_error(404)
@@ -133,9 +144,31 @@ def open_background_link(browser, panel, attempts):
                  lambda: browser.tab_count() > 1)
 
 
-def run(exe, work, report):
-    work.mkdir(parents=True, exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix="flit-background-links-", dir=work))
+def check_foreground_return(browser, report):
+    site = browser.site
+    select(browser, 0)  # Put a loaded, unrelated tab to the right of this source.
+    browser.navigate(FOREGROUND_SOURCE)
+    source = browser.wait("visible foreground link source", browser.page_panel)
+    require(browser.tab_count() == 2 and browser.selected() == 0, "Source must not be the last tab")
+    before = site.count(FOREGROUND_SOURCE)
+
+    click_attachment(browser, 0)  # The only link covers the fixture viewport.
+    browser.page(FOREGROUND_TARGET, require_request=True)
+    require(site.count(FOREGROUND_CLICK) == 1 and browser.tab_count() == 3
+            and browser.selected() == 2, "Expected a trusted foreground link to open a new tab")
+    browser.close_row(browser.selected())
+    browser.wait("foreground link tab closed", lambda: browser.tab_count() == 2)
+    check = report["foreground_return"] = {
+        "selected_row": browser.selected(), "address": browser.address(),
+        "same_panel": browser.page_panel() == source,
+        "source_requests_before": before, "source_requests_after": site.count(FOREGROUND_SOURCE),
+    }
+    require(check["selected_row"] == 0 and check["address"] == site.origin + FOREGROUND_SOURCE
+            and check["same_panel"] and check["source_requests_after"] == before,
+            f"Closing the link did not return to the still-loaded source: {check}")
+
+
+def run(exe, scratch, report):
     profile = scratch / "profile"
     report.update(profile=str(profile), launch={})
     with fixture() as site:
@@ -179,6 +212,7 @@ def run(exe, work, report):
                 ))
                 require(browser.tab_count() == 2, "Selecting the background link changed the tab count")
                 report["after_selection"] = page_counts(site, TARGET)
+                check_foreground_return(browser, report)
                 process.normal_close(browser.hwnd)
         finally:
             report["http_requests"] = site.report()["requests"]
@@ -200,13 +234,17 @@ def main():
         parser.error("--exe must point to Flit.exe next to Flit.dll")
     work = args.work.resolve()
     require(work.is_relative_to(WORKSPACE), f"--work must be inside {WORKSPACE}")
+    work.mkdir(parents=True, exist_ok=True)
+    scratch = tempfile.TemporaryDirectory(prefix="flit-link-tabs-", dir=work)
     with exe.with_name("Flit.dll").open("rb") as dll:
         report = {"result": "fail", "dll_sha256": file_digest(dll, "sha256").hexdigest()}
     try:
-        run(exe, work, report)
+        run(exe, Path(scratch.name), report)
         report["result"] = "pass"
     except (RuntimeError, OSError) as error:
         report["error"] = f"{type(error).__name__}: {error}"
+    finally:
+        clean_scratch(scratch, report)
     print(json.dumps(report, indent=2))
     return int(report["result"] != "pass")
 

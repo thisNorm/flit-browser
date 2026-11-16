@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlsplit
 sys.dont_write_bytecode = True
 from windows_extensions import uia
 from windows_multi_session import clean_scratch
-from windows_session import send
+from windows_session import select, send
 from windows_smoke import ADDRESS, BACK, Browser, NEW_TAB, OwnedProcess, WORKSPACE, Win32, require
 
 
@@ -177,6 +177,14 @@ def run(args, profile, report):
                          same_domain(urlsplit(browser.address()).hostname or "", ("rust-lang.org",))
                          and "Learn Rust" in browser.title(), 15)
             source = browser.address()
+            source_panel = browser.page_panel()
+            source_row = browser.selected()
+            command(browser, NEW_TAB)
+            browser.wait("unrelated blank tab after the source",
+                         lambda: browser.tab_count() == source_row + 2
+                         and browser.selected() == source_row + 1)
+            select(browser, source_row)
+            browser.wait("public source selected again", lambda: browser.address() == source)
             old_count = browser.tab_count()
             command(browser, 178)
             command(browser, 141)
@@ -188,10 +196,17 @@ def run(args, profile, report):
             browser.wait("new tab selected", lambda: browser.tab_count() == old_count + 1)
             item = report["new_tab"] = observe(browser, 16, lambda row: search_results(row, "naver"))
             require(search_results(item, "naver"), "Naver results missing in new tab")
+            item["source_row"] = source_row
+            item["unrelated_row"] = source_row + 1
             browser.close_row(browser.selected())
-            browser.wait("original public page is still present", lambda: browser.address() == source
-                         and browser.tab_count() == old_count and "Learn Rust" in browser.title(), 8)
-            item["original_after_close"] = browser.address()
+            browser.wait("new results tab closed", lambda: browser.tab_count() == old_count, 8)
+            item["row_after_close"] = browser.selected()
+            item["address_after_close"] = browser.address()
+            item["same_page_panel"] = browser.page_panel() == source_panel
+            require(item["row_after_close"] == source_row and item["address_after_close"] == source
+                    and item["same_page_panel"] and "Learn Rust" in browser.title(),
+                    f"Closing the results selected row {item['row_after_close']} instead of source row {source_row}")
+            item["original_after_close"] = item["address_after_close"]
         process.normal_close(browser.hwnd)
     require(all(item["outcome"] == "visible_results" for item in report["search"].values()),
             "Visible results were not confirmed for every selected search engine")
