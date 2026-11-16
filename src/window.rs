@@ -113,6 +113,7 @@ const EXPORT_BOOKMARKS: usize = 175;
 const SEARCH_ENGINE_FIRST: usize = 176;
 const SEARCH_ENGINE_LAST: usize = SEARCH_ENGINE_FIRST + SearchEngine::ALL.len() - 1;
 const GO_NEW_TAB: usize = 180;
+const IMPORT_PASSWORDS: usize = 181;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -3753,6 +3754,7 @@ fn show_menu(ui: Controls) {
         !private(),
     );
     add(PASSWORDS, "Password manager", !private());
+    add(IMPORT_PASSWORDS, "Import passwords from CSV…", !private());
     let vault_site_at_open = vault_site();
     if let Some(site) = &vault_site_at_open {
         add(VAULT_SAVE, "Add or update Flit Vault login…", true);
@@ -4929,6 +4931,9 @@ unsafe extern "system" fn window_proc(
                 RECOVERY_COPY if !private() => restore_recovery_copy(window),
                 EXTENSIONS if !private() => open_builtin("chrome://extensions/"),
                 PASSWORDS if !private() => open_builtin("chrome://password-manager/"),
+                IMPORT_PASSWORDS if !private() => {
+                    open_builtin("chrome://password-manager/settings")
+                }
                 MATERIAL => {
                     let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
                     chrome::toggle_acrylic(window, 8 * dpi / 96);
