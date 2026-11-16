@@ -3,6 +3,7 @@ use crate::{
     chrome::{self, ButtonKind},
     download_guard,
     keyboard::{self, Shortcut},
+    memory_sites::{self, SiteExceptions},
     navigation::{self, HOME},
     panel_motion::Motion,
     permissions,
@@ -21,9 +22,10 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::{
-        CreateFontW, DEFAULT_GUI_FONT, DeleteObject, GetMonitorInfoW, GetStockObject, HDC, HFONT,
-        InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, RDW_ALLCHILDREN,
-        RDW_INVALIDATE, RedrawWindow, ScreenToClient, UpdateWindow,
+        COLOR_HIGHLIGHT, CreateFontW, DEFAULT_GUI_FONT, DeleteObject, FillRect, GetMonitorInfoW,
+        GetStockObject, GetSysColorBrush, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+        MONITORINFO, MonitorFromWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RedrawWindow,
+        ScreenToClient, UpdateWindow,
     },
     System::{
         LibraryLoader::GetModuleHandleW,
@@ -37,8 +39,9 @@ use windows_sys::Win32::{
             SetThreadDpiAwarenessContext,
         },
         Input::KeyboardAndMouse::{
-            EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture,
-            SetFocus, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB,
+            EnableWindow, GetCapture, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture,
+            SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT,
+            VK_TAB,
         },
         Shell::{DefSubclassProc, SetWindowSubclass},
         WindowsAndMessaging::*,
@@ -121,6 +124,9 @@ const TAB_DUPLICATE: usize = 2;
 const TAB_MUTE: usize = 3;
 const TAB_CLOSE: usize = 4;
 const TAB_UNLOAD: usize = 5;
+const TAB_KEEP_SITE: usize = 6;
+const TAB_MOVE_UP: usize = 7;
+const TAB_MOVE_DOWN: usize = 8;
 const WINDOW_CLASS: &str = "FlitBrowserWindow";
 const APP_TITLE: &str = "Flit Browser";
 const PRIVATE_TITLE: &str = "Flit Browser — Private";
@@ -192,6 +198,20 @@ struct Row {
     unloaded: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TabDrop {
+    key: usize,
+    after: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TabDrag {
+    key: usize,
+    start_y: i32,
+    dragging: bool,
+    target: Option<TabDrop>,
+}
+
 struct Tab {
     key: usize,
     panel: HWND,
@@ -245,6 +265,7 @@ struct Shell {
     address_edited: bool,
     updating_address: bool,
     row_close: Option<(usize, u32)>,
+    tab_drag: Option<TabDrag>,
     links: VecDeque<(String, WindowOpenDisposition)>,
     popups: Vec<Browser>,
     pending_popups: BTreeSet<(usize, i32)>,
@@ -266,6 +287,7 @@ thread_local! {
     static RESTORE_TABS: Cell<bool> = const { Cell::new(true) };
     static SIDEBAR_DEFAULT: Cell<bool> = const { Cell::new(true) };
     static DEFER_BACKGROUND: Cell<bool> = const { Cell::new(false) };
+    static MEMORY_SITES: RefCell<SiteExceptions> = RefCell::new(SiteExceptions::default());
     static RECOVERY_WINDOW: Cell<usize> = const { Cell::new(0) };
     static OPENING_SESSION: Cell<bool> = const { Cell::new(false) };
     static EXIT_SESSION: RefCell<Option<ExitSession>> = const { RefCell::new(None) };
@@ -1037,6 +1059,10 @@ pub(crate) fn open(
     RESTORE_TABS.set(saved.as_ref().is_none_or(|state| state.restore));
     SIDEBAR_DEFAULT.set(saved.as_ref().is_none_or(|state| state.sidebar_open));
     DEFER_BACKGROUND.set(saved.as_ref().is_some_and(|state| state.defer_background));
+    match SiteExceptions::load(profile) {
+        Ok(sites) => MEMORY_SITES.with(|slot| *slot.borrow_mut() = sites),
+        Err(error) => eprintln!("Flit Browser: Could not read memory exceptions: {error}"),
+    }
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -1245,6 +1271,7 @@ fn create_window(
                 address_edited: false,
                 updating_address: false,
                 row_close: None,
+                tab_drag: None,
                 links: VecDeque::new(),
                 popups: Vec::new(),
                 pending_popups: BTreeSet::new(),
@@ -3680,36 +3707,103 @@ fn modifiers() -> (bool, bool, bool) {
     (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU))
 }
 
-fn tab_point(hwnd: HWND, lp: LPARAM, close_only: bool) -> Option<usize> {
-    let hit = unsafe { SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lp) } as u32;
-    if hit >> 16 != 0 {
-        return None;
-    }
-    let index = (hit & 0xffff) as usize;
+fn tab_rect(hwnd: HWND, index: usize) -> Option<RECT> {
     let mut row = RECT::default();
-    if unsafe {
+    (unsafe {
         SendMessageW(
             hwnd,
             LB_GETITEMRECT,
             index,
             (&mut row as *mut RECT) as isize,
         )
-    } == LB_ERR as isize
-    {
+    } != LB_ERR as isize)
+        .then_some(row)
+}
+
+fn tab_hit(hwnd: HWND, lp: LPARAM) -> Option<(usize, RECT)> {
+    let hit = unsafe { SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lp) } as u32;
+    if hit >> 16 != 0 {
         return None;
     }
+    let index = (hit & 0xffff) as usize;
+    let row = tab_rect(hwnd, index)?;
     let x = (lp as u16 as i16) as i32;
     let y = ((lp >> 16) as u16 as i16) as i32;
+    (x >= row.left && x < row.right && y >= row.top && y < row.bottom).then_some((index, row))
+}
+
+fn tab_point(hwnd: HWND, lp: LPARAM, close_only: bool) -> Option<usize> {
+    let (index, row) = tab_hit(hwnd, lp)?;
     let target = 28 * unsafe { GetDpiForWindow(hwnd) }.max(96) as i32 / 96;
-    if x < row.left
-        || x >= row.right
-        || y < row.top
-        || y >= row.bottom
-        || (close_only && x < row.right - target)
-    {
+    if close_only && ((lp as u16 as i16) as i32) < row.right - target {
         return None;
     }
     row_key(index)
+}
+
+fn tab_move_indices(s: &Shell, key: usize, drop: TabDrop) -> Option<(usize, usize)> {
+    let from = s.tabs.iter().position(|tab| tab.key == key)?;
+    let hit = s.tabs.iter().position(|tab| tab.key == drop.key)?;
+    if s.closing || from == hit || s.tabs[from].pinned != s.tabs[hit].pinned {
+        return None;
+    }
+    let to = hit + usize::from(drop.after) - usize::from(from < hit);
+    (from != to).then_some((from, to))
+}
+
+fn adjacent_tab(s: &Shell, key: usize, down: bool) -> Option<TabDrop> {
+    let index = s.tabs.iter().position(|t| t.key == key)?;
+    let next = if down {
+        index + 1
+    } else {
+        index.checked_sub(1)?
+    };
+    let drop = TabDrop {
+        key: s.tabs.get(next)?.key,
+        after: down,
+    };
+    tab_move_indices(s, key, drop).map(|_| drop)
+}
+
+fn move_tab(key: usize, drop: TabDrop) {
+    if change(|s| {
+        let (from, to) = tab_move_indices(s, key, drop)?;
+        let tab = s.tabs.remove(from);
+        s.tabs.insert(to, tab);
+        Some(())
+    })
+    .flatten()
+    .is_some()
+    {
+        refresh_rows(false);
+        queue_session_save();
+    }
+}
+
+fn update_tab_drag(list: HWND, lp: LPARAM) -> Option<TabDrag> {
+    let mut drag = with_shell(|s| s.tab_drag).flatten()?;
+    let y = ((lp >> 16) as u16 as i16) as i32;
+    let threshold = 5 * unsafe { GetDpiForWindow(list) }.max(96) as i32 / 96;
+    drag.dragging |= (y - drag.start_y).abs() >= threshold;
+    let target = drag
+        .dragging
+        .then(|| {
+            let (row, rect) = tab_hit(list, lp)?;
+            let drop = TabDrop {
+                key: row_key(row)?,
+                after: y >= (rect.top + rect.bottom) / 2,
+            };
+            with_shell(|s| tab_move_indices(s, drag.key, drop))
+                .flatten()
+                .map(|_| drop)
+        })
+        .flatten();
+    if target != drag.target {
+        drag.target = target;
+        unsafe { InvalidateRect(list, null(), 0) };
+    }
+    change(|s| s.tab_drag = Some(drag));
+    Some(drag)
 }
 
 fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
@@ -3719,19 +3813,12 @@ fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
     };
     let key = if coordinates == -1 {
         let index = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
-        let mut row = RECT::default();
-        if index < 0
-            || unsafe {
-                SendMessageW(
-                    list,
-                    LB_GETITEMRECT,
-                    index as usize,
-                    (&mut row as *mut RECT) as LPARAM,
-                )
-            } < 0
-        {
+        if index < 0 {
             return;
         }
+        let Some(row) = tab_rect(list, index as usize) else {
+            return;
+        };
         point = POINT {
             x: row.left,
             y: row.bottom,
@@ -3750,13 +3837,20 @@ fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
     let Some(key) = key else {
         return;
     };
-    let Some((pinned, muted, copyable, unloadable)) = with_shell(|s| {
+    let Some((pinned, muted, copyable, unloadable, up, down, site)) = with_shell(|s| {
         let tab = s.tabs.iter().find(|t| t.key == key)?;
         Some((
             tab.pinned,
             tab.muted,
             session::stored_url(&tab.url).is_some(),
             can_unload(s, tab),
+            adjacent_tab(s, key, false).is_some(),
+            adjacent_tab(s, key, true).is_some(),
+            if s.private {
+                None
+            } else {
+                memory_sites::host(&tab.url)
+            },
         ))
     })
     .flatten() else {
@@ -3775,6 +3869,8 @@ fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
             true,
         ),
         (TAB_UNLOAD, "Unload tab to free memory…", unloadable),
+        (TAB_MOVE_UP, "Move tab up", up),
+        (TAB_MOVE_DOWN, "Move tab down", down),
         (TAB_CLOSE, "Close tab", true),
     ] {
         unsafe {
@@ -3784,6 +3880,20 @@ fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
                 id,
                 wide(label).as_ptr(),
             );
+        }
+    }
+    if let Some(site) = &site {
+        let flags = MEMORY_SITES.with(|slot| {
+            if slot.borrow().contains(site) {
+                MF_CHECKED
+            } else {
+                0
+            }
+        });
+        let label = wide(&format!("Keep {site} active when freeing memory"));
+        unsafe {
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            AppendMenuW(menu, MF_STRING | flags, TAB_KEEP_SITE, label.as_ptr());
         }
     }
     unsafe {
@@ -3797,7 +3907,15 @@ fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
             null(),
         );
         DestroyMenu(menu);
-        if action != 0 {
+        if action as usize == TAB_KEEP_SITE {
+            // The page can navigate while the native menu is open.
+            if let Some(site) = site.as_deref()
+                && tab_memory_site(key).as_deref() == Some(site)
+                && !exiting()
+            {
+                tab_action(key, TAB_KEEP_SITE);
+            }
+        } else if action != 0 {
             PostMessageW(parent, TAB_MENU_ACTION, key, action as LPARAM);
         }
     }
@@ -3822,10 +3940,46 @@ fn can_release_background(s: &Shell, tab: &Tab) -> bool {
         && s.popups.is_empty()
         && s.pending_popups.is_empty()
         && can_unload(s, tab)
+        && (s.private
+            || !MEMORY_SITES.with(|slot| {
+                let sites = slot.borrow();
+                !sites.is_empty()
+                    && memory_sites::host(&tab.url).is_some_and(|site| sites.contains(&site))
+            }))
         && tab.browser.as_ref().is_some_and(|browser| {
             browser.is_loading() == 0
                 && browser.host().is_some_and(|host| host.has_dev_tools() == 0)
         })
+}
+
+fn tab_memory_site(key: usize) -> Option<String> {
+    with_shell(|s| {
+        if s.private || s.closing {
+            return None;
+        }
+        memory_sites::host(&s.tabs.iter().find(|tab| tab.key == key)?.url)
+    })
+    .flatten()
+}
+
+fn toggle_memory_site(window: HWND, site: &str) {
+    let result = PROFILE.with(|slot| {
+        let profile = slot.borrow();
+        profile
+            .as_deref()
+            .map(|profile| MEMORY_SITES.with(|sites| sites.borrow_mut().toggle(profile, site)))
+    });
+    if let Some(Err(error)) = result {
+        eprintln!("Flit Browser: Could not save memory exception: {error}");
+        unsafe {
+            MessageBoxW(
+                window,
+                windows_sys::w!("Could not save this site's memory setting."),
+                windows_sys::w!("Flit Browser"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
 }
 
 fn background_tabs_for_release() -> Vec<usize> {
@@ -3848,7 +4002,7 @@ fn free_background_memory(window: HWND) {
         return;
     }
     let message = wide(&format!(
-        "Unload up to {} background tabs? They stay in the sidebar and reload when selected.\n\nPinned tabs, downloads, camera or microphone use, and inspected tabs are skipped. Other audio and unsaved work can stop or be lost.",
+        "Unload up to {} background tabs? They stay in the sidebar and reload when selected.\n\nKept sites, pinned tabs, downloads, camera or microphone use, and inspected tabs are skipped. Other audio and unsaved work can stop or be lost.",
         keys.len()
     ));
     if unsafe {
@@ -3934,6 +4088,20 @@ fn unload_tab(key: usize) {
 
 fn tab_action(key: usize, action: usize) {
     match action {
+        TAB_KEEP_SITE => {
+            if let Some(site) = tab_memory_site(key)
+                && let Some(ui) = controls()
+            {
+                toggle_memory_site(ui.window, &site);
+            }
+        }
+        TAB_MOVE_UP | TAB_MOVE_DOWN => {
+            if let Some(drop) =
+                with_shell(|s| adjacent_tab(s, key, action == TAB_MOVE_DOWN)).flatten()
+            {
+                move_tab(key, drop);
+            }
+        }
         TAB_PIN => {
             change(|s| {
                 let i = s.tabs.iter().position(|t| t.key == key)?;
@@ -4023,6 +4191,15 @@ unsafe extern "system" fn chrome_proc(
             return 0;
         }
         match (id, wp as u16) {
+            (TABS, VK_ESCAPE) if change(|s| s.tab_drag.take().is_some()) == Some(true) => {
+                unsafe {
+                    if GetCapture() == hwnd {
+                        ReleaseCapture();
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                return 0;
+            }
             (ADDRESS, VK_ESCAPE) => {
                 refresh(true);
                 return 0;
@@ -4102,6 +4279,28 @@ unsafe extern "system" fn chrome_proc(
                     }
                     return 0;
                 }
+                if message == WM_LBUTTONDOWN
+                    && !exiting()
+                    && with_shell(|s| !s.closing) == Some(true)
+                    && let Some(key) = tab_point(hwnd, lp, false)
+                {
+                    unsafe { SetFocus(hwnd) };
+                    change(|s| {
+                        s.tab_drag = Some(TabDrag {
+                            key,
+                            start_y: ((lp >> 16) as u16 as i16) as i32,
+                            dragging: false,
+                            target: None,
+                        });
+                    });
+                    unsafe { SetCapture(hwnd) };
+                    return 0;
+                }
+            }
+            WM_MOUSEMOVE => {
+                if update_tab_drag(hwnd, lp).is_some() {
+                    return 0;
+                }
             }
             WM_LBUTTONUP | WM_MBUTTONUP => {
                 if let Some((key, button)) = change(|s| s.row_close.take()).flatten() {
@@ -4117,9 +4316,38 @@ unsafe extern "system" fn chrome_proc(
                     }
                     return 0;
                 }
+                if message == WM_LBUTTONUP
+                    && let Some(drag) = update_tab_drag(hwnd, lp)
+                {
+                    change(|s| s.tab_drag = None);
+                    unsafe {
+                        if GetCapture() == hwnd {
+                            ReleaseCapture();
+                        }
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                    if !exiting() {
+                        if let Some(drop) = drag.target {
+                            move_tab(drag.key, drop);
+                        } else if !drag.dragging
+                            && tab_point(hwnd, lp, false) == Some(drag.key)
+                            && with_shell(|s| !s.closing && s.active != Some(drag.key))
+                                == Some(true)
+                        {
+                            select_key(drag.key);
+                        }
+                    }
+                    return 0;
+                }
             }
             WM_CAPTURECHANGED | WM_CANCELMODE => {
-                change(|s| s.row_close = None);
+                if change(|s| {
+                    s.row_close = None;
+                    s.tab_drag.take().is_some()
+                }) == Some(true)
+                {
+                    unsafe { InvalidateRect(hwnd, null(), 0) };
+                }
             }
             _ => {}
         }
@@ -4218,6 +4446,24 @@ unsafe extern "system" fn window_proc(
                         (row.label.as_str(), row.pinned, row.muted, row.unloaded)
                     });
                 chrome::draw_tab(item, label, pinned, muted, unloaded, dpi);
+                if let Some((row, drop)) = row
+                    .as_ref()
+                    .zip(with_shell(|s| s.tab_drag.and_then(|drag| drag.target)).flatten())
+                    && row.key == drop.key
+                {
+                    let height = (2 * dpi / 96).max(1);
+                    let y = if drop.after {
+                        item.rcItem.bottom - height
+                    } else {
+                        item.rcItem.top
+                    };
+                    let line = RECT {
+                        top: y,
+                        bottom: y + height,
+                        ..item.rcItem
+                    };
+                    unsafe { FillRect(item.hDC, &line, GetSysColorBrush(COLOR_HIGHLIGHT)) };
+                }
                 return 1;
             }
             let kind = match wp {

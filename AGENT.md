@@ -1,6 +1,6 @@
 # AI가 백그라운드에서 Flit 사용하기
 
-Flit 0.12의 Windows 설치본에는 로컬 MCP 서버가 들어 있다. 설치한 뒤 PowerShell에서 다음 명령을 실행하고 Codex를 새로 연다. 설치 경로를 바꿨다면 `Flit.exe` 경로도 바꾼다.
+Flit Windows 설치본에는 로컬 MCP 서버가 들어 있다. 설치한 뒤 PowerShell에서 다음 명령을 실행하고 Codex를 새로 연다. 설치 경로를 바꿨다면 `Flit.exe` 경로도 바꾼다.
 
 ```powershell
 codex mcp add flit -- "$env:LOCALAPPDATA\Programs\Flit Browser\Flit.exe" --flit-agent
@@ -14,6 +14,7 @@ codex mcp add flit -- "$env:LOCALAPPDATA\Programs\Flit Browser\Flit.exe" --flit-
 | `flit_list_tabs` | 이 연결의 탭 ID, 주소, 제목, 로딩 상태를 읽는다. |
 | `flit_snapshot` | 현재 최상위 문서에서 화면에 표시되는 텍스트와 링크를 읽는다. 로딩 중이면 상태를 반환한다. 24,000 UTF-8 바이트, 링크 60개를 넘기면 내용 일부만 반환한다. |
 | `flit_follow_link` | 같은 탭에서 가장 최근 스냅샷의 링크를 연다. 주소나 문서가 바뀌었거나 새 스냅샷을 받았다면 다시 읽어야 한다. |
+| `flit_stop_loading` | 같은 연결의 작업 탭에서 로드 중지를 요청한다. 열리기 전 중지된 페이지는 본문을 읽을 수 없다. 이미 로드가 끝났거나 Vault 로그인 진행 중이면 그대로 둔다. |
 | `flit_close_tab` | 작업 탭을 닫는다. 호스트가 표준 입력을 닫으면 그 연결의 남은 탭도 정리한다. |
 | `flit_sign_in` | 현재 탭의 사이트에 등록된 Flit Vault 계정으로 지원되는 로그인 폼을 제출한다. 입력은 탭 ID 하나뿐이다. |
 

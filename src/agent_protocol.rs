@@ -16,6 +16,7 @@ const SNAPSHOT: &str = "flit_snapshot";
 const FOLLOW: &str = "flit_follow_link";
 const CLOSE: &str = "flit_close_tab";
 const SIGN_IN: &str = "flit_sign_in";
+const STOP_LOADING: &str = "flit_stop_loading";
 
 #[derive(Clone, Debug)]
 pub(crate) enum Command {
@@ -25,6 +26,7 @@ pub(crate) enum Command {
     Follow { tab: u32, snapshot: u32, link: u32 },
     Close { tab: u32 },
     SignIn { tab: u32 },
+    StopLoading { tab: u32 },
 }
 
 pub(crate) fn serve(
@@ -224,6 +226,8 @@ fn tool_catalog() -> Value {
         tool(CLOSE, "Close an isolated agent tab used for a public page.",
             json!({"tab":id}), &["tab"]),
         tool(SIGN_IN, "Attempt sign-in on the current page of an isolated agent tab. Requires a supported login form and a saved Flit Vault credential explicitly enrolled for the tab's current approved HTTPS origin. Supply only the tab ID. Returns status submitted with reason destination_verified after a same-origin destination returns HTTP 2xx with no visible login or OTP prompt, or action_required with a reason. Use a fresh flit_snapshot to confirm sign-in on the site.",
+            json!({"tab":id}), &["tab"]),
+        tool(STOP_LOADING, "Request that the browser stop loading a tab owned by this connection. Returns stopped when the request is sent, not_loading if idle, or signing_in if a Vault attempt is active and left alone. An interrupted main document is not available to snapshot.",
             json!({"tab":id}), &["tab"])
     ]})
 }
@@ -272,7 +276,8 @@ fn call_tool(
         },
         (CLOSE, 1) => number("tab").map(|tab| Command::Close { tab }),
         (SIGN_IN, 1) => number("tab").map(|tab| Command::SignIn { tab }),
-        (OPEN | LIST | SNAPSHOT | FOLLOW | CLOSE | SIGN_IN, _) => None,
+        (STOP_LOADING, 1) => number("tab").map(|tab| Command::StopLoading { tab }),
+        (OPEN | LIST | SNAPSHOT | FOLLOW | CLOSE | SIGN_IN | STOP_LOADING, _) => None,
         _ => return Err((-32602, "Unknown tool")),
     };
 
@@ -383,7 +388,8 @@ mod tests {
                     "flit_snapshot",
                     "flit_follow_link",
                     "flit_close_tab",
-                    "flit_sign_in"
+                    "flit_sign_in",
+                    "flit_stop_loading"
                 ]
             );
             assert!(
@@ -400,11 +406,12 @@ mod tests {
                     "additionalProperties":false
                 })
             );
+            assert_eq!(tools[6]["inputSchema"], tools[5]["inputSchema"]);
         }
     }
 
     #[test]
-    fn rejects_invalid_sign_in_arguments_without_dispatch() {
+    fn rejects_invalid_sign_in_and_stop_arguments_without_dispatch() {
         for arguments in [
             json!({}),
             json!({"tab":-1}),
@@ -415,10 +422,12 @@ mod tests {
             json!({"tab":1,"selector":"form"}),
             json!({"tab":1,"url":"https://example.invalid/"}),
         ] {
-            let request = call(1, "flit_sign_in", arguments);
-            let reply =
-                dispatch(&request, &mut |_| panic!("invalid sign-in call dispatched")).unwrap();
-            assert_eq!(reply["result"]["isError"], true, "{request}");
+            for tool in ["flit_sign_in", "flit_stop_loading"] {
+                let request = call(1, tool, arguments.clone());
+                let reply =
+                    dispatch(&request, &mut |_| panic!("invalid {tool} call dispatched")).unwrap();
+                assert_eq!(reply["result"]["isError"], true, "{request}");
+            }
         }
     }
 
@@ -523,6 +532,7 @@ mod tests {
                 ),
                 call(5, "flit_close_tab", json!({"tab":1})),
                 call(6, "flit_sign_in", json!({"tab":u32::MAX})),
+                call(7, "flit_stop_loading", json!({"tab":u32::MAX})),
             ],
             |command| {
                 executed += 1;
@@ -540,11 +550,14 @@ mod tests {
                     ) => Err("stale snapshot".into()),
                     (5, Command::Close { tab: 1 }) => Ok(json!("closed")),
                     (6, Command::SignIn { tab: u32::MAX }) => Ok(sign_in.clone()),
+                    (7, Command::StopLoading { tab: u32::MAX }) => {
+                        Ok(json!({"tab":u32::MAX,"status":"stopped"}))
+                    }
                     other => panic!("unexpected dispatch: {other:?}"),
                 }
             },
         );
-        assert_eq!(executed, 6);
+        assert_eq!(executed, 7);
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(replies[2]["result"]["structuredContent"], snapshot);
         assert_eq!(
@@ -561,5 +574,6 @@ mod tests {
         assert!(replies[4]["result"].get("structuredContent").is_none());
         assert_eq!(replies[5]["result"]["isError"], false);
         assert_eq!(replies[5]["result"]["structuredContent"], sign_in);
+        assert_eq!(replies[6]["result"]["isError"], false);
     }
 }

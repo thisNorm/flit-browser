@@ -8,6 +8,7 @@ mod chrome;
 mod download_guard;
 mod keyboard;
 mod launch_url;
+mod memory_sites;
 mod navigation;
 mod panel_motion;
 mod permissions;

@@ -26,6 +26,7 @@ TOOLS = {
     "flit_follow_link": {"tab", "snapshot", "link"},
     "flit_close_tab": {"tab"},
     "flit_sign_in": {"tab"},
+    "flit_stop_loading": {"tab"},
 }
 DOM_TEXT = "렌더링된 한국어 문장: 사과와 포도"
 PASSWORD = "FLIT_FIXTURE_DUMMY_VALUE_6D94"
@@ -59,6 +60,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(405)
 
     def do_GET(self):
+        if self.path == "/held-load":
+            with self.server.lock:
+                self.server.hits[self.path] += 1
+            # Send no response; observe the browser closing the outstanding request.
+            self.connection.settimeout(15)
+            try:
+                disconnected = not self.connection.recv(1)
+            except ConnectionResetError:
+                disconnected = True
+            except TimeoutError:
+                disconnected = False
+            if disconnected:
+                with self.server.lock:
+                    self.server.hits["disconnected /held-load"] += 1
+            return
         if self.path == "/dom-text":
             content_type, body = "text/plain", DOM_TEXT
         elif self.path == "/session":
@@ -314,6 +330,7 @@ def exercise(mcp, peer, site, report):
 
     require(list_tabs() == [], "Expected no agent tabs before the first open")
     mcp.tool("flit_open", {"url": "data:text/plain,flit-fixture"}, reject=True)
+    mcp.tool("flit_stop_loading", {"tab": 1}, reject=True)
     require(list_tabs() == [], "A rejected URL created an agent tab")
     report["processes_before_first_open"] = mcp.process.total_processes()
     require(report["processes_before_first_open"] == 1 and not site.report()["requests"],
@@ -378,6 +395,27 @@ def exercise(mcp, peer, site, report):
     peer.tool("flit_snapshot", {"tab": first}, reject=True)
     isolated = navigation(peer.tool("flit_open", {"url": session_url}, timeout=27), session_url)
     peer.ready_snapshot(isolated, session_url, "Flit MCP session", "No session cookie")
+
+    report["stage"] = "stop a held load in the owning connection"
+    held_url = site.origin + "/held-load"
+    held = navigation(mcp.tool("flit_open", {"url": held_url}), held_url)
+    mcp.wait("held navigation to reach the server", time.monotonic() + 8,
+             lambda: site.count("/held-load"))
+    peer.tool("flit_stop_loading", {"tab": held}, reject=True)
+    require(mcp.tool("flit_snapshot", {"tab": held}).get("status") == "loading",
+            "The held load did not stay loading after the peer's stop attempt")
+    require(mcp.tool("flit_stop_loading", {"tab": held}) == {"tab": held, "status": "stopped"},
+            "The owner could not stop the held load")
+    mcp.wait("browser to disconnect the held request", time.monotonic() + 8,
+             lambda: site.count("disconnected /held-load"))
+    stopped = mcp.tool("flit_snapshot", {"tab": held})
+    require(stopped.get("status") == "stopped" and "snapshot" not in stopped and "text" not in stopped,
+            f"An interrupted main document was reported as readable: {stopped!r}")
+    require(mcp.tool("flit_stop_loading", {"tab": second}) == {"tab": second, "status": "not_loading"},
+            "Stopping a settled tab did not report an idle no-op")
+    mcp.tool("flit_close_tab", {"tab": held})
+    report["owned_load_stopped"] = True
+
     peer.finish()
     require({tab["tab"]: tab["url"] for tab in list_tabs()} == {first: anchor, second: other},
             "Closing the other connection changed the first connection's tabs")

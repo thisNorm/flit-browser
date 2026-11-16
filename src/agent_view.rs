@@ -104,9 +104,9 @@ wrap_load_handler! {
         fn on_loading_state_change(
             &self, _browser: Option<&mut Browser>, loading: i32, _back: i32, _forward: i32,
         ) {
-            // A provisional navigation can end without a document, e.g. a denied download.
+            // A provisional navigation can end without a document (for example, a denied download or stop).
             if loading == 0 && self.pending.swap(false, Relaxed) {
-                agent::failed(self.tab, LOAD_FAILED);
+                agent::load_incomplete(self.tab, LOAD_FAILED);
             }
         }
 

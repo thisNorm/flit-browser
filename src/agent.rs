@@ -274,7 +274,7 @@ pub(crate) fn loaded(id: u32, url: String, http_status: i32) {
     if let Some(url) = web_url(&url) {
         address(id, url);
         update(id, |tab| {
-            if tab.status != "error" {
+            if !matches!(tab.status, "error" | "stopped") {
                 tab.status = "ready";
                 tab.http_status = (http_status > 0).then_some(http_status);
             }
@@ -303,6 +303,19 @@ pub(crate) fn loaded(id: u32, url: String, http_status: i32) {
                 finish_login(id, "action_required", "verification_page_failed");
             }
         }
+    }
+}
+
+pub(crate) fn load_incomplete(id: u32, reason: &'static str) {
+    let loading = STATE.with(|state| {
+        state
+            .borrow()
+            .tabs
+            .get(&id)
+            .is_some_and(|tab| tab.status == "loading")
+    });
+    if loading {
+        failed(id, reason);
     }
 }
 
@@ -416,6 +429,36 @@ fn close(id: u32) -> Result<Value, String> {
         closed(id);
     }
     Ok(json!({"tab": id, "status": "closed"}))
+}
+
+fn stop_loading(id: u32) -> Result<Value, String> {
+    let (browser, status) = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let tab = state
+            .tabs
+            .get_mut(&id)
+            .filter(|tab| !tab.closing)
+            .ok_or("No such agent tab.")?;
+        if tab.login.is_some() {
+            return Ok((None, "signing_in"));
+        }
+        let browser = tab.browser.as_ref().ok_or("No such agent tab.")?;
+        let main_loading = tab.status == "loading";
+        if !main_loading && browser.is_loading() == 0 {
+            return Ok((None, "not_loading"));
+        }
+        let browser = browser.clone();
+        if main_loading {
+            tab.invalidate();
+            tab.status = "stopped";
+        }
+        Ok::<_, &str>((Some(browser), "stopped"))
+    })?;
+    // StopLoad can invoke callbacks; set the state and release the borrow first.
+    if let Some(browser) = browser {
+        browser.stop_load();
+    }
+    Ok(json!({"tab": id, "status": status}))
 }
 
 fn follow(id: u32, snapshot: u32, link: u32) -> Result<Value, String> {
@@ -886,6 +929,7 @@ fn execute(command: Command, reply: Reply) {
             link,
         } => follow(tab, snapshot, link),
         Command::Close { tab } => close(tab),
+        Command::StopLoading { tab } => stop_loading(tab),
         Command::SignIn { tab } => {
             sign_in(tab, reply);
             return;
