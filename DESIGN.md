@@ -36,7 +36,7 @@ Windows의 Segoe UI를 사용한다. 주소창과 탐색 도구를 떠 있는 �
 
 ## Rust와 Exact
 
-현재 실행 파일은 Rust + Win32 UI + CEF Chrome Runtime이다. Exact가 이미 적용됐다고 표시하지 않는다. [Phase 0에서 확인한 Exact 커밋](../flit-browser-phase0/docs/exact-source-evidence.md)은 Windows 외부 HWND 임베딩을 바로 제공하지 않았다.
+현재 실행 파일은 Rust + Win32 UI + CEF Chrome Runtime이다. [0.7.0에서 다시 확인한 Exact Windows 코드](https://github.com/expo/exact/blob/ef3e678b05a63688d033f391fc345a726e4b714f/host/windows/src/lib.rs#L90-L164)도 창과 메시지 루프를 자체 관리하며, 기존 HWND를 전달받는 공개 API를 제공하지 않는다.
 
 Exact + Contract의 채택 조건은 동일한 CEF Chrome Runtime을 유지한 상태로 주소창↔페이지 포커스, 한글 조합, DPI 전환, resize·popup·종료를 통과하는 것이다. 같은 페이지·탭 상태에서 UI 프로세스와 private commit/working set을 비교한다. Exact를 붙이기 위해 웹 영역을 이중 렌더링하거나 Chromium 프로필 기능을 제거하지 않는다.
 
@@ -47,3 +47,5 @@ Exact + Contract의 채택 조건은 동일한 CEF Chrome Runtime을 유지한 �
 ## 성능 확인
 
 이전 버전과 새 버전을 새 프로필·같은 로컬 테스트 페이지로 순차 실행한다. 페이지 하나, 페이지 하나와 빈 탭 다섯 개, 빈 탭을 닫은 상태를 구분해 프로세스 트리 전체를 측정한다. Private Commit과 Private Working Set을 각각 기록하며 단일 프로세스 수치를 브라우저 전체 RAM으로 부르지 않는다. 빈 탭에서의 절감 결과를 여러 실제 사이트의 절감률로 확장하지 않는다. 합성 효과의 비용은 Flit 프로세스 바깥의 Windows 합성기에도 발생할 수 있으므로 UI 측정만으로 0이라고 가정하지 않는다.
+
+0.6.0과 0.7.0의 로컬 비교에서 페이지 하나와 빈 탭 다섯 개는 양쪽 모두 프로세스 6개, 렌더러 2개였다. 이 상태의 Private Working Set은 103.46 → 100.76 MiB였다. 버전당 한 번 측정한 결과이므로 성능 개선율로 사용하지 않는다.

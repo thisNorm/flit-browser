@@ -15,6 +15,7 @@ use std::{
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -88,6 +89,10 @@ const SELECT_TAB_LAST: usize = 159;
 const SAVE_BOOKMARK: usize = 160;
 const NEW_WINDOW: usize = 161;
 const PRIVATE_WINDOW: usize = 162;
+const DEVTOOLS: usize = 163;
+const DEVTOOLS_CONSOLE: usize = 164;
+const CLOSE_WINDOW: usize = 165;
+const SITE_INFO: usize = 166;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -95,6 +100,7 @@ const OPEN_LINK: u32 = WM_APP + 4;
 const TAB_MENU_ACTION: u32 = WM_APP + 5;
 const TAB_CLOSE_CANCELLED: u32 = WM_APP + 6;
 const POPUP_CLOSED: u32 = WM_APP + 7;
+const OPEN_SETTINGS_WINDOW: u32 = WM_APP + 8;
 const TAB_PIN: usize = 1;
 const TAB_DUPLICATE: usize = 2;
 const TAB_MUTE: usize = 3;
@@ -106,11 +112,14 @@ const PRIVATE_TITLE: &str = "Flit Browser — Private";
 const ICON_ID: usize = 32512;
 const SIDEBAR_TIMER: usize = 1;
 const RECOVERY_TIMER: usize = 2;
+const SETTINGS_URL: &str = "chrome://settings/";
+const CLEAR_DATA_URL: &str = "chrome://settings/clearBrowserData";
 
 #[derive(Clone, Copy)]
 struct Controls {
     window: HWND,
     address: HWND,
+    site_info: HWND,
     back: HWND,
     forward: HWND,
     reload: HWND,
@@ -131,12 +140,13 @@ struct Controls {
 }
 
 impl Controls {
-    fn chrome(self) -> [HWND; 12] {
+    fn chrome(self) -> [HWND; 13] {
         [
             self.sidebar,
             self.back,
             self.forward,
             self.reload,
+            self.site_info,
             self.address,
             self.go,
             self.bookmark,
@@ -173,6 +183,7 @@ struct Tab {
     browser: Option<Browser>,
     native_window: Option<Window>,
     native_close_sent: bool,
+    close_requested: bool,
     retiring: bool,
     url: String,
     title: String,
@@ -208,6 +219,8 @@ struct Shell {
     links: VecDeque<(String, WindowOpenDisposition)>,
     popups: Vec<Browser>,
     pending_popups: BTreeSet<(usize, i32)>,
+    settings_window: Option<Browser>,
+    pending_settings: Option<(usize, String)>,
     closing: bool,
     closing_session: Option<Session>,
 }
@@ -317,6 +330,118 @@ fn queue_session_save() {
 }
 
 wrap_client! {
+    struct FlitDevToolsClient;
+    impl Client {}
+}
+
+wrap_client! {
+    struct FlitSettingsClient { window: usize }
+    impl Client {
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(FlitSettingsLife::new(self.window))
+        }
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(FlitUnload::new(self.window, 0))
+        }
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(download_guard::handler(self.window, 0))
+        }
+        fn command_handler(&self) -> Option<CommandHandler> {
+            Some(FlitSettingsCommands::new(self.window))
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(FlitSettingsRequest::new(self.window))
+        }
+    }
+}
+
+wrap_request_handler! {
+    struct FlitSettingsRequest { window: usize }
+    impl RequestHandler {
+        fn on_before_browse(
+            &self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>,
+            request: Option<&mut Request>, _gesture: i32, _redirect: i32,
+        ) -> i32 {
+            if frame.is_none_or(|frame| frame.is_main() != 0) {
+                if let Some(url) = request.map(|request| CefString::from(&request.url())) {
+                    if queue_link(self.window, Some(&url), WindowOpenDisposition::NEW_FOREGROUND_TAB) {
+                        return 1;
+                    }
+                }
+            }
+            0
+        }
+        fn on_open_urlfrom_tab(
+            &self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>,
+            url: Option<&CefString>, disposition: WindowOpenDisposition, _gesture: i32,
+        ) -> i32 {
+            let disposition = match disposition {
+                WindowOpenDisposition::NEW_BACKGROUND_TAB | WindowOpenDisposition::NEW_WINDOW => disposition,
+                _ => WindowOpenDisposition::NEW_FOREGROUND_TAB,
+            };
+            i32::from(queue_link(self.window, url, disposition))
+        }
+    }
+}
+
+wrap_command_handler! {
+    struct FlitSettingsCommands { window: usize }
+    impl CommandHandler {
+        fn on_chrome_command(
+            &self, _browser: Option<&mut Browser>, command: i32, _disposition: WindowOpenDisposition,
+        ) -> i32 {
+            let action = if command == chrome_command(c"IDC_NEW_TAB") {
+                NEW_TAB
+            } else if command == chrome_command(c"IDC_NEW_WINDOW") {
+                NEW_WINDOW
+            } else if command == chrome_command(c"IDC_NEW_INCOGNITO_WINDOW") {
+                PRIVATE_WINDOW
+            } else {
+                return 0;
+            };
+            unsafe { PostMessageW(self.window as HWND, WM_COMMAND, action, 0); }
+            1
+        }
+        // Keep Chromium's normal menu and toolbar policies when intercepting
+        // the commands that would otherwise create unmanaged browser windows.
+        fn is_chrome_app_menu_item_visible(&self, _browser: Option<&mut Browser>, _command: i32) -> i32 { 1 }
+        fn is_chrome_app_menu_item_enabled(&self, _browser: Option<&mut Browser>, _command: i32) -> i32 { 1 }
+        fn is_chrome_page_action_icon_visible(&self, _icon: ChromePageActionIconType) -> i32 { 1 }
+        fn is_chrome_toolbar_button_visible(&self, _button: ChromeToolbarButtonType) -> i32 { 1 }
+    }
+}
+
+wrap_life_span_handler! {
+    struct FlitSettingsLife { window: usize }
+    impl LifeSpanHandler {
+        fn on_before_popup(
+            &self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: i32,
+            url: Option<&CefString>, _name: Option<&CefString>, disposition: WindowOpenDisposition,
+            gesture: i32, _features: Option<&PopupFeatures>, _window: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>,
+            _extra: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut i32>,
+        ) -> i32 {
+            if gesture != 0 {
+                queue_link(self.window, url, disposition);
+            }
+            1
+        }
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            let _scope = WindowScope::enter(self.window);
+            if let Some(browser) = browser {
+                download_guard::clear_browser(self.window, browser.identifier());
+                let _ = change(|s| {
+                    if s.settings_window.as_ref().is_some_and(|stored| stored.is_same(Some(browser)) != 0) {
+                        s.settings_window = None;
+                    }
+                });
+            }
+            browser_closed(self.window, POPUP_CLOSED, 0);
+        }
+    }
+}
+
+wrap_client! {
     struct FlitClient { key: usize, window: usize }
     impl Client {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
@@ -368,7 +493,8 @@ wrap_jsdialog_handler! {
             let cancelled_close = !proceed && is_reload == 0
                 && change(|s| {
                     s.closing_session = None;
-                    std::mem::replace(&mut s.closing, false)
+                    let tab = s.tabs.iter().any(|tab| tab.key == self.key && tab.close_requested);
+                    std::mem::replace(&mut s.closing, false) || tab
                 }) == Some(true);
             callback.cont(i32::from(proceed), None);
             if cancelled_close {
@@ -405,6 +531,7 @@ wrap_life_span_handler! {
                 state.pending_popups.retain(|(key, _)| *key != self.key);
                 let tab = state.tabs.iter_mut().find(|tab| tab.key == self.key)?;
                 tab.retiring = true;
+                tab.close_requested = false;
                 tab.browser.take()
             }).flatten();
             drop(browser);
@@ -447,6 +574,20 @@ wrap_life_span_handler! {
             let _scope = WindowScope::enter(self.window);
             change(|s| s.pending_popups.remove(&(self.key, popup_id)));
             browser_closed(self.window, POPUP_CLOSED, 0);
+        }
+        fn on_before_dev_tools_popup(
+            &self, _browser: Option<&mut Browser>, _window: Option<&mut WindowInfo>,
+            client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>,
+            _extra: Option<&mut Option<DictionaryValue>>, use_default_window: Option<&mut i32>,
+        ) {
+            // DevTools is owned by Chromium. Its callbacks must not update or
+            // close the Flit tab whose client would otherwise be inherited.
+            if let Some(client) = client {
+                *client = Some(FlitDevToolsClient::new());
+            }
+            if let Some(use_default_window) = use_default_window {
+                *use_default_window = 1;
+            }
         }
     }
 }
@@ -512,10 +653,23 @@ wrap_request_handler! {
     impl RequestHandler {
         fn on_before_browse(
             &self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>,
-            _request: Option<&mut Request>, _gesture: i32, _redirect: i32,
+            request: Option<&mut Request>, _gesture: i32, _redirect: i32,
         ) -> i32 {
             if frame.is_none_or(|frame| frame.is_main() != 0) {
                 permissions::cancel_tab(self.window, self.key);
+                if let Some(request) = request {
+                    let target = CefString::from(&request.url()).to_string();
+                    if let Some(target) = settings_target(&target) {
+                        let _scope = WindowScope::enter(self.window);
+                        if private() {
+                            return 1;
+                        }
+                        if change(|s| s.pending_settings = Some((self.key, target))).is_some() {
+                            unsafe { PostMessageW(self.window as HWND, OPEN_SETTINGS_WINDOW, 0, 0); }
+                        }
+                        return 1;
+                    }
+                }
             }
             0
         }
@@ -871,6 +1025,7 @@ fn open_window(
     let ui = Controls {
         window,
         address: edit(window, ADDRESS),
+        site_info: button(window, SITE_INFO, "Site information"),
         back: button(window, BACK, "Back"),
         forward: button(window, FORWARD, "Forward"),
         reload: button(window, RELOAD, "Reload"),
@@ -959,6 +1114,8 @@ fn open_window(
                 links: VecDeque::new(),
                 popups: Vec::new(),
                 pending_popups: BTreeSet::new(),
+                settings_window: None,
+                pending_settings: None,
                 closing: false,
                 closing_session: None,
             },
@@ -1211,6 +1368,7 @@ fn layout() {
         ui.back,
         ui.forward,
         ui.reload,
+        ui.site_info,
         ui.address,
         ui.go,
         ui.bookmark,
@@ -1224,6 +1382,7 @@ fn layout() {
     set_bounds(ui.forward, d(94), d(15), d(27), d(30));
     set_bounds(ui.reload, d(124), d(15), d(33), d(30));
     let a = l.address_frame;
+    set_bounds(ui.site_info, a.left + d(7), a.top + d(5), d(25), d(30));
     set_bounds(
         ui.address,
         a.left + d(35),
@@ -1542,7 +1701,7 @@ fn refresh_rows(ensure_visible: bool) {
 
 fn refresh(force_address: bool) {
     refresh_rows(force_address);
-    let Some((ui, url, title, capture, back, forward)) = with_shell(|s| {
+    let Some((ui, url, title, capture, back, forward, web)) = with_shell(|s| {
         let tab = s.tabs.iter().find(|t| Some(t.key) == s.active)?;
         Some((
             s.controls,
@@ -1551,6 +1710,8 @@ fn refresh(force_address: bool) {
             capture_labels(tab).map(|(_, caption)| caption),
             tab.back,
             tab.forward,
+            tab.browser.is_some()
+                && (tab.url.starts_with("https://") || tab.url.starts_with("http://")),
         ))
     })
     .flatten() else {
@@ -1576,6 +1737,7 @@ fn refresh(force_address: bool) {
         set_text(ui.window, &caption);
     }
     unsafe {
+        EnableWindow(ui.site_info, i32::from(web));
         EnableWindow(ui.back, i32::from(back));
         EnableWindow(ui.forward, i32::from(forward));
     }
@@ -1695,6 +1857,7 @@ fn append_tab(url: &str, title: &str, pinned: bool) -> Result<(usize, usize), &'
             browser: None,
             native_window: None,
             native_close_sent: false,
+            close_requested: false,
             retiring: false,
             url: url.to_owned(),
             title: title.to_owned(),
@@ -1851,6 +2014,11 @@ fn navigate() {
             return;
         }
     };
+    if settings_target(&url).is_some() {
+        refresh(true);
+        open_settings_window(&url);
+        return;
+    }
     let Some(key) = with_shell(|s| s.active).flatten() else {
         return;
     };
@@ -2006,8 +2174,93 @@ unsafe extern "system" fn page_widget_proc(
     result
 }
 
+wrap_task! {
+    struct CloseEmbeddedPage { window: usize, key: usize, popups: Vec<usize>, deadline: Instant }
+    impl Task {
+        fn execute(&self) {
+            let _scope = WindowScope::enter(self.window);
+            let host = with_shell(|s| {
+                let tab = s.tabs.iter().find(|tab| tab.key == self.key && tab.close_requested)?;
+                tab.browser.clone()
+            }).flatten().and_then(|browser| browser.host());
+            if let Some(host) = host {
+                if Instant::now() < self.deadline && self.popups.iter().any(|hwnd| unsafe {
+                    GetWindow(*hwnd as HWND, GW_OWNER) == self.window as HWND
+                }) {
+                    let mut retry = CloseEmbeddedPage::new(self.window, self.key, self.popups.clone(), self.deadline);
+                    if post_delayed_task(ThreadId::UI, Some(&mut retry), 32) != 0 {
+                        return;
+                    }
+                }
+                host.close_browser(0);
+            }
+        }
+    }
+}
+
+fn owned_transient_windows(owner: HWND) -> Vec<usize> {
+    struct Scan {
+        owner: HWND,
+        found: Vec<usize>,
+    }
+    unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> i32 {
+        let scan = unsafe { &mut *(data as *mut Scan) };
+        if unsafe {
+            GetWindow(hwnd, GW_OWNER) == scan.owner
+                && GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_POPUP != 0
+                && IsWindowVisible(hwnd) != 0
+        } {
+            scan.found.push(hwnd as usize);
+        }
+        1
+    }
+    let mut scan = Scan {
+        owner,
+        found: Vec::new(),
+    };
+    unsafe {
+        let thread = GetWindowThreadProcessId(owner, null_mut());
+        if thread != 0 {
+            EnumThreadWindows(thread, Some(collect), (&mut scan as *mut Scan) as LPARAM);
+        }
+    }
+    scan.found
+}
+
+fn close_embedded_page(window: HWND, key: usize) {
+    let Some(native) = change(|s| {
+        let tab = s
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.key == key && !tab.retiring)?;
+        if tab.browser.is_none() || std::mem::replace(&mut tab.close_requested, true) {
+            return None;
+        }
+        Some(tab.native_window.clone())
+    })
+    .flatten() else {
+        return;
+    };
+    let mut popups = Vec::new();
+    if let Some(native) = native.filter(|native| native.is_closed() == 0) {
+        // The outer Flit HWND can own a Chromium Views bubble. Hide the
+        // BrowserView while it is live and let Chromium retire its own UI.
+        popups = owned_transient_windows(window);
+        native.hide();
+    }
+    // Observe only windows present at hide time. A popup that stays open
+    // cannot block the user's close indefinitely.
+    CloseEmbeddedPage::new(
+        window as usize,
+        key,
+        popups,
+        Instant::now() + Duration::from_millis(1500),
+    )
+    .execute();
+}
+
 fn close_tab(key: Option<usize>) {
-    let Some((window, key, browser)) = with_shell(|s| {
+    let Some((window, key, loaded)) = with_shell(|s| {
         if s.closing {
             return None;
         }
@@ -2015,8 +2268,8 @@ fn close_tab(key: Option<usize>) {
         let tab = s
             .tabs
             .iter()
-            .find(|t| t.key == key && !t.unloading && !t.retiring)?;
-        Some((s.controls.window, key, tab.browser.clone()))
+            .find(|t| t.key == key && !t.unloading && !t.retiring && !t.close_requested)?;
+        Some((s.controls.window, key, tab.browser.is_some()))
     })
     .flatten() else {
         return;
@@ -2025,8 +2278,8 @@ fn close_tab(key: Option<usize>) {
         return;
     }
     permissions::cancel_tab(window as usize, key);
-    if let Some(host) = browser.and_then(|b| b.host()) {
-        host.close_browser(0);
+    if loaded {
+        close_embedded_page(window, key);
     } else {
         closed(key);
     }
@@ -2049,6 +2302,7 @@ fn close_window(window: HWND) {
             return false;
         }
         s.closing = true;
+        s.pending_settings = None;
         s.closing_session = (!s.private).then(|| snapshot(s));
         true
     }) == Some(true)
@@ -2083,27 +2337,32 @@ fn cancel_active_permission(window: HWND) {
 }
 
 fn continue_window_close(window: HWND) {
-    let browser = with_shell(|s| {
-        if let Some(popup) = s.popups.last() {
-            return Some(popup.clone());
+    let Some((aux, tab, waiting)) = with_shell(|s| {
+        let waiting =
+            !s.pending_popups.is_empty() || s.tabs.iter().any(|tab| tab.unloading || tab.retiring);
+        if let Some(settings) = &s.settings_window {
+            return (Some(settings.clone()), None, waiting);
         }
-        s.tabs
+        if let Some(popup) = s.popups.last() {
+            return (Some(popup.clone()), None, waiting);
+        }
+        let key = s
+            .tabs
             .iter()
             .find(|t| Some(t.key) != s.active && t.browser.is_some() && !t.unloading)
-            .or_else(|| s.tabs.iter().find(|t| t.browser.is_some() && !t.unloading))?
-            .browser
-            .clone()
-    })
-    .flatten();
-    if let Some(host) = browser.and_then(|browser| browser.host()) {
-        host.close_browser(0);
-    } else {
-        if with_shell(|s| {
-            !s.pending_popups.is_empty() || s.tabs.iter().any(|tab| tab.unloading || tab.retiring)
-        }) == Some(true)
-        {
-            return;
+            .or_else(|| s.tabs.iter().find(|t| t.browser.is_some() && !t.unloading))
+            .map(|tab| tab.key);
+        (None, key, waiting)
+    }) else {
+        return;
+    };
+    if let Some(aux) = aux {
+        if let Some(host) = aux.host() {
+            host.close_browser(0);
         }
+    } else if let Some(key) = tab {
+        close_embedded_page(window, key);
+    } else if !waiting {
         if let Some(state) = change(|s| s.closing_session.take()).flatten() {
             if last_normal_window() {
                 store_session(&state);
@@ -2123,20 +2382,21 @@ fn snapshot(s: &Shell) -> Session {
             restore: false,
         };
     }
-    let selected = s
-        .tabs
-        .iter()
-        .position(|tab| Some(tab.key) == s.active)
-        .unwrap_or(0);
-    let entries = s
-        .tabs
-        .iter()
-        .map(|tab| Entry {
+    let mut entries = Vec::new();
+    let mut selected = 0;
+    for tab in &s.tabs {
+        if settings_target(&tab.url).is_some() {
+            continue;
+        }
+        if Some(tab.key) == s.active {
+            selected = entries.len();
+        }
+        entries.push(Entry {
             url: tab.url.clone(),
             title: tab.title.clone(),
             pinned: tab.pinned,
-        })
-        .collect();
+        });
+    }
     Session {
         entries,
         selected,
@@ -2341,6 +2601,10 @@ fn host() -> Option<BrowserHost> {
     active().and_then(|b| b.host())
 }
 
+fn chrome_command(name: &std::ffi::CStr) -> i32 {
+    unsafe { sys::cef_id_for_command_id_name(name.as_ptr()) }
+}
+
 fn zoom_page(host: &BrowserHost, id: usize) {
     let command = match id {
         ZOOM_IN => ZoomCommand::IN,
@@ -2352,35 +2616,153 @@ fn zoom_page(host: &BrowserHost, id: usize) {
     }
 }
 
-fn open_builtin(url: &'static str) {
-    let requested = url::Url::parse(url).ok();
+fn settings_target(address: &str) -> Option<String> {
+    let url = url::Url::parse(address).ok()?;
+    (url.scheme() == "chrome"
+        && url.host_str() == Some("settings")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none())
+    .then(|| url.into())
+}
+
+fn open_settings_window(url: &str) {
+    let Some((window, existing)) = with_shell(|s| {
+        (!s.private && !s.closing).then(|| (s.controls.window, s.settings_window.clone()))
+    })
+    .flatten() else {
+        return;
+    };
+    if let Some(browser) = existing.filter(|b| b.is_valid() != 0) {
+        if let Some(frame) = browser.main_frame() {
+            frame.load_url(Some(&CefString::from(url)));
+        }
+        if let Some(host) = browser.host() {
+            let hwnd: HWND = host.window_handle().0.cast();
+            if !hwnd.is_null() {
+                unsafe {
+                    if IsIconic(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    SetForegroundWindow(hwnd);
+                }
+            }
+            host.set_focus(1);
+        }
+        return;
+    }
+    let info = WindowInfo {
+        runtime_style: RuntimeStyle::CHROME,
+        ..Default::default()
+    };
+    let mut client = FlitSettingsClient::new(window as usize);
+    let browser = browser_host_create_browser_sync(
+        Some(&info),
+        Some(&mut client),
+        Some(&CefString::from(url)),
+        Some(&BrowserSettings::default()),
+        None,
+        None,
+    );
+    if let Some(browser) = browser {
+        change(|s| s.settings_window = Some(browser));
+    } else {
+        unsafe {
+            MessageBoxW(
+                window,
+                windows_sys::w!("Could not open settings."),
+                windows_sys::w!("Flit Browser"),
+                MB_ICONERROR | MB_OK,
+            );
+        }
+    }
+}
+
+fn open_builtin(url: &str) {
+    if let Some(url) = settings_target(url) {
+        // The history deletion completion handler needs Chromium's complete
+        // BrowserView. Flit's lightweight embedded tab omits that UI.
+        open_settings_window(&url);
+        return;
+    }
     let existing = with_shell(|s| {
         s.tabs
             .iter()
-            .find(|tab| {
-                tab.url == url
-                    || requested.as_ref().is_some_and(|target| {
-                        target.host_str() == Some("settings")
-                            && url::Url::parse(&tab.url).is_ok_and(|current| {
-                                current.scheme() == "chrome"
-                                    && current.host_str() == Some("settings")
-                            })
-                    })
-            })
-            .map(|tab| (tab.key, tab.url != url))
+            .find(|tab| !tab.retiring && !tab.unloading && tab.url == url)
+            .map(|tab| tab.key)
     })
     .flatten();
-    if let Some((key, navigate)) = existing {
+    if let Some(key) = existing {
         select_key(key);
-        if navigate {
-            if let Some(frame) = active().and_then(|browser| browser.main_frame()) {
-                frame.load_url(Some(&CefString::from(url)));
-            }
-        }
     } else if let Err(message) = add_tab(url) {
         if let Some(ui) = controls() {
             set_text(ui.window, &format!("{} — {message}", app_title()));
         }
+    }
+}
+
+fn site_info() -> Option<(String, &'static str)> {
+    let browser = active()?;
+    let frame = browser.main_frame()?;
+    let url = url::Url::parse(&CefString::from(&frame.url()).to_string()).ok()?;
+    let origin = url.origin().ascii_serialization();
+    let connection = match url.scheme() {
+        "http" => "This site uses HTTP. The connection is not encrypted.",
+        "https" => {
+            let ssl = browser
+                .host()?
+                .visible_navigation_entry()
+                .filter(|entry| entry.is_valid() != 0)
+                .filter(|entry| {
+                    url::Url::parse(&CefString::from(&entry.url()).to_string())
+                        .is_ok_and(|entry_url| entry_url == url)
+                })
+                .and_then(|entry| entry.sslstatus());
+            if ssl.is_some_and(|status| {
+                status.is_secure_connection() != 0
+                    && is_cert_status_error(status.cert_status()) == 0
+                    && status.content_status() == SslContentStatus::NORMAL_CONTENT
+            }) {
+                "The connection uses verified HTTPS."
+            } else {
+                "The browser cannot confirm a fully secure connection to this site."
+            }
+        }
+        _ => return None,
+    };
+    Some((origin, connection))
+}
+
+fn show_site_info(window: HWND) {
+    let Some((origin, connection)) = site_info() else {
+        return;
+    };
+    let is_private = private();
+    let question = if is_private {
+        ""
+    } else {
+        "\n\nOpen this site's settings?"
+    };
+    let content = wide(&format!("{origin}\n\n{connection}{question}"));
+    let selected = unsafe {
+        MessageBoxW(
+            window,
+            content.as_ptr(),
+            windows_sys::w!("Site information"),
+            MB_ICONINFORMATION
+                | if is_private {
+                    MB_OK
+                } else {
+                    MB_YESNO | MB_DEFBUTTON2
+                },
+        )
+    };
+    if !is_private && selected == IDYES && site_info().is_some_and(|(current, _)| current == origin)
+    {
+        let mut url =
+            url::Url::parse("chrome://settings/content/siteDetails").expect("static settings URL");
+        url.query_pairs_mut().append_pair("site", &origin);
+        open_builtin(url.as_str());
     }
 }
 
@@ -2543,9 +2925,10 @@ fn show_menu(ui: Controls) {
     add(PRIVATE_WINDOW, "New private window\tCtrl+Shift+N", true);
     add(RESTORE_TAB, "Reopen closed tab\tCtrl+Shift+T", restore);
     add(FOCUS_FILTER, "Search open tabs\tCtrl+Shift+A", true);
+    add(CLOSE_WINDOW, "Close window\tCtrl+Shift+W", true);
     separator();
     add(SAVE_BOOKMARK, "Bookmark this page\tCtrl+D", !private());
-    add(BOOKMARKS, "Manage bookmarks", !private());
+    add(BOOKMARKS, "Manage bookmarks\tCtrl+Shift+O", !private());
     add(HISTORY, "History\tCtrl+H", !private());
     add(DOWNLOADS, "Downloads\tCtrl+J", true);
     separator();
@@ -2572,9 +2955,21 @@ fn show_menu(ui: Controls) {
     separator();
     add(SETTINGS, "Settings", !private());
     add(SITE_PERMISSIONS, "Site permissions", !private());
-    add(CLEAR_BROWSING, "Clear browsing data…", !private());
+    add(
+        CLEAR_BROWSING,
+        "Clear browsing data…\tCtrl+Shift+Del",
+        !private(),
+    );
     add(PASSWORDS, "Password manager", !private());
     add(EXTENSIONS, "Extensions", !private());
+    add(
+        DEVTOOLS,
+        "Developer tools\tF12",
+        host().is_some_and(|host| {
+            host.has_dev_tools() != 0
+                || host.can_execute_chrome_command(chrome_command(c"IDC_DEV_TOOLS_TOGGLE")) != 0
+        }),
+    );
     unsafe {
         AppendMenuW(
             menu,
@@ -2624,11 +3019,13 @@ fn shortcut_command(action: Shortcut) -> usize {
         Shortcut::FocusAddress => FOCUS_ADDRESS,
         Shortcut::FocusSearch => FOCUS_SEARCH,
         Shortcut::Bookmark => SAVE_BOOKMARK,
+        Shortcut::ManageBookmarks => BOOKMARKS,
         Shortcut::NewTab => NEW_TAB,
         Shortcut::NewWindow => NEW_WINDOW,
         Shortcut::PrivateWindow => PRIVATE_WINDOW,
         Shortcut::RestoreTab => RESTORE_TAB,
         Shortcut::CloseTab => CLOSE_TAB,
+        Shortcut::CloseWindow => CLOSE_WINDOW,
         Shortcut::Reload => RELOAD,
         Shortcut::HardReload => HARD_RELOAD,
         Shortcut::Back => BACK,
@@ -2643,8 +3040,11 @@ fn shortcut_command(action: Shortcut) -> usize {
         Shortcut::FindNext => FOCUS_FIND_NEXT,
         Shortcut::FindPrevious => FOCUS_FIND_PREV,
         Shortcut::History => HISTORY,
+        Shortcut::ClearBrowsingData => CLEAR_BROWSING,
         Shortcut::Downloads => DOWNLOADS,
         Shortcut::Print => PRINT,
+        Shortcut::DevTools => DEVTOOLS,
+        Shortcut::DevToolsConsole => DEVTOOLS_CONSOLE,
         Shortcut::ToggleFullscreen => FULLSCREEN,
         Shortcut::ZoomIn => ZOOM_IN,
         Shortcut::ZoomOut => ZOOM_OUT,
@@ -2804,6 +3204,7 @@ fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
 fn can_unload(s: &Shell, tab: &Tab) -> bool {
     !s.closing
         && !tab.unloading
+        && !tab.close_requested
         && Some(tab.key) != s.active
         && tab.browser.is_some()
         && (tab.url.starts_with("http://") || tab.url.starts_with("https://"))
@@ -3130,6 +3531,7 @@ unsafe extern "system" fn window_proc(
                 RELOAD => ButtonKind::Reload,
                 GO => ButtonKind::Go,
                 SAVE_BOOKMARK => ButtonKind::Bookmark,
+                SITE_INFO => ButtonKind::SiteInfo,
                 MENU => ButtonKind::Menu,
                 NEW_TAB
                     if with_shell(|s| !s.sidebar_open && !s.sidebar_motion.running())
@@ -3247,10 +3649,11 @@ unsafe extern "system" fn window_proc(
                 HISTORY if !private() => open_builtin("chrome://history/"),
                 BOOKMARKS if !private() => open_builtin(MANAGER_URL),
                 SAVE_BOOKMARK => bookmark_page(),
+                SITE_INFO => show_site_info(window),
                 DOWNLOADS => open_builtin("chrome://downloads/"),
-                SETTINGS if !private() => open_builtin("chrome://settings/"),
+                SETTINGS if !private() => open_builtin(SETTINGS_URL),
                 SITE_PERMISSIONS if !private() => open_builtin("chrome://settings/content"),
-                CLEAR_BROWSING if !private() => open_builtin("chrome://settings/clearBrowserData"),
+                CLEAR_BROWSING if !private() => open_builtin(CLEAR_DATA_URL),
                 TOGGLE_RESTORE if !private() => {
                     RESTORE_TABS.set(!RESTORE_TABS.get());
                     save_session();
@@ -3291,6 +3694,24 @@ unsafe extern "system" fn window_proc(
                         host.print();
                     }
                 }
+                DEVTOOLS | DEVTOOLS_CONSOLE => {
+                    let command = if id == DEVTOOLS {
+                        chrome_command(c"IDC_DEV_TOOLS_TOGGLE")
+                    } else {
+                        chrome_command(c"IDC_DEV_TOOLS_CONSOLE")
+                    };
+                    if let Some(host) = host() {
+                        if id == DEVTOOLS && host.has_dev_tools() != 0 {
+                            host.close_dev_tools();
+                        } else if host.can_execute_chrome_command(command) != 0 {
+                            host.execute_chrome_command(
+                                command,
+                                WindowOpenDisposition::CURRENT_TAB,
+                            );
+                        }
+                    }
+                }
+                CLOSE_WINDOW => close_window(window),
                 ADDRESS if notification == EN_CHANGE => {
                     change(|s| {
                         if !s.updating_address {
@@ -3329,7 +3750,19 @@ unsafe extern "system" fn window_proc(
             0
         }
         TAB_CLOSE_CANCELLED => {
+            let native = change(|s| {
+                let tab = s.tabs.iter_mut().find(|tab| tab.key == wp)?;
+                if std::mem::take(&mut tab.close_requested) {
+                    tab.native_window.clone()
+                } else {
+                    None
+                }
+            })
+            .flatten();
             select_key(wp);
+            if let Some(native) = native.filter(|native| native.is_closed() == 0) {
+                native.show();
+            }
             focus_page();
             queue_session_save();
             0
@@ -3337,6 +3770,24 @@ unsafe extern "system" fn window_proc(
         POPUP_CLOSED => {
             if with_shell(|s| s.closing) == Some(true) {
                 continue_window_close(window);
+            }
+            0
+        }
+        OPEN_SETTINGS_WINDOW => {
+            if let Some((key, url)) = change(|s| s.pending_settings.take()).flatten() {
+                let restore = change(|s| {
+                    let tab = s.tabs.iter_mut().find(|tab| tab.key == key)?;
+                    if settings_target(&tab.url).is_some() && tab.browser.is_some() {
+                        tab.url = HOME.into();
+                        tab.title.clear();
+                    }
+                    Some(s.active == Some(key))
+                })
+                .flatten();
+                if restore == Some(true) {
+                    refresh(true);
+                }
+                open_settings_window(&url);
             }
             0
         }

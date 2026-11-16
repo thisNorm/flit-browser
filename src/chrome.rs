@@ -77,6 +77,7 @@ pub(crate) enum ButtonKind {
     NewTab,
     NewTabCompact,
     Bookmark,
+    SiteInfo,
     Menu,
 }
 
@@ -337,15 +338,6 @@ fn paint_strip(dc: HDC, bounds: RECT, layout: &Layout, colors: &Palette) {
             glass_plate(dc, plate, d(37), colors.navigation, colors, layout.dpi);
         }
         glass_plate(dc, address, d(38), colors.field, colors, layout.dpi);
-        search_icon(
-            dc,
-            (
-                address.left + d(18),
-                (address.top + address.bottom) / 2 - d(1),
-            ),
-            layout.dpi,
-            colors.disabled,
-        );
         if has_area(layout.find_frame) {
             glass_plate(
                 dc,
@@ -528,6 +520,14 @@ fn button_icon(dc: HDC, kind: ButtonKind, center: (i32, i32), dpi: i32, color: C
             stroke(dc, center, dpi, [(5, -7), (5, -3), (1, -3)]);
         }
         ButtonKind::Go => stroke(dc, center, dpi, [(-3, -5), (2, 0), (-3, 5)]),
+        ButtonKind::SiteInfo => {
+            for y in [-4, 0, 4] {
+                stroke(dc, center, dpi, [(-6, y), (6, y)]);
+            }
+            for (x, y) in [(-2, -4), (3, 0), (0, 4)] {
+                stroke(dc, center, dpi, [(x, y - 2), (x, y + 2)]);
+            }
+        }
         ButtonKind::NewTab | ButtonKind::NewTabCompact => {
             stroke(dc, center, dpi, [(-5, 0), (5, 0)]);
             stroke(dc, center, dpi, [(0, -5), (0, 5)]);
@@ -572,7 +572,9 @@ pub(crate) fn draw_button(item: &DRAWITEMSTRUCT, kind: ButtonKind, dpi: i32) {
     let pressed = !disabled && item.itemState & ODS_SELECTED != 0;
     let hot = !disabled && item.itemState & ODS_HOTLIGHT != 0;
     let (base, ink) = match kind {
-        ButtonKind::Go | ButtonKind::Bookmark => (colors.field, colors.field_text),
+        ButtonKind::Go | ButtonKind::Bookmark | ButtonKind::SiteInfo => {
+            (colors.field, colors.field_text)
+        }
         ButtonKind::NewTab => (colors.panel, colors.text),
         _ => (colors.navigation, colors.text),
     };

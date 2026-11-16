@@ -18,6 +18,7 @@ import time
 from urllib.parse import urlsplit
 
 from windows_smoke import Browser, OwnedProcess, WORKSPACE, Win32, fixture, require
+from windows_devtools import tools_windows
 
 
 FIND, FIND_TEXT, FIND_STATUS, FIND_CLOSE = 124, 125, 126, 129
@@ -26,14 +27,13 @@ PAGES = (
     ("history", 119, "history", ("History", "방문 기록")),
     ("bookmarks", 120, "bookmarks", ("Bookmarks", "북마크")),
     ("downloads", 121, "downloads", ("Downloads", "Download history", "다운로드", "다운로드 기록")),
-    ("settings", 122, "settings", ("Settings", "설정")),
     ("extensions", 123, "extensions", ("Extensions", "확장 프로그램")),
     ("passwords", 137, "password-manager", (
         "Google Password Manager", "Password Manager", "Passwords", "비밀번호 관리자")),
 )
 
 
-SETTINGS_ROUTES = (("site_permissions", 146, "/content"),
+SETTINGS_ROUTES = (("settings", 122, "/"), ("site_permissions", 146, "/content"),
                    ("clear_browsing_dialog", 147, "/clearBrowserData"))
 
 
@@ -85,11 +85,23 @@ def builtin(browser, cid, host, titles, item):
     item["scope"] = "Activation only: expected document title and chrome host; no WebUI DOM inspection."
 
 
-def settings_route(browser, cid, path, item):
+def settings_route(browser, cid, path, item, existing=None):
+    before = browser.selected(), browser.tab_count()
     command(browser, cid)
-    expected = "chrome://settings" + path
-    browser.wait(f"{expected} committed", lambda: browser.address() == expected)
-    item["scope"] = "Settings route reached; no permissions changed or browsing data cleared."
+    names = ("settings", "설정") if path == "/" else (
+        ("site settings", "사이트 설정") if path == "/content" else ("privacy and security", "개인 정보 보호 및 보안"))
+
+    def settings():
+        windows = tools_windows(browser)
+        for hwnd, title in windows.items():
+            if any(name in title.casefold() for name in names):
+                return hwnd, title
+
+    hwnd, title = browser.wait(f"Chromium settings window for {path}", settings)
+    require(existing is None or hwnd == existing, "Settings route opened another Chromium window")
+    require((browser.selected(), browser.tab_count()) == before, "Settings window altered the active Flit tab")
+    item.update(hwnd=hwnd, title=title, path=path,
+                scope="Separate Chromium window title; no settings changed or browsing data cleared.")
 
 
 def find(browser, item):
@@ -170,9 +182,11 @@ def run(exe, work, evidence):
                 for name, cid, host, titles in PAGES:
                     check(results, name, lambda item, cid=cid, host=host, titles=titles:
                           builtin(browser, cid, host, titles, item), browser)
+                settings_hwnd = None
                 for name, cid, path in SETTINGS_ROUTES:
-                    check(results, name, lambda item, cid=cid, path=path:
-                          settings_route(browser, cid, path, item), browser)
+                    item = check(results, name, lambda item, cid=cid, path=path:
+                                 settings_route(browser, cid, path, item, settings_hwnd), browser)
+                    settings_hwnd = item.get("hwnd", settings_hwnd)
                 check(results, "normal_close", lambda item: process.normal_close(browser.hwnd))
         finally:
             evidence["fixture"] = site.report()
