@@ -142,6 +142,7 @@ const STOP_LOADING: u32 = WM_APP + 10;
 const EXIT_NEXT_WINDOW: u32 = WM_APP + 11;
 const TAB_DOWNLOAD_ENDED: u32 = WM_APP + 12;
 const LOAD_RESTORED_WINDOW: u32 = WM_APP + 13;
+const SELECT_POPUP_TAB: u32 = WM_APP + 14;
 const TAB_PIN: usize = 1;
 const TAB_DUPLICATE: usize = 2;
 const TAB_MUTE: usize = 3;
@@ -315,6 +316,13 @@ struct PendingLink {
     source: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct PopupTab {
+    opener: usize,
+    id: i32,
+    foreground: bool,
+}
+
 struct PageChanges {
     active: bool,
     save: bool,
@@ -348,7 +356,7 @@ struct Shell {
     tab_drag: Option<TabDrag>,
     links: VecDeque<PendingLink>,
     popups: Vec<Browser>,
-    pending_popups: BTreeSet<(usize, i32)>,
+    pending_popups: BTreeMap<(usize, i32), Option<usize>>,
     settings_window: Option<Browser>,
     pending_settings: Option<(usize, String)>,
     closing: bool,
@@ -373,6 +381,7 @@ thread_local! {
     static RECOVERY_WINDOW: Cell<usize> = const { Cell::new(0) };
     static OPENING_SESSION: Cell<bool> = const { Cell::new(false) };
     static EXIT_SESSION: RefCell<Option<ExitSession>> = const { RefCell::new(None) };
+    static NATIVE_EXIT: Cell<bool> = const { Cell::new(false) };
     static EXIT_CODE: Cell<i32> = const { Cell::new(0) };
 }
 
@@ -382,7 +391,7 @@ struct ExitSession {
 }
 
 fn exiting() -> bool {
-    EXIT_SESSION.with(|slot| slot.borrow().is_some())
+    NATIVE_EXIT.get() || EXIT_SESSION.with(|slot| slot.borrow().is_some())
 }
 
 struct WindowScope(usize);
@@ -598,10 +607,10 @@ wrap_life_span_handler! {
 }
 
 wrap_client! {
-    struct FlitClient { key: usize, window: usize }
+    struct FlitClient { key: usize, window: usize, popup: Option<PopupTab> }
     impl Client {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(FlitLife::new(self.window, self.key))
+            Some(FlitLife::new(self.window, self.key, self.popup))
         }
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(FlitDisplay::new(self.window, self.key))
@@ -647,15 +656,15 @@ wrap_jsdialog_handler! {
             let releasing = with_shell(|s| s.tabs.iter().any(|tab| tab.key == self.key && tab.unloading)) == Some(true);
             let proceed = !releasing && unsafe { MessageBoxW(self.window as HWND, message,
                 windows_sys::w!("Flit Browser"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) } == IDYES;
-            let cancelled_close = !proceed && is_reload == 0
-                && change(|s| {
+            let cancelled_close = !proceed && is_reload == 0 && (
+                (!releasing && cancel_native_exit()) || change(|s| {
                     let tab = s.tabs.iter().any(|tab| tab.key == self.key && tab.close_requested);
                     if !releasing {
                         s.closing_session = None;
                         return std::mem::replace(&mut s.closing, false) || tab;
                     }
                     tab
-                }) == Some(true);
+                }) == Some(true));
             callback.cont(i32::from(proceed), None);
             if cancelled_close {
                 unsafe { PostMessageW(self.window as HWND, TAB_CLOSE_CANCELLED, self.key, isize::from(releasing)); }
@@ -679,16 +688,41 @@ wrap_find_handler! {
 }
 
 wrap_life_span_handler! {
-    struct FlitLife { window: usize, key: usize }
+    struct FlitLife { window: usize, key: usize, popup: Option<PopupTab> }
     impl LifeSpanHandler {
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let (Some(popup), Some(browser)) = (self.popup, browser) else { return };
+            let _scope = WindowScope::enter(self.window);
+            let tracked = change(|s| s.pending_popups.remove(&(popup.opener, popup.id)))
+                .flatten().flatten() == Some(self.key);
+            if !tracked {
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+                return;
+            }
+            if attach_tab_browser(self.key, browser).is_err() {
+                return;
+            }
+            let window = self.window as HWND;
+            if with_shell(|s| s.closing) == Some(true) {
+                browser_closed(self.window, POPUP_CLOSED, 0);
+            } else {
+                if popup.foreground {
+                    // The CEF navigation still holds the opener's creation lock here.
+                    unsafe { PostMessageW(window, SELECT_POPUP_TAB, self.key, 0); }
+                }
+                queue_session_save();
+            }
+        }
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             let _scope = WindowScope::enter(self.window);
             permissions::cancel_tab(self.window, self.key);
             if let Some(browser) = browser {
                 download_guard::clear_browser(self.window, browser.identifier());
             }
+            discard_aborted_popups(self.key, None);
             let browser = change(|state| {
-                state.pending_popups.retain(|(key, _)| *key != self.key);
                 let tab = state.tabs.iter_mut().find(|tab| tab.key == self.key)?;
                 tab.retiring = true;
                 tab.close_requested = false;
@@ -702,8 +736,8 @@ wrap_life_span_handler! {
             &self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>,
             popup_id: i32, target_url: Option<&CefString>, _target_name: Option<&CefString>,
             disposition: WindowOpenDisposition, gesture: i32, _features: Option<&PopupFeatures>,
-            _window: Option<&mut WindowInfo>, client: Option<&mut Option<Client>>,
-            _settings: Option<&mut BrowserSettings>, _extra: Option<&mut Option<DictionaryValue>>,
+            window: Option<&mut WindowInfo>, client: Option<&mut Option<Client>>,
+            settings: Option<&mut BrowserSettings>, _extra: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
             if gesture == 0 || exiting() {
@@ -713,26 +747,42 @@ wrap_life_span_handler! {
             if with_shell(|s| s.closing) != Some(false) {
                 return 1;
             }
-            if disposition == WindowOpenDisposition::NEW_POPUP {
-                let target = target_url.map(CefString::to_string).unwrap_or_default();
-                if let Some(client) = client {
-                    if target.is_empty() || target == HOME || crate::launch_url::literal_http_url(&target).is_some() {
-                        // Let CEF create the real child browsing context so OAuth
-                        // callbacks can reach window.opener in the same profile.
-                        change(|s| s.pending_popups.insert((self.key, popup_id)));
-                        *client = Some(FlitPopupClient::new(self.window, self.key, popup_id));
-                        return 0;
-                    }
+            let target = target_url.map(CefString::to_string).unwrap_or_default();
+            if !(target.is_empty() || target == HOME || crate::launch_url::literal_http_url(&target).is_some()) {
+                return 1;
+            }
+            let Some(client) = client else { return 1 };
+            if matches!(disposition, WindowOpenDisposition::NEW_FOREGROUND_TAB | WindowOpenDisposition::NEW_BACKGROUND_TAB) {
+                let Some(window) = window else { return 1 };
+                let foreground = disposition == WindowOpenDisposition::NEW_FOREGROUND_TAB;
+                let Ok((key, _)) = append_tab(if target.is_empty() { HOME } else { &target }, "", false, foreground.then_some(self.key)) else {
+                    return 1;
+                };
+                let Some(panel) = with_shell(|s| s.tabs.iter().find(|tab| tab.key == key).map(|t| t.panel)).flatten() else {
+                    return 1;
+                };
+                // Let Chromium create and navigate the child so the original
+                // method, body and opener survive the new-tab request.
+                *window = tab_window_info(self.window as HWND, panel);
+                if let Some(settings) = settings {
+                    settings.chrome_zoom_bubble = State::DISABLED;
                 }
-            } else if matches!(disposition, WindowOpenDisposition::NEW_FOREGROUND_TAB
-                | WindowOpenDisposition::NEW_BACKGROUND_TAB | WindowOpenDisposition::NEW_WINDOW) {
-                queue_link(self.window, target_url, disposition, Some(self.key));
+                change(|s| s.pending_popups.insert((self.key, popup_id), Some(key)));
+                *client = Some(FlitClient::new(key, self.window, Some(PopupTab { opener: self.key, id: popup_id, foreground })));
+                return 0;
+            }
+            if matches!(disposition, WindowOpenDisposition::NEW_POPUP | WindowOpenDisposition::NEW_WINDOW) {
+                // Let an explicit separate window keep its native browsing
+                // context and window.opener in the same profile.
+                change(|s| s.pending_popups.insert((self.key, popup_id), None));
+                *client = Some(FlitPopupClient::new(self.window, self.key, popup_id));
+                return 0;
             }
             1
         }
         fn on_before_popup_aborted(&self, _browser: Option<&mut Browser>, popup_id: i32) {
             let _scope = WindowScope::enter(self.window);
-            change(|s| s.pending_popups.remove(&(self.key, popup_id)));
+            discard_aborted_popups(self.key, Some(popup_id));
             browser_closed(self.window, POPUP_CLOSED, 0);
         }
         fn on_before_dev_tools_popup(
@@ -749,6 +799,31 @@ wrap_life_span_handler! {
                 *use_default_window = 1;
             }
         }
+    }
+}
+
+fn discard_aborted_popups(opener: usize, id: Option<i32>) {
+    let panels = change(|s| {
+        let keys: Vec<_> = s
+            .pending_popups
+            .extract_if(.., |&(key, popup_id), _| {
+                key == opener && id.is_none_or(|id| id == popup_id)
+            })
+            .filter_map(|(_, tab)| tab)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                let index = s.tabs.iter().position(|tab| tab.key == key)?;
+                Some(s.tabs.remove(index).panel)
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    if !panels.is_empty() {
+        for panel in panels {
+            unsafe { DestroyWindow(panel) };
+        }
+        refresh_rows(false);
     }
 }
 
@@ -775,9 +850,12 @@ wrap_life_span_handler! {
             let Some(browser) = browser else { return; };
             let _scope = WindowScope::enter(self.window);
             let tracked = change(|s| {
-                s.pending_popups.remove(&(self.opener_key, self.popup_id));
+                if s.pending_popups.remove(&(self.opener_key, self.popup_id)) != Some(None) {
+                    return false;
+                }
                 s.popups.push(browser.clone());
-            }).is_some();
+                true
+            }) == Some(true);
             if !tracked || with_shell(|s| s.closing) == Some(true) {
                 if let Some(host) = browser.host() {
                     host.close_browser(0);
@@ -1433,7 +1511,7 @@ fn create_window(
                 tab_drag: None,
                 links: VecDeque::new(),
                 popups: Vec::new(),
-                pending_popups: BTreeSet::new(),
+                pending_popups: BTreeMap::new(),
                 settings_window: None,
                 pending_settings: None,
                 closing: false,
@@ -2424,9 +2502,7 @@ fn load_deferred(key: usize) -> Result<(), &'static str> {
     })
     .flatten();
     if let Some(url) = url {
-        if let Some(frame) = materialize(key)?.main_frame() {
-            frame.load_url(Some(&CefString::from(url.as_str())));
-        }
+        navigate_tab(key, &url)?;
     }
     Ok(())
 }
@@ -2450,24 +2526,8 @@ fn load_waiting_window(window: HWND) {
     }
 }
 
-fn materialize(key: usize) -> Result<Browser, &'static str> {
-    let (ui, panel, existing, muted, foreground) = with_shell(|s| {
-        let tab = s.tabs.iter().find(|tab| tab.key == key && !tab.retiring)?;
-        Some((
-            s.controls,
-            tab.panel,
-            tab.browser.clone(),
-            tab.muted,
-            s.active == Some(key),
-        ))
-    })
-    .flatten()
-    .ok_or("The tab is no longer available.")?;
-    if let Some(browser) = existing {
-        return Ok(browser);
-    }
-    position_page(&current_layout(ui.window), panel, None);
-    let mut context = request_context()?;
+fn tab_window_info(window: HWND, panel: HWND) -> WindowInfo {
+    position_page(&current_layout(window), panel, None);
     let mut rect = RECT::default();
     unsafe {
         GetClientRect(panel, &mut rect);
@@ -2491,7 +2551,27 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
         },
     );
     win.ex_style |= WS_EX_NOACTIVATE;
-    let mut client = FlitClient::new(key, ui.window as usize);
+    win
+}
+
+fn navigate_tab(key: usize, url: &str) -> Result<Browser, &'static str> {
+    let (window, panel, existing) = with_shell(|s| {
+        let tab = s.tabs.iter().find(|tab| tab.key == key && !tab.retiring)?;
+        Some((s.controls.window, tab.panel, tab.browser.clone()))
+    })
+    .flatten()
+    .ok_or("The tab is no longer available.")?;
+    let url = CefString::from(url);
+    if let Some(browser) = existing {
+        let frame = browser
+            .main_frame()
+            .ok_or("The page is no longer available.")?;
+        frame.load_url(Some(&url));
+        return Ok(browser);
+    }
+    let mut context = request_context()?;
+    let win = tab_window_info(window, panel);
+    let mut client = FlitClient::new(key, window as usize, None);
     let settings = BrowserSettings {
         // The embedded host has no Chromium toolbar to anchor a zoom bubble.
         chrome_zoom_bubble: State::DISABLED,
@@ -2500,7 +2580,9 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
     let Some(browser) = browser_host_create_browser_sync(
         Some(&win),
         Some(&mut client),
-        Some(&CefString::from(HOME)),
+        // Go straight to the requested page so Chrome can assign its renderer
+        // without first opening an about:blank document in a separate process.
+        Some(&url),
         Some(&settings),
         None,
         context.as_mut(),
@@ -2509,6 +2591,26 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
             InvalidateRect(panel, null(), 1);
         }
         return Err("CEF could not create the browser tab.");
+    };
+    attach_tab_browser(key, &browser)?;
+    Ok(browser)
+}
+
+fn attach_tab_browser(key: usize, browser: &Browser) -> Result<(), &'static str> {
+    let Some((window, panel, muted, foreground)) = with_shell(|s| {
+        let tab = s.tabs.iter().find(|tab| tab.key == key && !tab.retiring)?;
+        Some((
+            s.controls.window,
+            tab.panel,
+            tab.muted,
+            s.active == Some(key),
+        ))
+    })
+    .flatten() else {
+        if let Some(host) = browser.host() {
+            host.close_browser(1);
+        }
+        return Err("The tab is no longer available.");
     };
     let native_window =
         browser_view_get_for_browser(Some(&mut browser.clone())).and_then(|view| view.window());
@@ -2521,7 +2623,7 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
             {
                 return false;
             }
-            if unsafe { SetWindowSubclass(child, Some(page_widget_proc), key, ui.window as usize) }
+            if unsafe { SetWindowSubclass(child, Some(page_widget_proc), key, window as usize) }
                 == 0
             {
                 return false;
@@ -2552,7 +2654,7 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
         return Err("CEF did not provide a windowed Chrome-style browser.");
     }
     refresh_rows(false);
-    Ok(browser)
+    Ok(())
 }
 
 fn navigate(new_tab: bool) {
@@ -2602,20 +2704,17 @@ fn navigate(new_tab: bool) {
     if url == HOME && active().is_none() {
         return;
     }
-    let browser = match materialize(key) {
+    close_find(false);
+    show_address(ui.address, &url);
+    let browser = match navigate_tab(key, &url) {
         Ok(browser) => browser,
         Err(message) => {
             set_text(ui.window, &format!("{} — {message}", app_title()));
             return;
         }
     };
-    if let Some(frame) = browser.main_frame() {
-        close_find(false);
-        show_address(ui.address, &url);
-        frame.load_url(Some(&CefString::from(url.as_str())));
-        if let Some(host) = browser.host() {
-            host.set_focus(1);
-        }
+    if let Some(host) = browser.host() {
+        host.set_focus(1);
     }
 }
 
@@ -2961,13 +3060,15 @@ fn close_tab(key: Option<usize>) {
 }
 
 fn close_window(window: HWND) {
-    if exiting()
-        || with_shell(|s| s.closing) != Some(false)
-        || !confirm_window_download_close(window)
-    {
+    if exiting() || with_shell(|s| s.closing) != Some(false) {
         return;
     }
-    if !exiting() {
+    // Chromium's shutdown command applies to the entire process, not one
+    // Flit window among several. It checks every beforeunload first.
+    if WINDOWS.with(|windows| windows.borrow().len() == 1) && try_native_exit() {
+        return;
+    }
+    if confirm_window_download_close(window) && !exiting() {
         begin_window_close(window);
     }
 }
@@ -3001,6 +3102,9 @@ fn exit_flit(window: HWND) {
         || OPENING_SESSION.get()
         || WINDOWS.with(|windows| windows.borrow().values().any(|s| s.closing))
     {
+        return;
+    }
+    if try_native_exit() {
         return;
     }
     let count = WINDOWS.with(|windows| {
@@ -3044,17 +3148,7 @@ fn exit_flit(window: HWND) {
     let Some(current) = order.pop_front() else {
         return;
     };
-    // Save once before asking CEF to tear down any window. Mid-exit writes
-    // would lose the windows that already closed.
-    if let Some(state) = profile_snapshot() {
-        store_session(state);
-    }
-    let timer = RECOVERY_WINDOW.replace(0);
-    if timer != 0 {
-        unsafe {
-            KillTimer(timer as HWND, RECOVERY_TIMER);
-        }
-    }
+    save_before_exit();
     EXIT_SESSION.with(|slot| {
         slot.replace(Some(ExitSession {
             current,
@@ -3063,6 +3157,88 @@ fn exit_flit(window: HWND) {
     });
     let _scope = WindowScope::enter(current);
     begin_window_close(current as HWND);
+}
+
+fn save_before_exit() {
+    // Mid-exit writes would lose the windows that already closed.
+    if let Some(state) = profile_snapshot() {
+        store_session(state);
+    }
+    let timer = RECOVERY_WINDOW.replace(0);
+    if timer != 0 {
+        unsafe { KillTimer(timer as HWND, RECOVERY_TIMER) };
+    }
+}
+
+fn try_native_exit() -> bool {
+    let command = chrome_command(c"IDC_EXIT");
+    if command <= 0 {
+        return false;
+    }
+    let browser = WINDOWS.with(|windows| {
+        let windows = windows.borrow();
+        if windows.values().any(|s| {
+            s.closing || !s.pending_popups.is_empty()
+                || s.tabs.iter().any(|t| t.close_requested || t.unloading || t.retiring)
+                // Keep the existing owned download confirmation.
+                || download_guard::count(s.controls.window as usize, None) != 0
+        }) {
+            return None;
+        }
+        windows
+            .values()
+            .flat_map(|s| &s.tabs)
+            .filter_map(|tab| tab.browser.as_ref())
+            .next()
+            .cloned()
+    });
+    let Some(host) = browser
+        .and_then(|browser| browser.host())
+        .filter(|host| host.can_execute_chrome_command(command) != 0)
+    else {
+        return false;
+    };
+    save_before_exit();
+    NATIVE_EXIT.set(true);
+    WINDOWS.with(|windows| {
+        for s in windows.borrow_mut().values_mut() {
+            s.closing = true;
+        }
+    });
+    host.execute_chrome_command(command, WindowOpenDisposition::CURRENT_TAB);
+    true
+}
+
+fn cancel_native_exit() -> bool {
+    if !NATIVE_EXIT.replace(false) {
+        return false;
+    }
+    WINDOWS.with(|windows| {
+        for s in windows.borrow_mut().values_mut() {
+            s.closing = false;
+        }
+    });
+    true
+}
+
+fn finish_native_exit() {
+    let ready = WINDOWS.with(|windows| {
+        let windows = windows.borrow();
+        if windows.values().any(|s| {
+            s.settings_window.is_some()
+                || !s.popups.is_empty()
+                || !s.pending_popups.is_empty()
+                || s.tabs
+                    .iter()
+                    .any(|t| t.browser.is_some() || t.retiring || t.unloading)
+        }) {
+            return Vec::new();
+        }
+        windows.keys().copied().collect::<Vec<_>>()
+    });
+    for window in ready {
+        unsafe { DestroyWindow(window as HWND) };
+    }
 }
 
 fn advance_exit(closed: HWND) {
@@ -3120,6 +3296,10 @@ fn cancel_active_permission(window: HWND) {
 }
 
 fn continue_window_close(window: HWND) {
+    if NATIVE_EXIT.get() {
+        finish_native_exit();
+        return;
+    }
     let Some((aux, tab, waiting)) = with_shell(|s| {
         let waiting =
             !s.pending_popups.is_empty() || s.tabs.iter().any(|tab| tab.unloading || tab.retiring);
@@ -5913,6 +6093,13 @@ unsafe extern "system" fn window_proc(
                         source,
                     );
                 }
+            }
+            0
+        }
+        SELECT_POPUP_TAB => {
+            if !exiting() && with_shell(|s| !s.closing) == Some(true) {
+                select_key(wp);
+                focus_page();
             }
             0
         }

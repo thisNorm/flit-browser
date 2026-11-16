@@ -121,6 +121,13 @@ wrap_app! {
                 // Flit draws its own new-tab page and does not need Chrome's
                 // component extensions that start a background page.
                 command.append_switch(Some(&CefString::from("disable-component-extensions-with-background-pages")));
+                // Reuse suitable renderers sooner without closing any tabs.
+                // Site Isolation still permits more processes for distinct sites.
+                command.append_switch(Some(&CefString::from("site-per-process")));
+                command.append_switch_with_value(
+                    Some(&CefString::from("renderer-process-limit")),
+                    Some(&CefString::from("16")),
+                );
                 if let Some(url) = self.initial_url.as_deref().and_then(launch_url::literal_http_url) {
                     command.append_argument(Some(&CefString::from(url)));
                 }

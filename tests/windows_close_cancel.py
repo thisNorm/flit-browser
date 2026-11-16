@@ -17,7 +17,7 @@ from urllib.parse import unquote
 sys.dont_write_bytecode = True
 from windows_download_close import owned_windows, post
 from windows_downloads import click_attachment, sha256
-from windows_session import select, titles
+from windows_session import loaded_panels, select, titles
 from windows_smoke import Browser, NEW_TAB, OwnedProcess, WORKSPACE, Win32, api, page_counts, require, until
 from windows_windows import seed_profile
 
@@ -135,6 +135,12 @@ def click_and_observe(browser, index, path):
             browser.wait(f"trusted fixture click {path} after retry", lambda: browser.site.count(path), 3)
 
 
+def active_view(browser):
+    panel = browser.page_panel()
+    if panel and (view := browser.win.find_child(panel, None, None, None)):
+        return panel, view
+
+
 def close_dialog(browser, evidence):
     process, win = browser.process, browser.win
     require(not owned_windows(process, "#32770"), "An owned dialog was already open")
@@ -175,7 +181,7 @@ def run(exe, profile, report):
             with OwnedProcess(Win32(), exe, args, launch) as process:
                 browser = Browser(process, site)
                 win = browser.win
-                views = []
+                views = report["views_before_close"] = []
                 for index, path in enumerate(PATHS):
                     if index:
                         browser.click(NEW_TAB)
@@ -183,43 +189,47 @@ def run(exe, profile, report):
                         browser.navigate(path)
                     else:
                         browser.page(path, require_request=True)
-                    panel = browser.wait(f"visible CEF panel for {path}", browser.page_panel)
-                    view = win.find_child(panel, None, None, None)
-                    require(view and win.pid(view) in process.pids() and view not in views, f"Missing owned CEF view for {path}")
-                    views.append(view)
+                    identity = browser.wait(f"visible CEF view for {path}", lambda: active_view(browser))
+                    require(win.pid(identity[1]) in process.pids() and identity not in views,
+                            f"Missing distinct owned CEF view for {path}")
+                    views.append(identity)
                     if path == "/protected":
                         click_and_observe(browser, 0, "/armed")
 
                 browser.wait("three loaded tab rows with the third selected",
                              lambda: titles(browser) == LABELS and browser.selected() == 2)
-                require(all(win.pid(view) in process.pids() for view in views), "A tab view closed before WM_CLOSE")
+                pids = process.pids()
+                require(all(win.pid(view) in pids for _, view in views), "A tab view closed before WM_CLOSE")
                 report["rows_before_close"] = titles(browser)
+                report["page_counts_before_close"] = before = {path: page_counts(site, path) for path in PATHS}
 
                 veto = report["veto"] = {}
                 dialog = close_dialog(browser, veto)
-                veto["plain_view_closed_before_no"] = win.pid(views[0]) not in process.pids()
-                require(veto["plain_view_closed_before_no"], "The plain background view did not close before the veto dialog")
+                veto["loaded_panels_at_prompt"] = loaded_panels(browser)
+                veto["views_at_prompt"] = [(panel, win.find_child(panel, None, None, None)) for panel, _ in views]
+                require(veto["loaded_panels_at_prompt"] == len(PATHS) and veto["views_at_prompt"] == views,
+                        "The beforeunload prompt appeared after a loaded tab view was lost or replaced")
                 answer(browser, dialog, IDNO, veto)
                 browser.wait("No dismissed the dialog and kept the Flit window enabled", lambda: (
                     not win.visible(dialog) and win.pid(browser.hwnd) == process.pid and win.enabled(browser.hwnd)
                 ))
                 report["rows_after_no"] = rows = titles(browser)
                 require(rows == LABELS, f"No lost or reordered tab rows: {rows!r}")
-
-                browser.page("/plain", lambda: select(browser, 0), require_request=True)
-                require(browser.has_page_title(LABELS[0]), "The retained first row did not reload its original page")
-                report["plain_row_reloaded"] = True
-
-                select(browser, 1)
-                browser.wait("protected draft selected in its original CEF view", lambda: (
-                    browser.address() == site.origin + "/protected" and browser.has_page_title(LABELS[1])
-                    and (panel := browser.page_panel()) and win.find_child(panel, None, None, None) == views[1]
-                ))
-                click_and_observe(browser, 1, "/draft")
+                report["loaded_panels_after_no"] = loaded_panels(browser)
+                require(report["loaded_panels_after_no"] == len(PATHS), "No lost a loaded tab view")
+                for index, (path, label) in enumerate(zip(PATHS, LABELS)):
+                    select(browser, index)
+                    browser.wait(f"{path} selected in its original CEF view", lambda: (
+                        browser.address() == site.origin + path and browser.has_page_title(label)
+                        and active_view(browser) == views[index]
+                    ))
+                    if path == "/protected":
+                        click_and_observe(browser, 1, "/draft")
                 with site.lock:
                     report["draft_readback"] = draft = site.drafts[0]
-                require(draft == DRAFT and page_counts(site, "/protected") == (1, 1),
-                        f"No lost or reloaded the protected field: {draft!r}")
+                require(draft == DRAFT, f"No lost the protected draft: {draft!r}")
+                report["page_counts_after_no"] = after = {path: page_counts(site, path) for path in PATHS}
+                require(after == before, f"No reloaded a fixture page: {before!r} -> {after!r}")
                 require(titles(browser) == LABELS, "Selecting the retained rows changed the tab list")
 
                 confirm = report["confirm"] = {}
@@ -228,6 +238,12 @@ def run(exe, profile, report):
                 launch["exit_code"] = code = win.native.GetExitCodeProcess(process.process)
                 until("empty job after Yes", lambda: not process.pids(), 8)
                 require(code == 0, f"Flit exited with 0x{code:08x} after Yes")
+                session = report["session_after_yes"] = json.loads((profile / "session.json").read_text(encoding="utf-8"))
+                entries = [{"url": site.origin + path, "title": label, "pinned": False}
+                           for path, label in zip(PATHS, LABELS)]
+                require(isinstance(session, dict) and session.get("entries") == entries
+                        and session.get("selected") == len(PATHS) - 1 and not session.get("additional_windows"),
+                        f"Clean close after Yes did not save the original tabs and selection: {session!r}")
         finally:
             with site.lock:
                 report["requests"] = dict(site.hits)
@@ -264,7 +280,7 @@ def main():
         require("scratch_cleanup_error" not in report, "Could not remove the isolated scratch profile")
         require(sha256(dll) == report["dll_sha256"], "Staged DLL changed during the test")
         report["result"] = "pass"
-    except (RuntimeError, OSError) as error:
+    except (RuntimeError, OSError, ValueError) as error:
         report["error"] = f"{type(error).__name__}: {error}"
     print(json.dumps(report, indent=2))
     return int(report["result"] != "pass")

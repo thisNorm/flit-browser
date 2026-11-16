@@ -255,10 +255,15 @@ def run_exit_veto(exe, profile, report):
             protected = first.open_window(NEW_WINDOW, "third_protected", evidence)
             protected.navigate("/protected")
             veto.click_and_observe(protected, 0, "/armed")
+            windows = (first, protected, second)  # Same order as states.
+            handles = sorted(window.hwnd for window in windows)
+            require(sorted(Window.handles(process)) == handles, "Expected three original normal windows before Exit Flit")
             await_snapshot(first, primary, states, evidence, "before_exit")
             get_owner = api(C.WinDLL("user32", use_last_error=True), "GetWindow", W.HWND, W.HWND, W.UINT)
             for source, label, button in ((first, "decline", veto.IDNO), (protected, "confirm", veto.IDYES)):
                 require(not owned_windows(process, "#32770"), "An owned modal dialog was already open")
+                if button == veto.IDYES:
+                    before_retry_mtime = primary.stat().st_mtime_ns
                 send(source, WM_COMMAND, EXIT_FLIT, post=True)
                 dialogs = protected.wait("beforeunload confirmation after Exit Flit",
                                          lambda: owned_windows(process, "#32770"), 8)
@@ -274,21 +279,28 @@ def run_exit_veto(exe, profile, report):
                 else:
                     raise RuntimeError("Exit Flit dialog did not show the beforeunload warning")
                 evidence[label] = {"hwnd": dialog, "warning": warning.value, "remaining_windows": sorted(Window.handles(process))}
-                require(evidence[label]["remaining_windows"] == [protected.hwnd],
-                        "The first two windows must finish closing before the third can veto")
+                require(evidence[label]["remaining_windows"] == handles,
+                        "Exit Flit lost or replaced a window before the beforeunload answer")
                 veto.answer(protected, dialog, button, evidence[label])
                 if button == veto.IDNO:
                     protected.wait("No dismissed beforeunload and re-enabled the protected HWND", lambda: (
                         not process.win.visible(dialog) and process.win.enabled(protected.hwnd)
                     ))
-                    require(Window.handles(process) == {protected.hwnd}, "Declining Exit Flit lost the third window")
+                    evidence["windows_after_no"] = sorted(Window.handles(process))
+                    require(evidence["windows_after_no"] == handles, "Declining Exit Flit lost or replaced a window")
+                    for window, state in zip(windows, states):
+                        entry = state["entries"][0]
+                        require(window.address() == entry["url"] and titles(window) == (entry["title"],)
+                                and window.selected() == state["selected"],
+                                f"Declining Exit Flit changed the tab in HWND 0x{window.hwnd:x}")
                     veto.click_and_observe(protected, 1, "/draft")
                     with site.lock:
                         evidence["draft_preserved"] = site.drafts[-1] == veto.DRAFT
                     require(evidence["draft_preserved"], "Declining Exit Flit lost the live draft")
-                    await_snapshot(protected, primary, (states[1],), evidence, "after_veto")
+                    await_snapshot(protected, primary, states, evidence, "after_veto")
             wait_stopped(process, "confirming Exit Flit after a veto")
-        check_snapshot(primary, (states[1],), evidence, "after_retry")
+        check_snapshot(primary, states, evidence, "after_retry")
+        require(primary.stat().st_mtime_ns != before_retry_mtime, "Confirming Exit Flit did not refresh session.json")
 
 
 def clean_scratch(scratch, report):
