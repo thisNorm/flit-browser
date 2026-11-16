@@ -153,8 +153,11 @@ namespace FlitPreview {
 '@
 }
 
-# Pin the inspected official unsigned Windows x64 bootstrap (CEF 156.0.26+g8ea0c73).
-$expectedHash = 'BDCF5C7A978F810E626E6CB923F1AA06477F0114CBB74515662F2157386F7472'
+# Pin the inspected official unsigned Windows x64 bootstraps.
+$expectedHashes = @(
+    'BDCF5C7A978F810E626E6CB923F1AA06477F0114CBB74515662F2157386F7472', # CEF 156.0.26
+    '4A559CE8B73B0D482752E1343601FB1BF2D17EC1CD6D2BC6B7BE411D1F41207F'  # CEF 158.0.3 beta
+)
 $stage = Join-Path $parent ('.flit-icon-' + [guid]::NewGuid().ToString('N') + '.exe')
 $created = $false
 try {
@@ -163,8 +166,8 @@ try {
         if ((Get-AuthenticodeSignature -LiteralPath $bootstrap.FullName).Status -ne 'NotSigned') {
             throw 'Signed or unverifiable bootstraps cannot be stamped for this preview.'
         }
-        if ((Get-FileHash -InputStream $source -Algorithm SHA256).Hash -ne $expectedHash) {
-            throw 'Unexpected bootstrap.exe. This preview tool is pinned to the verified CEF 156.0.26 Windows x64 bootstrap.'
+        if ((Get-FileHash -InputStream $source -Algorithm SHA256).Hash -notin $expectedHashes) {
+            throw 'Unexpected bootstrap.exe. Use a verified CEF Windows x64 bootstrap for this preview.'
         }
         $source.Position = 0
         $copy = [IO.File]::Open($stage, [IO.FileMode]::CreateNew)

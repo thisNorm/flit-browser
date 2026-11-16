@@ -34,7 +34,10 @@ pub(crate) fn apply_backdrop(hwnd: HWND, gap: i32) {
         DwmSetWindowAttribute(hwnd, attribute as u32, (&value as *const i32).cast(), 4) >= 0
     };
     set(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND);
-    set(DWMWA_USE_IMMERSIVE_DARK_MODE, 0);
+    set(
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        i32::from(crate::window::private()),
+    );
     let success = set(DWMWA_SYSTEMBACKDROP_TYPE, material);
     // Keep text and page HWNDs opaque. Expose the DWM material in the
     // caption and in the slim frame around the web content.
@@ -90,6 +93,8 @@ struct Palette {
     active: COLORREF,
     active_text: COLORREF,
     disabled: COLORREF,
+    rim: COLORREF,
+    shadow: COLORREF,
     high_contrast: bool,
 }
 
@@ -139,8 +144,28 @@ fn palette() -> Palette {
                 active: GetSysColor(COLOR_HIGHLIGHT),
                 active_text: GetSysColor(COLOR_HIGHLIGHTTEXT),
                 disabled: GetSysColor(COLOR_GRAYTEXT),
+                rim: GetSysColor(COLOR_BTNFACE),
+                shadow: GetSysColor(COLOR_BTNFACE),
                 high_contrast,
             }
+        }
+    } else if crate::window::private() {
+        Palette {
+            surface: rgb(0x19, 0x1c, 0x2a),
+            panel: rgb(0x23, 0x28, 0x38),
+            navigation: rgb(0x2b, 0x31, 0x44),
+            text: rgb(0xed, 0xf1, 0xfc),
+            field: rgb(0x2b, 0x31, 0x44),
+            filter: rgb(0x19, 0x1e, 0x2b),
+            field_text: rgb(0xf1, 0xf4, 0xff),
+            border: rgb(0x45, 0x50, 0x69),
+            hot: rgb(0x43, 0x50, 0x69),
+            active: rgb(0x3b, 0x4a, 0x67),
+            active_text: rgb(0xe4, 0xed, 0xff),
+            disabled: rgb(0xb2, 0xbf, 0xda),
+            rim: rgb(0x48, 0x54, 0x6d),
+            shadow: rgb(0x13, 0x17, 0x24),
+            high_contrast,
         }
     } else {
         Palette {
@@ -156,6 +181,8 @@ fn palette() -> Palette {
             active: rgb(0xd9, 0xe8, 0xff),
             active_text: rgb(0x1c, 0x49, 0x84),
             disabled: rgb(0x6e, 0x6e, 0x73),
+            rim: 0xffffff,
+            shadow: rgb(0xd7, 0xe1, 0xef),
             high_contrast,
         }
     }
@@ -223,7 +250,7 @@ fn glass_plate(dc: HDC, r: RECT, diameter: i32, core: COLORREF, colors: &Palette
         dc,
         rect(r.left, r.top + shadow, r.right, r.bottom + shadow),
         diameter,
-        rgb(0xd7, 0xe1, 0xef),
+        colors.shadow,
         None,
     );
     rounded(dc, r, diameter, core, Some(colors.border));
@@ -250,7 +277,7 @@ fn glass_plate(dc: HDC, r: RECT, diameter: i32, core: COLORREF, colors: &Palette
             Alpha: 0,
         };
         let points = [
-            color(rim.left, rim.top, 0xffffff),
+            color(rim.left, rim.top, colors.rim),
             color(rim.right, (rim.top + px(7, dpi)).min(rim.bottom), core),
         ];
         let mesh = GRADIENT_RECT {
@@ -602,7 +629,14 @@ fn labeled_new_tab(kind: ButtonKind) -> bool {
     matches!(kind, ButtonKind::NewTab)
 }
 
-pub(crate) fn draw_tab(item: &DRAWITEMSTRUCT, label: &str, pinned: bool, muted: bool, dpi: i32) {
+pub(crate) fn draw_tab(
+    item: &DRAWITEMSTRUCT,
+    label: &str,
+    pinned: bool,
+    muted: bool,
+    unloaded: bool,
+    dpi: i32,
+) {
     let saved = begin_item(item);
     if saved == 0 {
         return;
@@ -613,7 +647,7 @@ pub(crate) fn draw_tab(item: &DRAWITEMSTRUCT, label: &str, pinned: bool, muted: 
     let selected = item.itemState & ODS_SELECTED != 0;
     let foreground = if selected {
         colors.active_text
-    } else if item.itemState & (ODS_DISABLED | ODS_GRAYED) != 0 {
+    } else if unloaded || item.itemState & (ODS_DISABLED | ODS_GRAYED) != 0 {
         colors.disabled
     } else {
         colors.text
@@ -628,7 +662,7 @@ pub(crate) fn draw_tab(item: &DRAWITEMSTRUCT, label: &str, pinned: bool, muted: 
             None,
         );
     }
-    let tab_ink = if selected && !colors.high_contrast {
+    let tab_ink = if selected && !colors.high_contrast && !crate::window::private() {
         rgb(0x00, 0x66, 0xcc)
     } else {
         foreground
@@ -767,7 +801,11 @@ pub(crate) fn paint_start(window: HWND, font: HFONT) {
                 SetBkMode(dc, TRANSPARENT as i32);
                 DrawTextW(
                     dc,
-                    windows_sys::w!("Flit"),
+                    if crate::window::private() {
+                        windows_sys::w!("Private browsing")
+                    } else {
+                        windows_sys::w!("Flit")
+                    },
                     -1,
                     &mut title,
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE,
@@ -791,7 +829,13 @@ pub(crate) fn paint_start(window: HWND, font: HFONT) {
             unsafe {
                 DrawTextW(
                     dc,
-                    windows_sys::w!("Search or enter a website in the address bar"),
+                    if crate::window::private() {
+                        windows_sys::w!(
+                            "Flit clears private browsing data when the last private window closes."
+                        )
+                    } else {
+                        windows_sys::w!("Search or enter a website in the address bar")
+                    },
                     -1,
                     &mut subtitle,
                     DT_CENTER | DT_WORDBREAK,
@@ -799,9 +843,13 @@ pub(crate) fn paint_start(window: HWND, font: HFONT) {
                 SetTextColor(dc, colors.disabled);
                 DrawTextW(
                     dc,
-                    windows_sys::w!(
-                        "Ctrl+L  Address     Ctrl+T  New tab     Ctrl+Shift+A  Find a tab"
-                    ),
+                    if crate::window::private() {
+                        windows_sys::w!("Downloaded files stay on your device.")
+                    } else {
+                        windows_sys::w!(
+                            "Ctrl+L  Address     Ctrl+T  New tab     Ctrl+Shift+A  Find a tab"
+                        )
+                    },
                     -1,
                     &mut hint,
                     DT_CENTER | DT_WORDBREAK,

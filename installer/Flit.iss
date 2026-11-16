@@ -1,5 +1,10 @@
 #define Product "Flit Browser"
-#define ProductVersion "0.5.0"
+#define ProductVersion "0.6.0"
+#define BrowserClient "FlitBrowser"
+#define BrowserKey "Software\Clients\StartMenuInternet\" + BrowserClient
+#define CapabilitiesKey BrowserKey + "\Capabilities"
+#define UrlProgId "FlitBrowser.URL"
+#define UrlProgIdKey "Software\Classes\" + UrlProgId
 #ifndef BundleDir
   #error Build with Build-Setup.ps1 or pass --define=BundleDir=PATH to ISCC.
 #endif
@@ -26,6 +31,7 @@ SolidCompression=yes
 WizardStyle=modern dynamic
 CloseApplications=yes
 RestartApplications=no
+ChangesAssociations=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -36,6 +42,24 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#BundleDir}\*"; DestDir: "{app}"; Excludes: "debug.log"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Registry]
+; Advertise HTTP(S) support without writing any default association.
+Root: HKCU; Subkey: "{#UrlProgIdKey}"; ValueType: string; ValueData: "Flit Browser URL"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "{#UrlProgIdKey}"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "{#UrlProgIdKey}\DefaultIcon"; ValueType: string; ValueData: """{app}\Flit.exe"",0"
+Root: HKCU; Subkey: "{#UrlProgIdKey}\shell\open\command"; ValueType: string; ValueData: """{app}\Flit.exe"" -- ""%1"""
+
+Root: HKCU; Subkey: "{#BrowserKey}"; ValueType: string; ValueData: "{#Product}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "{#BrowserKey}\DefaultIcon"; ValueType: string; ValueData: """{app}\Flit.exe"",0"
+Root: HKCU; Subkey: "{#BrowserKey}\shell\open\command"; ValueType: string; ValueData: """{app}\Flit.exe"""
+Root: HKCU; Subkey: "{#CapabilitiesKey}"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#Product}"
+Root: HKCU; Subkey: "{#CapabilitiesKey}"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Open HTTP and HTTPS links with Flit Browser."
+Root: HKCU; Subkey: "{#CapabilitiesKey}"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\Flit.exe"",0"
+Root: HKCU; Subkey: "{#CapabilitiesKey}\Startmenu"; ValueType: string; ValueName: "StartMenuInternet"; ValueData: "{#BrowserClient}"
+Root: HKCU; Subkey: "{#CapabilitiesKey}\URLAssociations"; ValueType: string; ValueName: "http"; ValueData: "{#UrlProgId}"
+Root: HKCU; Subkey: "{#CapabilitiesKey}\URLAssociations"; ValueType: string; ValueName: "https"; ValueData: "{#UrlProgId}"
+Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#Product}"; ValueData: "{#CapabilitiesKey}"; Flags: uninsdeletevalue
 
 [INI]
 Filename: "{app}\flit-installed.ini"; Section: "Flit"; Key: "Version"; String: "{#ProductVersion}"; Flags: uninsdeletesection

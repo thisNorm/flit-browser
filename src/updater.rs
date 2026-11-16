@@ -23,6 +23,11 @@ const LAST_CHECK: &str = "last-check.txt";
 const READY: &str = "ready.txt";
 static NORMAL_PROFILE: AtomicBool = AtomicBool::new(false);
 
+// Read the loaded library; the Rust headers can be older than the bundle.
+unsafe extern "C" {
+    fn cef_version_info(entry: i32) -> i32;
+}
+
 pub(crate) fn set_profile(normal: bool) {
     NORMAL_PROFILE.store(normal, Ordering::Relaxed);
 }
@@ -111,12 +116,18 @@ pub(crate) fn apply_if_ready() {
 }
 
 pub(crate) fn check_manual() -> String {
-    use cef::sys::{
-        CEF_VERSION_MAJOR, CEF_VERSION_MINOR, CEF_VERSION_PATCH, CHROME_VERSION_BUILD,
-        CHROME_VERSION_MAJOR, CHROME_VERSION_MINOR, CHROME_VERSION_PATCH,
-    };
+    let [
+        cef_major,
+        cef_minor,
+        cef_patch,
+        _,
+        chrome_major,
+        chrome_minor,
+        chrome_build,
+        chrome_patch,
+    ] = std::array::from_fn(|index| unsafe { cef_version_info(index as i32) });
     let headline = format!(
-        "Flit Browser {CURRENT_VERSION}\nCEF {CEF_VERSION_MAJOR}.{CEF_VERSION_MINOR}.{CEF_VERSION_PATCH} · Chromium {CHROME_VERSION_MAJOR}.{CHROME_VERSION_MINOR}.{CHROME_VERSION_BUILD}.{CHROME_VERSION_PATCH}"
+        "Flit Browser {CURRENT_VERSION}\nCEF {cef_major}.{cef_minor}.{cef_patch} · Chromium {chrome_major}.{chrome_minor}.{chrome_build}.{chrome_patch}"
     );
     let Some(update) = Update::discover() else {
         return format!(

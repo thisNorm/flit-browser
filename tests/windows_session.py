@@ -162,6 +162,35 @@ def run(exe, work, evidence):
 
             with launch("empty_restore") as browser:
                 at_home(browser)
+
+            evidence["launches"]["interrupted"] = report = {}
+            with OwnedProcess(win, exe, [f"--flit-profile={profile}", "--flit-url=" + site.origin + "/first"], report) as process:
+                browser = Browser(process, site)
+                browser.page("/first", require_request=True)
+                browser.click(NEW_TAB)
+                browser.navigate("/second")
+
+                def saved():
+                    path = profile / "session.json"
+                    if not path.is_file():
+                        return False
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                    return (state["selected"] == 1 and
+                            [entry["url"] for entry in state["entries"]] ==
+                            [site.origin + "/first", site.origin + "/second"])
+
+                browser.wait("recent session snapshot before an unexpected exit", saved)
+                # Simulate an abrupt exit of the disposable browser, never the user's app.
+                win.check(win.kill_job(process.job, 1))
+                until("empty interrupted test job", lambda: not process.pids(), 8)
+                report["snapshot_recovered_after_abrupt_exit"] = True
+
+            before = counts(("/first", "/second"))
+            with launch("recover_interrupted_session") as browser:
+                browser.page("/second", require_request=True, baseline=before["/second"])
+                require(browser.tab_count() == 2 and browser.selected() == 1 and loaded_panels(browser) == 1,
+                        "Recovery did not select only the previously active tab")
+                require(page_counts(site, "/first") == before["/first"], "Background recovery loaded a page")
         finally:
             evidence["fixture"] = site.report()
 
