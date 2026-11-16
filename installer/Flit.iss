@@ -1,5 +1,5 @@
 #define Product "Flit Browser"
-#define ProductVersion "0.3.0"
+#define ProductVersion "0.4.0"
 #ifndef BundleDir
   #error Build with Build-Setup.ps1 or pass --define=BundleDir=PATH to ISCC.
 #endif
@@ -35,7 +35,7 @@ Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#BundleDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BundleDir}\*"; DestDir: "{app}"; Excludes: "debug.log"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [INI]
 Filename: "{app}\flit-installed.ini"; Section: "Flit"; Key: "Version"; String: "{#ProductVersion}"; Flags: uninsdeletesection

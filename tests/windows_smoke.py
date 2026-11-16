@@ -481,7 +481,12 @@ def sidebar_layout(browser):
     address = browser.address()
     with win.window_coordinates(hwnd):
         dpi = win.check(win.dpi(hwnd))
+        inset = 8 * dpi // 96
         tolerance = (dpi + 47) // 48  # Two logical pixels for native rounding.
+        animation = W.BOOL()
+        get_setting = api(C.WinDLL("user32", use_last_error=True), "SystemParametersInfoW",
+                          W.BOOL, W.UINT, W.UINT, C.c_void_p, W.UINT)
+        animated = bool(get_setting(0x1042, 0, C.byref(animation), 0) and animation.value)
 
         def snapshot(expanded):
             mode = "expanded" if expanded else "collapsed"
@@ -498,7 +503,6 @@ def sidebar_layout(browser):
                 return bounds
 
             page = checked_rect(panel, "native page panel")
-            inset = 8 * dpi // 96
             require(abs(page[2] - (client[2] - inset)) <= tolerance
                     and abs(page[3] - (client[3] - inset)) <= tolerance,
                     f"{mode}: page panel {page} does not meet the {inset}px frame inset in {client}")
@@ -529,19 +533,50 @@ def sidebar_layout(browser):
                     f"Sidebar does not have room for the filter and two vertical tab rows: {edit}, {tabs}")
             return {"client": client, "page": page, "tabs": tabs, "filter": edit}
 
-        def toggle_cycle():
+        def toggle_cycle(observe_motion=False):
             opened = snapshot(True)
+            open_x = opened["page"][0]
+
+            def intermediate(label):
+                def sample():
+                    x = browser.in_client(panel)[0]
+                    return x if inset + tolerance < x < open_x - tolerance else None
+                return browser.wait(label, sample, timeout=2)
+
+            def wait_open():
+                browser.wait("sidebar returns to its final position", lambda: (
+                    all(win.visible(browser.controls[c]) for c in SIDEBAR)
+                    and browser.in_client(panel) == opened["page"]
+                ))
+
+            positions = {}
             browser.click(SIDEBAR_TOGGLE)
-            browser.wait("sidebar controls hidden", lambda: not any(win.visible(browser.controls[c]) for c in SIDEBAR))
+            if observe_motion and animated:
+                positions["closing_x"] = intermediate("an intermediate closing position")
+            browser.wait("sidebar collapsed into its final position", lambda: (
+                not any(win.visible(browser.controls[c]) for c in SIDEBAR)
+                and abs(browser.in_client(panel)[0] - inset) <= tolerance
+            ))
             closed = snapshot(False)
             require(opened["page"][0] - closed["page"][0] >= opened["tabs"][2] - opened["tabs"][0] - tolerance,
                     f"Collapsing the sidebar did not reclaim its width: {opened['page']} -> {closed['page']}")
             browser.click(SIDEBAR_TOGGLE)
-            browser.wait("sidebar controls shown", lambda: all(win.visible(browser.controls[c]) for c in SIDEBAR))
+            if observe_motion and animated:
+                positions["opening_x"] = intermediate("an intermediate opening position")
+            wait_open()
             require(snapshot(True) == opened, "Reopening the sidebar did not restore its layout")
-            return {"expanded": opened, "collapsed": closed}
+            if observe_motion and animated:
+                browser.click(SIDEBAR_TOGGLE)
+                positions["before_reversal_x"] = intermediate("sidebar in motion before reversal")
+                browser.click(SIDEBAR_TOGGLE)
+                wait_open()
+                require(snapshot(True) == opened, "Reversing the sidebar did not restore its layout")
+            result = {"expanded": opened, "collapsed": closed}
+            if observe_motion:
+                result["motion"] = {"windows_animations_enabled": animated, **positions}
+            return result
 
-        result = {"default": toggle_cycle()}
+        result = {"default": toggle_cycle(observe_motion=True)}
         left, top, right, bottom = win.rect(hwnd)
         width, height = right - left, bottom - top
         narrow = max(width * 2 // 3, 690 * dpi // 96)

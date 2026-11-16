@@ -79,8 +79,11 @@ pub(crate) enum ButtonKind {
 
 struct Palette {
     surface: COLORREF,
+    panel: COLORREF,
+    navigation: COLORREF,
     text: COLORREF,
     field: COLORREF,
+    filter: COLORREF,
     field_text: COLORREF,
     border: COLORREF,
     hot: COLORREF,
@@ -125,8 +128,11 @@ fn palette() -> Palette {
         unsafe {
             Palette {
                 surface: GetSysColor(COLOR_BTNFACE),
+                panel: GetSysColor(COLOR_WINDOW),
+                navigation: GetSysColor(COLOR_BTNFACE),
                 text: GetSysColor(COLOR_BTNTEXT),
                 field: GetSysColor(COLOR_WINDOW),
+                filter: GetSysColor(COLOR_WINDOW),
                 field_text: GetSysColor(COLOR_WINDOWTEXT),
                 border: GetSysColor(COLOR_BTNTEXT),
                 hot: GetSysColor(COLOR_HIGHLIGHT),
@@ -138,14 +144,17 @@ fn palette() -> Palette {
         }
     } else {
         Palette {
-            surface: rgb(0xf4, 0xf5, 0xf8),
-            text: rgb(0x1d, 0x1d, 0x1f),
-            field: rgb(0xff, 0xff, 0xff),
+            surface: rgb(0xe8, 0xed, 0xf5),
+            panel: rgb(0xf3, 0xf7, 0xfc),
+            navigation: rgb(0xf7, 0xfa, 0xfe),
+            text: rgb(0x22, 0x2d, 0x40),
+            field: rgb(0xfb, 0xfd, 0xff),
+            filter: rgb(0xe9, 0xef, 0xf7),
             field_text: rgb(0x1d, 0x1d, 0x1f),
-            border: rgb(0xd2, 0xd2, 0xd7),
-            hot: rgb(0xe8, 0xe8, 0xed),
-            active: rgb(0xdc, 0xe8, 0xf8),
-            active_text: rgb(0x13, 0x3a, 0x66),
+            border: rgb(0xd0, 0xd9, 0xe7),
+            hot: rgb(0xdf, 0xe9, 0xf8),
+            active: rgb(0xd9, 0xe8, 0xff),
+            active_text: rgb(0x1c, 0x49, 0x84),
             disabled: rgb(0x6e, 0x6e, 0x73),
             high_contrast,
         }
@@ -201,6 +210,83 @@ fn rounded(dc: HDC, r: RECT, diameter: i32, color: COLORREF, border: Option<COLO
     }
 }
 
+fn glass_plate(dc: HDC, r: RECT, diameter: i32, core: COLORREF, colors: &Palette, dpi: i32) {
+    if !has_area(r) {
+        return;
+    }
+    if colors.high_contrast {
+        rounded(dc, r, diameter, core, Some(colors.border));
+        return;
+    }
+    let shadow = px(2, dpi);
+    rounded(
+        dc,
+        rect(r.left, r.top + shadow, r.right, r.bottom + shadow),
+        diameter,
+        rgb(0xd7, 0xe1, 0xef),
+        None,
+    );
+    rounded(dc, r, diameter, core, Some(colors.border));
+    let rim = inset(r, 1, 1);
+    if !has_area(rim) {
+        return;
+    }
+    let saved = unsafe { SaveDC(dc) };
+    if saved == 0 {
+        return;
+    }
+    let region =
+        unsafe { CreateRoundRectRgn(rim.left, rim.top, rim.right, rim.bottom, diameter, diameter) };
+    if !region.is_null() {
+        unsafe {
+            ExtSelectClipRgn(dc, region, RGN_AND);
+        }
+        let color = |x, y, c: COLORREF| TRIVERTEX {
+            x,
+            y,
+            Red: ((c & 255) as u16) << 8,
+            Green: (((c >> 8) & 255) as u16) << 8,
+            Blue: (((c >> 16) & 255) as u16) << 8,
+            Alpha: 0,
+        };
+        let points = [
+            color(rim.left, rim.top, 0xffffff),
+            color(rim.right, (rim.top + px(7, dpi)).min(rim.bottom), core),
+        ];
+        let mesh = GRADIENT_RECT {
+            UpperLeft: 0,
+            LowerRight: 1,
+        };
+        unsafe {
+            GradientFill(
+                dc,
+                points.as_ptr(),
+                2,
+                (&mesh as *const GRADIENT_RECT).cast(),
+                1,
+                GRADIENT_FILL_RECT_V,
+            );
+            DeleteObject(region);
+        }
+    }
+    unsafe {
+        RestoreDC(dc, saved);
+    }
+}
+
+fn search_icon(dc: HDC, center: (i32, i32), dpi: i32, color: COLORREF) {
+    with_pen(dc, color, dpi, || {
+        let (x, y) = center;
+        let r = px(4, dpi);
+        unsafe {
+            let old = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+            Ellipse(dc, x - r, y - r, x + r + 1, y + r + 1);
+            SelectObject(dc, old);
+        }
+        stroke(dc, center, dpi, [(3, 3), (6, 6)]);
+    });
+}
+
 fn paint_strip(dc: HDC, bounds: RECT, layout: &Layout, colors: &Palette) {
     if !has_area(bounds) {
         return;
@@ -213,18 +299,53 @@ fn paint_strip(dc: HDC, bounds: RECT, layout: &Layout, colors: &Palette) {
         IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
     }
     fill(dc, &bounds, colors.surface);
-    let frames = [
-        Some(layout.address_frame),
-        (layout.side > 0).then_some(layout.filter_frame),
-        has_area(layout.find_frame).then_some(layout.find_frame),
-    ];
-    for frame in frames.into_iter().flatten() {
-        rounded(
+    let d = |n| px(n, layout.dpi);
+    let address = layout.address_frame;
+    if bounds.top < layout.top {
+        for plate in [
+            rect(d(10), d(8), d(56), d(52)),
+            rect(d(57), d(8), d(164), d(52)),
+            rect(layout.width - d(55), d(8), layout.width - d(9), d(52)),
+        ] {
+            glass_plate(dc, plate, d(37), colors.navigation, colors, layout.dpi);
+        }
+        glass_plate(dc, address, d(38), colors.field, colors, layout.dpi);
+        search_icon(
             dc,
-            frame,
-            px(19, layout.dpi),
-            colors.field,
-            Some(colors.border),
+            (
+                address.left + d(18),
+                (address.top + address.bottom) / 2 - d(1),
+            ),
+            layout.dpi,
+            colors.disabled,
+        );
+        if has_area(layout.find_frame) {
+            glass_plate(
+                dc,
+                layout.find_frame,
+                d(28),
+                colors.field,
+                colors,
+                layout.dpi,
+            );
+        }
+    }
+    if layout.side > 0 && bounds.left < layout.side && bounds.bottom > layout.top {
+        glass_plate(
+            dc,
+            layout.sidebar_bounds(),
+            d(34),
+            colors.panel,
+            colors,
+            layout.dpi,
+        );
+        let filter = layout.filter_frame;
+        rounded(dc, filter, d(23), colors.filter, Some(colors.border));
+        search_icon(
+            dc,
+            (filter.left + d(14), (filter.top + filter.bottom) / 2 - d(1)),
+            layout.dpi,
+            colors.disabled,
         );
     }
     let line = px(1, layout.dpi);
@@ -423,10 +544,10 @@ pub(crate) fn draw_button(item: &DRAWITEMSTRUCT, kind: ButtonKind, dpi: i32) {
     let disabled = item.itemState & (ODS_DISABLED | ODS_GRAYED) != 0;
     let pressed = !disabled && item.itemState & ODS_SELECTED != 0;
     let hot = !disabled && item.itemState & ODS_HOTLIGHT != 0;
-    let (base, ink) = if matches!(kind, ButtonKind::Go | ButtonKind::Bookmark) {
-        (colors.field, colors.field_text)
-    } else {
-        (colors.surface, colors.text)
+    let (base, ink) = match kind {
+        ButtonKind::Go | ButtonKind::Bookmark => (colors.field, colors.field_text),
+        ButtonKind::NewTab => (colors.panel, colors.text),
+        _ => (colors.navigation, colors.text),
     };
     let background = if pressed {
         colors.active
@@ -450,7 +571,12 @@ pub(crate) fn draw_button(item: &DRAWITEMSTRUCT, kind: ButtonKind, dpi: i32) {
         } else {
             background
         };
-        rounded(dc, r, px(20, dpi), fill_color, border);
+        let shape = if labeled_new_tab(kind) {
+            inset(r, px(1, dpi), px(1, dpi))
+        } else {
+            r
+        };
+        rounded(dc, shape, px(20, dpi), fill_color, border);
     }
     let labeled = matches!(kind, ButtonKind::NewTab);
     let x = if labeled {
@@ -492,7 +618,7 @@ pub(crate) fn draw_tab(item: &DRAWITEMSTRUCT, label: &str, dpi: i32) {
     } else {
         colors.text
     };
-    fill(dc, &r, colors.surface);
+    fill(dc, &r, colors.panel);
     if selected {
         rounded(
             dc,
@@ -535,12 +661,13 @@ pub(crate) fn draw_tab(item: &DRAWITEMSTRUCT, label: &str, dpi: i32) {
     unsafe { RestoreDC(dc, saved) };
 }
 
-pub(crate) fn field_colors(dc: HDC, list: bool) -> HBRUSH {
+pub(crate) fn field_colors(dc: HDC, id: usize) -> HBRUSH {
     let colors = palette();
-    let (background, foreground) = if list {
-        (colors.surface, colors.text)
-    } else {
-        (colors.field, colors.field_text)
+    let (background, foreground) = match id {
+        101 | 125 => (colors.field, colors.field_text),
+        110 => (colors.filter, colors.field_text),
+        126 => (colors.surface, colors.text),
+        _ => (colors.panel, colors.text),
     };
     unsafe {
         SetTextColor(dc, foreground);

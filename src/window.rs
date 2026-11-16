@@ -1,6 +1,8 @@
 use crate::{
     chrome::{self, ButtonKind},
+    keyboard::{self, Shortcut},
     navigation::{self, HOME},
+    panel_motion::Motion,
 };
 use cef::*;
 use std::{
@@ -11,8 +13,9 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::{
-        CreateFontW, DEFAULT_GUI_FONT, DeleteObject, GetStockObject, HDC, HFONT, InvalidateRect,
-        RDW_ALLCHILDREN, RDW_INVALIDATE, RedrawWindow, UpdateWindow,
+        CreateFontW, DEFAULT_GUI_FONT, DeleteObject, GetMonitorInfoW, GetStockObject, HDC, HFONT,
+        InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, RDW_ALLCHILDREN,
+        RDW_INVALIDATE, RedrawWindow, UpdateWindow,
     },
     System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_CENTERIMAGE},
     UI::{
@@ -23,8 +26,7 @@ use windows_sys::Win32::{
         },
         Input::KeyboardAndMouse::{
             EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture,
-            SetFocus, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_F5, VK_LEFT, VK_MENU, VK_RETURN,
-            VK_RIGHT, VK_SHIFT, VK_TAB,
+            SetFocus, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB,
         },
         Shell::{DefSubclassProc, SetWindowSubclass},
         WindowsAndMessaging::*,
@@ -64,6 +66,13 @@ const RESTORE_TAB: usize = 136;
 const PASSWORDS: usize = 137;
 const UPDATE: usize = 138;
 const MATERIAL: usize = 139;
+const HARD_RELOAD: usize = 140;
+const FOCUS_SEARCH: usize = 141;
+const FULLSCREEN: usize = 142;
+const FOCUS_FIND_NEXT: usize = 143;
+const FOCUS_FIND_PREV: usize = 144;
+const SELECT_TAB_FIRST: usize = 151;
+const SELECT_TAB_LAST: usize = 159;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -71,6 +80,7 @@ const OPEN_LINK: u32 = WM_APP + 4;
 const WINDOW_CLASS: &str = "FlitBrowserWindow";
 const APP_TITLE: &str = "Flit Browser";
 const ICON_ID: usize = 32512;
+const SIDEBAR_TIMER: usize = 1;
 
 #[derive(Clone, Copy)]
 struct Controls {
@@ -145,11 +155,13 @@ struct Shell {
     active: Option<usize>,
     next_key: usize,
     sidebar_open: bool,
+    sidebar_motion: Motion,
     filter: String,
     rows: Vec<Row>,
     font: HFONT,
     font_dpi: i32,
     find_open: bool,
+    fullscreen: Option<WINDOWPLACEMENT>,
     recently_closed: Vec<String>,
 }
 
@@ -320,16 +332,18 @@ wrap_keyboard_handler! {
             _os_event: Option<&mut sys::MSG>, _shortcut: Option<&mut i32>,
         ) -> i32 {
             let Some(event) = event else { return 0 };
-            if !matches!(event.type_, KeyEventType::RAWKEYDOWN | KeyEventType::KEYDOWN) {
+            if !matches!(event.type_, KeyEventType::RAWKEYDOWN | KeyEventType::KEYDOWN)
+                || event.modifiers & sys::cef_event_flags_t::EVENTFLAG_ALTGR_DOWN.0 as u32 != 0
+            {
                 return 0;
             }
-            let Some(command) = shortcut(
+            let Some(command) = keyboard::shortcut(
                 event.windows_key_code as u16,
                 event.modifiers & sys::cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0 as u32 != 0,
                 event.modifiers & sys::cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0 as u32 != 0,
                 event.modifiers & sys::cef_event_flags_t::EVENTFLAG_ALT_DOWN.0 as u32 != 0,
             ) else { return 0 };
-            unsafe { PostMessageW(self.window as HWND, WM_COMMAND, command, 0); }
+            unsafe { PostMessageW(self.window as HWND, WM_COMMAND, shortcut_command(command), 0); }
             1
         }
     }
@@ -632,11 +646,13 @@ pub(crate) fn open(initial_url: &str) -> Result<(), &'static str> {
             active: None,
             next_key: 1,
             sidebar_open: true,
+            sidebar_motion: Motion::new(true),
             filter: String::new(),
             rows: Vec::new(),
             font: null_mut(),
             font_dpi: 0,
             find_open: false,
+            fullscreen: None,
             recently_closed: Vec::new(),
         });
     });
@@ -690,13 +706,22 @@ pub(crate) struct Layout {
     pub dpi: i32,
     pub top: i32,
     pub side: i32,
+    pub side_full: i32,
+    pub side_offset: i32,
+    pub fullscreen: bool,
     pub address_frame: RECT,
     pub filter_frame: RECT,
     pub find_frame: RECT,
 }
 
 impl Layout {
-    fn read(window: HWND, sidebar_open: bool, find_open: bool) -> Self {
+    fn read(
+        window: HWND,
+        sidebar_open: bool,
+        sidebar_position: f64,
+        find_open: bool,
+        fullscreen: bool,
+    ) -> Self {
         let mut rect = RECT::default();
         unsafe {
             GetClientRect(window, &mut rect);
@@ -705,36 +730,47 @@ impl Layout {
         let height = rect.bottom.max(1);
         let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
         let d = |n| n * dpi / 96;
-        let top = d(if find_open { 102 } else { 56 });
-        let side = if sidebar_open {
-            (width / 4).clamp(d(164), d(238))
-        } else {
+        let top = d(if find_open {
+            108
+        } else if fullscreen {
             0
+        } else {
+            62
+        });
+        let side_full = (width / 5).clamp(d(184), d(228));
+        let side = if fullscreen {
+            0
+        } else {
+            (f64::from(side_full) * sidebar_position).round() as i32
         };
+        let side_offset = side - side_full;
         Self {
             width,
             height,
             dpi,
             top,
             side,
+            side_full,
+            side_offset,
+            fullscreen,
             address_frame: RECT {
-                left: d(173),
+                left: d(170),
                 top: d(10),
-                right: (width - d(if sidebar_open { 54 } else { 94 })).max(d(245)),
-                bottom: d(46),
+                right: (width - d(if sidebar_open { 62 } else { 101 })).max(d(245)),
+                bottom: d(50),
             },
             filter_frame: RECT {
-                left: d(13),
-                top: top + d(43),
-                right: side - d(13),
-                bottom: top + d(74),
+                left: side_offset + d(17),
+                top: top + d(47),
+                right: side_offset + side_full - d(14),
+                bottom: top + d(79),
             },
             find_frame: if find_open {
                 RECT {
                     left: (width - d(340)).max(d(12)),
-                    top: d(63),
+                    top: d(65),
                     right: width - d(155),
-                    bottom: d(94),
+                    bottom: d(98),
                 }
             } else {
                 RECT::default()
@@ -747,7 +783,7 @@ impl Layout {
     }
 
     pub(crate) fn page_bounds(&self) -> RECT {
-        let gap = self.scale(8);
+        let gap = if self.fullscreen { 0 } else { self.scale(8) };
         RECT {
             left: self.side + gap,
             top: self.top,
@@ -755,6 +791,28 @@ impl Layout {
             bottom: (self.height - gap).max(self.top + 1),
         }
     }
+
+    pub(crate) fn sidebar_bounds(&self) -> RECT {
+        RECT {
+            left: self.side_offset + self.scale(9),
+            top: self.top,
+            right: self.side - self.scale(4),
+            bottom: self.height - self.scale(9),
+        }
+    }
+}
+
+fn current_layout(window: HWND) -> Layout {
+    let (open, position, find, fullscreen) = with_shell(|s| {
+        (
+            s.sidebar_open,
+            s.sidebar_motion.position(),
+            s.find_open,
+            s.fullscreen.is_some(),
+        )
+    })
+    .unwrap_or((true, 1.0, false, false));
+    Layout::read(window, open, position, find, fullscreen)
 }
 
 fn set_bounds(window: HWND, x: i32, y: i32, width: i32, height: i32) {
@@ -773,65 +831,56 @@ fn set_bounds(window: HWND, x: i32, y: i32, width: i32, height: i32) {
     }
 }
 
+fn fit_browser(panel: HWND, host: &BrowserHost) {
+    let child: HWND = host.window_handle().0.cast();
+    let mut client = RECT::default();
+    unsafe {
+        if child.is_null() || GetParent(child) != panel || GetClientRect(panel, &mut client) == 0 {
+            return;
+        }
+    }
+    set_bounds(child, 0, 0, client.right, client.bottom);
+}
+
 fn layout() {
-    let Some((ui, sidebar_open, find_open, panels)) = with_shell(|s| {
-        (
-            s.controls,
-            s.sidebar_open,
-            s.find_open,
-            s.tabs
-                .iter()
-                .map(|t| (t.panel, t.browser.clone()))
-                .collect::<Vec<_>>(),
-        )
-    }) else {
+    let Some((ui, sidebar_open, find_open)) =
+        with_shell(|s| (s.controls, s.sidebar_open, s.find_open))
+    else {
         return;
     };
-    let l = Layout::read(ui.window, sidebar_open, find_open);
+    let l = current_layout(ui.window);
     let d = |n| l.scale(n);
     update_fonts(ui, l.dpi);
-    set_bounds(ui.sidebar, d(11), d(10), d(36), d(36));
-    set_bounds(ui.back, d(52), d(10), d(36), d(36));
-    set_bounds(ui.forward, d(90), d(10), d(36), d(36));
-    set_bounds(ui.reload, d(128), d(10), d(36), d(36));
+    for hwnd in [
+        ui.sidebar,
+        ui.back,
+        ui.forward,
+        ui.reload,
+        ui.address,
+        ui.go,
+        ui.bookmark,
+        ui.menu,
+        ui.add,
+    ] {
+        set_visible(hwnd, !l.fullscreen);
+    }
+    set_bounds(ui.sidebar, d(18), d(15), d(30), d(30));
+    set_bounds(ui.back, d(64), d(15), d(27), d(30));
+    set_bounds(ui.forward, d(94), d(15), d(27), d(30));
+    set_bounds(ui.reload, d(124), d(15), d(33), d(30));
     let a = l.address_frame;
     set_bounds(
         ui.address,
-        a.left + d(14),
-        a.top + d(8),
-        a.right - a.left - d(74),
+        a.left + d(35),
+        a.top + d(10),
+        a.right - a.left - d(100),
         d(21),
     );
-    set_bounds(ui.bookmark, a.right - d(59), a.top + d(4), d(25), d(28));
-    set_bounds(ui.go, a.right - d(34), a.top + d(4), d(24), d(28));
-    set_bounds(ui.menu, l.width - d(46), d(10), d(36), d(36));
-    for hwnd in [ui.label, ui.filter, ui.tabs] {
-        unsafe {
-            ShowWindow(hwnd, if sidebar_open { SW_SHOWNA } else { SW_HIDE });
-        }
-    }
-    update_empty(ui);
-    if sidebar_open {
-        set_bounds(ui.label, d(17), l.top + d(9), d(52), d(28));
-        set_bounds(ui.add, l.side - d(103), l.top + d(8), d(90), d(30));
-        let f = l.filter_frame;
-        set_bounds(
-            ui.filter,
-            f.left + d(8),
-            f.top + d(6),
-            f.right - f.left - d(16),
-            d(21),
-        );
-        set_bounds(
-            ui.tabs,
-            d(12),
-            l.top + d(83),
-            l.side - d(24),
-            l.height - l.top - d(96),
-        );
-        set_bounds(ui.empty, d(17), l.top + d(83), l.side - d(34), d(34));
-    } else {
-        set_bounds(ui.add, l.width - d(86), d(10), d(36), d(36));
+    set_bounds(ui.bookmark, a.right - d(61), a.top + d(5), d(26), d(30));
+    set_bounds(ui.go, a.right - d(33), a.top + d(5), d(24), d(30));
+    set_bounds(ui.menu, l.width - d(47), d(15), d(30), d(30));
+    if !sidebar_open && l.side == 0 {
+        set_bounds(ui.add, l.width - d(93), d(10), d(34), d(40));
     }
     for hwnd in ui.find() {
         unsafe {
@@ -852,16 +901,92 @@ fn layout() {
         set_bounds(ui.find_next, l.width - d(65), f.top, d(24), d(29));
         set_bounds(ui.find_close, l.width - d(38), f.top, d(24), d(29));
     }
+    position_sidebar(ui, &l, false);
+    position_pages(&l, false);
+}
+
+fn position_sidebar(ui: Controls, l: &Layout, animating: bool) {
+    let d = |n| l.scale(n);
+    let visible = !l.fullscreen && (l.side > 0 || with_shell(|s| s.sidebar_open) == Some(true));
+    for hwnd in [ui.label, ui.filter, ui.tabs] {
+        set_visible(hwnd, visible);
+    }
+    let show_empty =
+        visible && with_shell(|s| !s.filter.is_empty() && s.rows.is_empty()) == Some(true);
+    set_visible(ui.empty, show_empty);
+    if visible {
+        let x = l.side_offset;
+        set_bounds(ui.label, x + d(22), l.top + d(11), d(46), d(30));
+        set_bounds(
+            ui.add,
+            x + l.side_full - d(105),
+            l.top + d(10),
+            d(89),
+            d(31),
+        );
+        let f = l.filter_frame;
+        set_bounds(
+            ui.filter,
+            f.left + d(27),
+            f.top + d(6),
+            f.right - f.left - d(35),
+            d(21),
+        );
+        set_bounds(
+            ui.tabs,
+            x + d(16),
+            l.top + d(88),
+            l.side_full - d(29),
+            l.height - l.top - d(109),
+        );
+        set_bounds(
+            ui.empty,
+            x + d(22),
+            l.top + d(88),
+            l.side_full - d(41),
+            d(34),
+        );
+    } else {
+        set_bounds(ui.add, l.width - d(93), d(10), d(34), d(40));
+    }
+    if !animating {
+        unsafe {
+            InvalidateRect(ui.add, null(), 0);
+        }
+    }
+}
+
+fn set_visible(hwnd: HWND, show: bool) {
+    unsafe {
+        let current = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0;
+        if current != show {
+            ShowWindow(hwnd, if show { SW_SHOWNA } else { SW_HIDE });
+        }
+    }
+}
+
+fn position_pages(l: &Layout, active_only: bool) {
+    let Some((window, panels)) = with_shell(|s| {
+        let panels = s
+            .tabs
+            .iter()
+            .filter(|t| !active_only || Some(t.key) == s.active)
+            .map(|t| (t.panel, t.browser.clone()))
+            .collect::<Vec<_>>();
+        (s.controls.window, panels)
+    }) else {
+        return;
+    };
     let p = l.page_bounds();
     let (width, height) = (p.right - p.left, p.bottom - p.top);
     for (panel, browser) in panels {
         set_bounds(panel, p.left, p.top, width, height);
         if let Some(host) = browser.and_then(|browser| browser.host()) {
-            set_bounds(host.window_handle().0.cast(), 0, 0, width, height);
+            fit_browser(panel, &host);
         }
     }
     unsafe {
-        InvalidateRect(ui.window, null(), 0);
+        InvalidateRect(window, null(), 0);
     }
 }
 
@@ -963,7 +1088,12 @@ fn tab_label(tab: &Tab) -> String {
 }
 
 fn update_empty(ui: Controls) {
-    let visible = with_shell(|s| s.sidebar_open && !s.filter.is_empty() && s.rows.is_empty());
+    let visible = with_shell(|s| {
+        s.fullscreen.is_none()
+            && (s.sidebar_open || s.sidebar_motion.running())
+            && !s.filter.is_empty()
+            && s.rows.is_empty()
+    });
     unsafe {
         ShowWindow(
             ui.empty,
@@ -1019,7 +1149,10 @@ fn refresh_rows(ensure_visible: bool) {
             }
             SendMessageW(ui.tabs, WM_SETREDRAW, 1, 0);
             // WM_SETREDRAW can change WS_VISIBLE on a hidden control.
-            if with_shell(|s| s.sidebar_open) == Some(false) {
+            if with_shell(|s| {
+                s.fullscreen.is_some() || (!s.sidebar_open && !s.sidebar_motion.running())
+            }) == Some(true)
+            {
                 ShowWindow(ui.tabs, SW_HIDE);
             }
         }
@@ -1121,8 +1254,7 @@ fn open_tab(url: &str, foreground: bool) -> Result<(), &'static str> {
         (s.controls, key)
     })
     .ok_or("The Flit window is not available.")?;
-    let (sidebar, find) = with_shell(|s| (s.sidebar_open, s.find_open)).unwrap_or((true, false));
-    let l = Layout::read(ui.window, sidebar, find);
+    let l = current_layout(ui.window);
     let p = l.page_bounds();
     let (width, height) = (p.right - p.left, p.bottom - p.top);
     let panel = child(
@@ -1191,6 +1323,10 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
         GetClientRect(panel, &mut rect);
     }
     let (width, height) = (rect.right.max(1), rect.bottom.max(1));
+    // Chrome-style CEF creates a Views widget; its initial bounds are DIPs.
+    // The Win32 panel and any later SetWindowPos bounds use physical pixels.
+    let dpi = unsafe { GetDpiForWindow(panel) }.max(96) as i32;
+    let dip = |px: i32| ((px * 96 + dpi / 2) / dpi).max(1);
     let mut win = WindowInfo {
         runtime_style: RuntimeStyle::CHROME,
         ..Default::default()
@@ -1200,8 +1336,8 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
         &Rect {
             x: 0,
             y: 0,
-            width,
-            height,
+            width: dip(width),
+            height: dip(height),
         },
     );
     win.ex_style |= WS_EX_NOACTIVATE;
@@ -1220,7 +1356,15 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
         return Err("CEF could not create the browser tab.");
     };
     let usable = browser.host().is_some_and(|host| {
-        host.runtime_style() == RuntimeStyle::CHROME && !host.window_handle().0.is_null()
+        let child: HWND = host.window_handle().0.cast();
+        if host.runtime_style() != RuntimeStyle::CHROME
+            || child.is_null()
+            || unsafe { GetParent(child) } != panel
+        {
+            return false;
+        }
+        fit_browser(panel, &host);
+        true
     });
     change(|s| {
         if let Some(tab) = s.tabs.iter_mut().find(|tab| tab.key == key) {
@@ -1240,21 +1384,12 @@ fn navigate() {
     let Some(ui) = controls() else {
         return;
     };
-    let Some(key) = with_shell(|s| s.active).flatten() else {
-        return;
-    };
-    let browser = match materialize(key) {
-        Ok(browser) => browser,
-        Err(message) => {
-            set_text(ui.window, &format!("{APP_TITLE} — {message}"));
-            return;
-        }
-    };
     let raw = text(ui.address, 16_384);
     let url = match navigation::address(&raw) {
         Ok(url) => url,
         Err(message) => {
             let label = wide(message);
+            let title = wide(APP_TITLE);
             unsafe {
                 SendMessageW(
                     ui.address,
@@ -1262,13 +1397,26 @@ fn navigate() {
                     0,
                     (&EDITBALLOONTIP {
                         cbStruct: std::mem::size_of::<EDITBALLOONTIP>() as u32,
-                        pszTitle: wide(APP_TITLE).as_ptr(),
+                        pszTitle: title.as_ptr(),
                         pszText: label.as_ptr(),
                         ttiIcon: TTI_WARNING as i32,
                     } as *const EDITBALLOONTIP) as isize,
                 );
                 SetFocus(ui.address);
             }
+            return;
+        }
+    };
+    let Some(key) = with_shell(|s| s.active).flatten() else {
+        return;
+    };
+    if url == HOME && active().is_none() {
+        return;
+    }
+    let browser = match materialize(key) {
+        Ok(browser) => browser,
+        Err(message) => {
+            set_text(ui.window, &format!("{APP_TITLE} — {message}"));
             return;
         }
     };
@@ -1409,19 +1557,131 @@ unsafe extern "system" fn start_proc(
 }
 
 fn toggle_sidebar() {
-    let Some((ui, open)) = change(|s| {
-        s.sidebar_open = !s.sidebar_open;
-        (s.controls, s.sidebar_open)
+    if let Some(open) = with_shell(|s| s.sidebar_open) {
+        set_sidebar(!open, true);
+    }
+}
+
+fn toggle_fullscreen(window: HWND) {
+    if let Some(placement) = change(|s| s.fullscreen.take()).flatten() {
+        unsafe {
+            SetWindowLongPtrW(
+                window,
+                GWL_STYLE,
+                GetWindowLongPtrW(window, GWL_STYLE) | WS_OVERLAPPEDWINDOW as isize,
+            );
+            SetWindowPlacement(window, &placement);
+            SetWindowPos(
+                window,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    } else {
+        let mut saved = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        let mut monitor = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            let display = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+            if GetWindowPlacement(window, &mut saved) == 0
+                || GetMonitorInfoW(display, &mut monitor) == 0
+            {
+                return;
+            }
+        }
+        close_find(false);
+        unsafe {
+            KillTimer(window, SIDEBAR_TIMER);
+        }
+        change(|s| {
+            s.fullscreen = Some(saved);
+            s.sidebar_motion.to(s.sidebar_open, false);
+        });
+        let r = monitor.rcMonitor;
+        unsafe {
+            SetWindowLongPtrW(
+                window,
+                GWL_STYLE,
+                GetWindowLongPtrW(window, GWL_STYLE) & !(WS_OVERLAPPEDWINDOW as isize),
+            );
+            SetWindowPos(
+                window,
+                null_mut(),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    layout();
+    focus_page();
+}
+
+fn reveal_toolbar(window: HWND) {
+    if with_shell(|s| s.fullscreen.is_some()) == Some(true) {
+        toggle_fullscreen(window);
+    }
+}
+
+fn set_sidebar(open: bool, animate: bool) {
+    let mut client_animation = 1;
+    let allowed = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut client_animation as *mut i32).cast(),
+            0,
+        )
+    } != 0
+        && client_animation != 0;
+    let Some((ui, moving)) = change(|s| {
+        s.sidebar_open = open;
+        s.sidebar_motion.to(open, animate && allowed);
+        (s.controls, s.sidebar_motion.running())
     }) else {
         return;
     };
     if !open {
         let focus = unsafe { GetFocus() };
-        if focus == ui.filter || focus == ui.tabs {
+        if focus == ui.filter || focus == ui.tabs || focus == ui.add {
             focus_control(ui.sidebar, false);
         }
     }
+    if moving && unsafe { SetTimer(ui.window, SIDEBAR_TIMER, 16, None) } == 0 {
+        change(|s| s.sidebar_motion.to(open, false));
+    } else if !moving {
+        unsafe {
+            KillTimer(ui.window, SIDEBAR_TIMER);
+        }
+    }
     layout();
+}
+
+fn tick_sidebar(window: HWND) {
+    let Some((ui, moving)) = with_shell(|s| (s.controls, s.sidebar_motion.running())) else {
+        return;
+    };
+    if !moving {
+        unsafe {
+            KillTimer(window, SIDEBAR_TIMER);
+        }
+        layout();
+        return;
+    }
+    let l = current_layout(window);
+    position_sidebar(ui, &l, true);
+    position_pages(&l, true);
 }
 
 fn cycle_tab(previous: bool) {
@@ -1436,6 +1696,7 @@ fn cycle_tab(previous: bool) {
     .flatten()
     {
         select(index);
+        focus_page();
     }
 }
 
@@ -1591,26 +1852,31 @@ fn show_menu(ui: Controls) {
     }
 }
 
-fn shortcut(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<usize> {
-    let command = match (key, ctrl, shift, alt) {
-        (0x4C, true, false, false) => FOCUS_ADDRESS, // Ctrl+L
-        (0x54, true, false, false) => NEW_TAB,       // Ctrl+T
-        (0x54, true, true, false) => RESTORE_TAB,
-        (0x57, true, false, false) => CLOSE_TAB, // Ctrl+W
-        (0x52, true, false, false) | (VK_F5, false, false, false) => RELOAD,
-        (VK_LEFT, false, false, true) => BACK,
-        (VK_RIGHT, false, false, true) => FORWARD,
-        (VK_TAB, true, false, false) => NEXT_TAB,
-        (VK_TAB, true, true, false) => PREVIOUS_TAB,
-        (0x41, true, true, false) => FOCUS_FILTER, // Ctrl+Shift+A
-        (0x42, true, true, false) => SIDEBAR,      // Ctrl+Shift+B
-        (0x46, true, false, false) => FIND,
-        (0x48, true, false, false) => HISTORY,
-        (0x4A, true, false, false) => DOWNLOADS,
-        (0x50, true, false, false) => PRINT,
-        _ => return None,
-    };
-    Some(command)
+fn shortcut_command(action: Shortcut) -> usize {
+    match action {
+        Shortcut::FocusAddress => FOCUS_ADDRESS,
+        Shortcut::FocusSearch => FOCUS_SEARCH,
+        Shortcut::NewTab => NEW_TAB,
+        Shortcut::RestoreTab => RESTORE_TAB,
+        Shortcut::CloseTab => CLOSE_TAB,
+        Shortcut::Reload => RELOAD,
+        Shortcut::HardReload => HARD_RELOAD,
+        Shortcut::Back => BACK,
+        Shortcut::Forward => FORWARD,
+        Shortcut::NextTab => NEXT_TAB,
+        Shortcut::PreviousTab => PREVIOUS_TAB,
+        Shortcut::SelectTab(n) => SELECT_TAB_FIRST + n.saturating_sub(1).min(7),
+        Shortcut::LastTab => SELECT_TAB_LAST,
+        Shortcut::FocusFilter => FOCUS_FILTER,
+        Shortcut::ToggleSidebar => SIDEBAR,
+        Shortcut::Find => FIND,
+        Shortcut::FindNext => FOCUS_FIND_NEXT,
+        Shortcut::FindPrevious => FOCUS_FIND_PREV,
+        Shortcut::History => HISTORY,
+        Shortcut::Downloads => DOWNLOADS,
+        Shortcut::Print => PRINT,
+        Shortcut::ToggleFullscreen => FULLSCREEN,
+    }
 }
 
 fn focus_control(hwnd: HWND, select_text: bool) {
@@ -1625,7 +1891,18 @@ fn focus_control(hwnd: HWND, select_text: bool) {
 fn focus_page() {
     if let Some(host) = active().and_then(|browser| browser.host()) {
         host.set_focus(1);
+    } else if let Some(ui) = controls() {
+        if with_shell(|s| s.fullscreen.is_some()) == Some(true) {
+            unsafe { SetFocus(ui.window) };
+        } else {
+            focus_control(ui.address, false);
+        }
     }
+}
+
+fn modifiers() -> (bool, bool, bool) {
+    let down = |key: u16| unsafe { GetKeyState(i32::from(key)) < 0 };
+    (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU))
 }
 
 fn tab_point(hwnd: HWND, lp: LPARAM, close_only: bool) -> Option<usize> {
@@ -1688,14 +1965,16 @@ unsafe extern "system" fn chrome_proc(
     parent: usize,
 ) -> LRESULT {
     let id = unsafe { GetDlgCtrlID(hwnd) } as usize;
+    if matches!(id, ADDRESS | FILTER | FIND_TEXT) {
+        if let Some(result) = keyboard::handle_edit_message(hwnd, message, wp, lp) {
+            return result;
+        }
+    }
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-        let key_down = |key: u16| unsafe { GetKeyState(key as i32) < 0 };
-        let ctrl = key_down(VK_CONTROL);
-        let shift = key_down(VK_SHIFT);
-        let alt = key_down(VK_MENU);
-        if let Some(command) = shortcut(wp as u16, ctrl, shift, alt) {
+        let (ctrl, shift, alt) = modifiers();
+        if let Some(action) = keyboard::shortcut(wp as u16, ctrl, shift, alt) {
             unsafe {
-                PostMessageW(parent as HWND, WM_COMMAND, command, 0);
+                PostMessageW(parent as HWND, WM_COMMAND, shortcut_command(action), 0);
             }
             return 0;
         }
@@ -1802,6 +2081,15 @@ unsafe extern "system" fn window_proc(
     lp: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let (ctrl, shift, alt) = modifiers();
+            if let Some(action) = keyboard::shortcut(wp as u16, ctrl, shift, alt) {
+                unsafe { PostMessageW(window, WM_COMMAND, shortcut_command(action), 0) };
+                0
+            } else {
+                unsafe { DefWindowProcW(window, message, wp, lp) }
+            }
+        }
         WM_SIZE => {
             layout();
             0
@@ -1823,8 +2111,11 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_PAINT if controls().is_some() => {
-            let (sidebar, find) = with_shell(|s| (s.sidebar_open, s.find_open)).unwrap_or_default();
-            chrome::paint_shell(window, Layout::read(window, sidebar, find));
+            chrome::paint_shell(window, current_layout(window));
+            0
+        }
+        WM_TIMER if wp == SIDEBAR_TIMER => {
+            tick_sidebar(window);
             0
         }
         WM_SYSCOLORCHANGE | WM_SETTINGCHANGE | WM_DWMCOMPOSITIONCHANGED if controls().is_some() => {
@@ -1856,7 +2147,10 @@ unsafe extern "system" fn window_proc(
                 GO => ButtonKind::Go,
                 BOOKMARKS => ButtonKind::Bookmark,
                 MENU => ButtonKind::Menu,
-                NEW_TAB if with_shell(|s| s.sidebar_open) == Some(false) => {
+                NEW_TAB
+                    if with_shell(|s| !s.sidebar_open && !s.sidebar_motion.running())
+                        == Some(true) =>
+                {
                     ButtonKind::NewTabCompact
                 }
                 NEW_TAB => ButtonKind::NewTab,
@@ -1865,14 +2159,16 @@ unsafe extern "system" fn window_proc(
             chrome::draw_button(item, kind, dpi);
             1
         }
-        WM_CTLCOLOREDIT => chrome::field_colors(wp as HDC, false) as isize,
-        WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => chrome::field_colors(wp as HDC, true) as isize,
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
+            chrome::field_colors(wp as HDC, unsafe { GetDlgCtrlID(lp as HWND) } as usize) as isize
+        }
         WM_COMMAND => {
             let id = wp & 0xffff;
             let notification = ((wp >> 16) & 0xffff) as u32;
             match id {
                 GO => navigate(),
                 NEW_TAB => {
+                    reveal_toolbar(window);
                     if let Some(ui) = controls() {
                         if !text(ui.filter, 256).is_empty() {
                             set_text(ui.filter, "");
@@ -1898,10 +2194,14 @@ unsafe extern "system" fn window_proc(
                         b.go_forward();
                     }
                 }
-                RELOAD => {
+                RELOAD | HARD_RELOAD => {
                     refresh(true);
                     if let Some(b) = active() {
-                        b.reload();
+                        if id == HARD_RELOAD {
+                            b.reload_ignore_cache();
+                        } else {
+                            b.reload();
+                        }
                     }
                 }
                 CLOSE_TAB => close_tab(None),
@@ -1910,21 +2210,38 @@ unsafe extern "system" fn window_proc(
                         let _ = add_tab(&url);
                     }
                 }
-                SIDEBAR => toggle_sidebar(),
-                FOCUS_ADDRESS => {
+                SIDEBAR => {
+                    reveal_toolbar(window);
+                    toggle_sidebar();
+                }
+                FOCUS_ADDRESS | FOCUS_SEARCH => {
+                    reveal_toolbar(window);
                     if let Some(ui) = controls() {
                         focus_control(ui.address, true);
                     }
                 }
                 FOCUS_FILTER => {
-                    if with_shell(|s| s.sidebar_open) == Some(false) {
-                        toggle_sidebar();
+                    reveal_toolbar(window);
+                    if with_shell(|s| !s.sidebar_open || s.sidebar_motion.running()) == Some(true) {
+                        set_sidebar(true, false);
                     }
                     if let Some(ui) = controls() {
                         focus_control(ui.filter, true);
                     }
                 }
                 NEXT_TAB | PREVIOUS_TAB => cycle_tab(id == PREVIOUS_TAB),
+                SELECT_TAB_FIRST..=SELECT_TAB_LAST => {
+                    let index = if id == SELECT_TAB_LAST {
+                        with_shell(|s| s.tabs.len().checked_sub(1)).flatten()
+                    } else {
+                        Some(id - SELECT_TAB_FIRST)
+                    };
+                    if let Some(index) = index {
+                        select(index);
+                        focus_page();
+                    }
+                }
+                FULLSCREEN => toggle_fullscreen(window),
                 MENU => {
                     if let Some(ui) = controls() {
                         show_menu(ui);
@@ -1951,7 +2268,18 @@ unsafe extern "system" fn window_proc(
                         );
                     }
                 }
-                FIND => toggle_find(),
+                FIND => {
+                    reveal_toolbar(window);
+                    toggle_find();
+                }
+                FOCUS_FIND_PREV | FOCUS_FIND_NEXT => {
+                    if with_shell(|s| s.find_open) == Some(true) {
+                        find_in_page(id == FOCUS_FIND_NEXT, true);
+                    } else {
+                        reveal_toolbar(window);
+                        toggle_find();
+                    }
+                }
                 FIND_PREVIOUS | FIND_NEXT => find_in_page(id == FIND_NEXT, true),
                 FIND_CLOSE => close_find(true),
                 PRINT => {
@@ -2009,6 +2337,9 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => 0,
         WM_NCDESTROY => {
+            unsafe {
+                KillTimer(window, SIDEBAR_TIMER);
+            }
             let state = SHELL.with(|s| s.borrow_mut().take());
             if let Some(state) = state {
                 if !state.font.is_null() {

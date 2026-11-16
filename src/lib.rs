@@ -1,7 +1,9 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 mod chrome;
+mod keyboard;
 mod navigation;
+mod panel_motion;
 mod updater;
 mod window;
 
