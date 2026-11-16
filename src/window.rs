@@ -93,6 +93,7 @@ const DEVTOOLS: usize = 163;
 const DEVTOOLS_CONSOLE: usize = 164;
 const CLOSE_WINDOW: usize = 165;
 const SITE_INFO: usize = 166;
+const FREE_MEMORY: usize = 167;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -198,8 +199,19 @@ struct Tab {
     bookmark: Option<SaveRequest>,
 }
 
+enum ClosedItem {
+    Tab {
+        owner: usize,
+        index: usize,
+        entry: Entry,
+        muted: bool,
+    },
+    Window(Session),
+}
+
 struct Shell {
     controls: Controls,
+    id: usize,
     tabs: Vec<Tab>,
     active: Option<usize>,
     next_key: usize,
@@ -211,7 +223,7 @@ struct Shell {
     font_dpi: i32,
     find_open: bool,
     fullscreen: Option<WINDOWPLACEMENT>,
-    recently_closed: Vec<String>,
+    recently_closed: Vec<ClosedItem>,
     private: bool,
     address_edited: bool,
     updating_address: bool,
@@ -223,10 +235,13 @@ struct Shell {
     pending_settings: Option<(usize, String)>,
     closing: bool,
     closing_session: Option<Session>,
+    memory_queue: VecDeque<usize>,
 }
 
 thread_local! {
     static WINDOWS: RefCell<BTreeMap<usize, Shell>> = const { RefCell::new(BTreeMap::new()) };
+    static NEXT_WINDOW_ID: Cell<usize> = const { Cell::new(1) };
+    static RECENT_NORMAL: RefCell<Vec<ClosedItem>> = const { RefCell::new(Vec::new()) };
     static CURRENT_WINDOW: Cell<usize> = const { Cell::new(0) };
     static LAST_NORMAL: Cell<usize> = const { Cell::new(0) };
     static PROFILE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
@@ -488,17 +503,21 @@ wrap_jsdialog_handler! {
             } else {
                 windows_sys::w!("Leave this page? Unsaved changes may be lost.")
             };
-            let proceed = unsafe { MessageBoxW(self.window as HWND, message,
+            let releasing = with_shell(|s| s.tabs.iter().any(|tab| tab.key == self.key && tab.unloading)) == Some(true);
+            let proceed = !releasing && unsafe { MessageBoxW(self.window as HWND, message,
                 windows_sys::w!("Flit Browser"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) } == IDYES;
             let cancelled_close = !proceed && is_reload == 0
                 && change(|s| {
-                    s.closing_session = None;
                     let tab = s.tabs.iter().any(|tab| tab.key == self.key && tab.close_requested);
-                    std::mem::replace(&mut s.closing, false) || tab
+                    if !releasing {
+                        s.closing_session = None;
+                        return std::mem::replace(&mut s.closing, false) || tab;
+                    }
+                    tab
                 }) == Some(true);
             callback.cont(i32::from(proceed), None);
             if cancelled_close {
-                unsafe { PostMessageW(self.window as HWND, TAB_CLOSE_CANCELLED, self.key, 0); }
+                unsafe { PostMessageW(self.window as HWND, TAB_CLOSE_CANCELLED, self.key, isize::from(releasing)); }
             }
             1
         }
@@ -1091,10 +1110,13 @@ fn open_window(
         );
     }
     WINDOWS.with(|windows| {
+        let id = NEXT_WINDOW_ID.get();
+        NEXT_WINDOW_ID.set(id + 1);
         windows.borrow_mut().insert(
             window as usize,
             Shell {
                 controls: ui,
+                id,
                 tabs: Vec::new(),
                 active: None,
                 next_key: 1,
@@ -1118,6 +1140,7 @@ fn open_window(
                 pending_settings: None,
                 closing: false,
                 closing_session: None,
+                memory_queue: VecDeque::new(),
             },
         );
     });
@@ -1777,7 +1800,14 @@ fn select(index: usize) {
             s.tabs
                 .iter()
                 .enumerate()
-                .map(|(i, t)| (t.panel, i == index))
+                .map(|(i, t)| {
+                    (
+                        t.panel,
+                        t.native_window.clone(),
+                        i == index,
+                        t.close_requested,
+                    )
+                })
                 .collect::<Vec<_>>(),
             s.closing,
         ))
@@ -1785,9 +1815,20 @@ fn select(index: usize) {
     .flatten() else {
         return;
     };
-    for (panel, visible) in panels {
+    for (panel, native, visible, closing) in panels {
+        if !visible {
+            if let Some(native) = native.as_ref().filter(|native| native.is_closed() == 0) {
+                // An ancestor HWND hide alone leaves Chrome's WebContents visible.
+                native.hide();
+            }
+        }
         unsafe {
             ShowWindow(panel, if visible { SW_SHOWNA } else { SW_HIDE });
+        }
+        if visible && !closing {
+            if let Some(native) = native.filter(|native| native.is_closed() == 0) {
+                native.show();
+            }
         }
     }
     layout();
@@ -1896,9 +1937,15 @@ fn load_deferred(key: usize) -> Result<(), &'static str> {
 }
 
 fn materialize(key: usize) -> Result<Browser, &'static str> {
-    let (ui, panel, existing, muted) = with_shell(|s| {
+    let (ui, panel, existing, muted, foreground) = with_shell(|s| {
         let tab = s.tabs.iter().find(|tab| tab.key == key && !tab.retiring)?;
-        Some((s.controls, tab.panel, tab.browser.clone(), tab.muted))
+        Some((
+            s.controls,
+            tab.panel,
+            tab.browser.clone(),
+            tab.muted,
+            s.active == Some(key),
+        ))
     })
     .flatten()
     .ok_or("The tab is no longer available.")?;
@@ -1970,6 +2017,11 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
             }
             true
         });
+    if !foreground && usable {
+        if let Some(native) = &native_window {
+            native.hide();
+        }
+    }
     change(|s| {
         if let Some(tab) = s.tabs.iter_mut().find(|tab| tab.key == key) {
             tab.browser = Some(browser.clone());
@@ -2103,16 +2155,32 @@ fn closed(key: usize) {
             continue_window_close(window);
         } else {
             refresh_rows(true);
+            release_next_background_tab();
         }
         return;
     }
     let Some((window, panel, next, was_active, closing)) = change(|s| {
         let index = s.tabs.iter().position(|tab| tab.key == key)?;
         let tab = s.tabs.remove(index);
-        if tab.url.starts_with("https://") || tab.url.starts_with("http://") {
-            s.recently_closed.push(tab.url);
-            if s.recently_closed.len() > 20 {
-                s.recently_closed.remove(0);
+        if (tab.url.starts_with("https://") || tab.url.starts_with("http://"))
+            && let Some(url) = session::stored_url(&tab.url)
+        {
+            let mut title = tab.title;
+            title.truncate(title.floor_char_boundary(1024));
+            let item = ClosedItem::Tab {
+                owner: s.id,
+                index,
+                entry: Entry {
+                    url,
+                    title,
+                    pinned: tab.pinned,
+                },
+                muted: tab.muted,
+            };
+            if s.private {
+                remember_closed(&mut s.recently_closed, item);
+            } else {
+                RECENT_NORMAL.with(|items| remember_closed(&mut items.borrow_mut(), item));
             }
         }
         let next = if s.tabs.is_empty() {
@@ -2303,7 +2371,8 @@ fn close_window(window: HWND) {
         }
         s.closing = true;
         s.pending_settings = None;
-        s.closing_session = (!s.private).then(|| snapshot(s));
+        s.memory_queue.clear();
+        s.closing_session = (!s.private).then(|| window_snapshot(s, true));
         true
     }) == Some(true)
     {
@@ -2365,7 +2434,21 @@ fn continue_window_close(window: HWND) {
     } else if !waiting {
         if let Some(state) = change(|s| s.closing_session.take()).flatten() {
             if last_normal_window() {
-                store_session(&state);
+                if RESTORE_TABS.get() {
+                    store_session(&state);
+                } else {
+                    store_session(&Session {
+                        entries: Vec::new(),
+                        selected: 0,
+                        restore: false,
+                    });
+                }
+            }
+            if state.entries.iter().any(|entry| entry.url != HOME) && normal_window().is_some() {
+                let state = session::validated(&state);
+                RECENT_NORMAL.with(|items| {
+                    remember_closed(&mut items.borrow_mut(), ClosedItem::Window(state))
+                });
             }
         }
         unsafe {
@@ -2374,8 +2457,8 @@ fn continue_window_close(window: HWND) {
     }
 }
 
-fn snapshot(s: &Shell) -> Session {
-    if !RESTORE_TABS.get() {
+fn window_snapshot(s: &Shell, restore: bool) -> Session {
+    if !restore {
         return Session {
             entries: Vec::new(),
             selected: 0,
@@ -2385,15 +2468,19 @@ fn snapshot(s: &Shell) -> Session {
     let mut entries = Vec::new();
     let mut selected = 0;
     for tab in &s.tabs {
-        if settings_target(&tab.url).is_some() {
+        let Some(url) = session::stored_url(&tab.url) else {
+            continue;
+        };
+        if settings_target(&url).is_some() {
             continue;
         }
         if Some(tab.key) == s.active {
             selected = entries.len();
         }
+        let title = &tab.title[..tab.title.floor_char_boundary(1024)];
         entries.push(Entry {
-            url: tab.url.clone(),
-            title: tab.title.clone(),
+            url,
+            title: title.to_owned(),
             pinned: tab.pinned,
         });
     }
@@ -2420,8 +2507,88 @@ fn store_session(state: &Session) {
 }
 
 fn save_session() {
-    if let Some(state) = with_shell(|s| (!s.private).then(|| snapshot(s))).flatten() {
+    if let Some(state) =
+        with_shell(|s| (!s.private).then(|| window_snapshot(s, RESTORE_TABS.get()))).flatten()
+    {
         store_session(&state);
+    }
+}
+
+fn remember_closed(items: &mut Vec<ClosedItem>, item: ClosedItem) {
+    if items.len() >= 20 {
+        items.remove(0);
+    }
+    items.push(item);
+}
+
+fn reopen_closed() {
+    let private = private();
+    let item = if private {
+        change(|s| s.recently_closed.pop()).flatten()
+    } else {
+        RECENT_NORMAL.with(|items| items.borrow_mut().pop())
+    };
+    let Some(item) = item else { return };
+    match item {
+        ClosedItem::Window(state) => {
+            if open_window(false, None, Some(state.clone())).is_err() {
+                RECENT_NORMAL.with(|items| {
+                    remember_closed(&mut items.borrow_mut(), ClosedItem::Window(state))
+                });
+            }
+        }
+        ClosedItem::Tab {
+            owner,
+            index,
+            entry,
+            muted,
+        } => {
+            let target = if private {
+                CURRENT_WINDOW.get()
+            } else {
+                WINDOWS.with(|windows| {
+                    windows
+                        .borrow()
+                        .iter()
+                        .find(|(_, s)| s.id == owner && !s.private && !s.closing)
+                        .map_or(CURRENT_WINDOW.get(), |(&window, _)| window)
+                })
+            };
+            let _scope = WindowScope::enter(target);
+            let Ok((key, appended)) = append_tab(&entry.url, &entry.title, entry.pinned) else {
+                let item = ClosedItem::Tab {
+                    owner,
+                    index,
+                    entry,
+                    muted,
+                };
+                if private {
+                    change(|s| remember_closed(&mut s.recently_closed, item));
+                } else {
+                    RECENT_NORMAL.with(|items| remember_closed(&mut items.borrow_mut(), item));
+                }
+                return;
+            };
+            let placed = change(|s| {
+                let mut tab = s.tabs.remove(appended);
+                tab.muted = muted;
+                let pinned = s.tabs.iter().take_while(|tab| tab.pinned).count();
+                let index = if entry.pinned {
+                    index.min(pinned)
+                } else {
+                    index.clamp(pinned, s.tabs.len())
+                };
+                s.tabs.insert(index, tab);
+                (s.controls.window, key)
+            });
+            if let Some((window, key)) = placed {
+                select_key(key);
+                unsafe {
+                    SetForegroundWindow(window);
+                }
+                focus_page();
+            }
+        }
     }
 }
 
@@ -2828,7 +2995,7 @@ fn finish_bookmark(key: usize, frame: &Frame) {
     }
 }
 
-fn toggle_find() {
+fn open_find() {
     if let Some(host) = host() {
         host.set_focus(1);
     }
@@ -2919,13 +3086,26 @@ fn show_menu(ui: Controls) {
     let separator = || unsafe {
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
     };
-    let restore = with_shell(|s| !s.recently_closed.is_empty()).unwrap_or(false);
+    let restore = if private() {
+        with_shell(|s| !s.recently_closed.is_empty()).unwrap_or(false)
+    } else {
+        RECENT_NORMAL.with(|items| !items.borrow().is_empty())
+    };
     add(NEW_TAB, "New tab\tCtrl+T", true);
     add(NEW_WINDOW, "New window\tCtrl+N", true);
     add(PRIVATE_WINDOW, "New private window\tCtrl+Shift+N", true);
-    add(RESTORE_TAB, "Reopen closed tab\tCtrl+Shift+T", restore);
+    add(
+        RESTORE_TAB,
+        "Reopen closed tab or window\tCtrl+Shift+T",
+        restore,
+    );
     add(FOCUS_FILTER, "Search open tabs\tCtrl+Shift+A", true);
     add(CLOSE_WINDOW, "Close window\tCtrl+Shift+W", true);
+    add(
+        FREE_MEMORY,
+        "Free memory from background tabs…",
+        !background_tabs_for_release().is_empty(),
+    );
     separator();
     add(SAVE_BOOKMARK, "Bookmark this page\tCtrl+D", !private());
     add(BOOKMARKS, "Manage bookmarks\tCtrl+Shift+O", !private());
@@ -3210,6 +3390,81 @@ fn can_unload(s: &Shell, tab: &Tab) -> bool {
         && (tab.url.starts_with("http://") || tab.url.starts_with("https://"))
         && session::stored_url(&tab.url).is_some()
         && download_guard::count(s.controls.window as usize, Some(tab.key)) == 0
+}
+
+fn can_release_background(s: &Shell, tab: &Tab) -> bool {
+    !tab.pinned
+        && !tab.has_video_access
+        && !tab.has_audio_access
+        && !tab.retiring
+        && s.popups.is_empty()
+        && s.pending_popups.is_empty()
+        && can_unload(s, tab)
+        && tab.browser.as_ref().is_some_and(|browser| {
+            browser.is_loading() == 0
+                && browser.host().is_some_and(|host| host.has_dev_tools() == 0)
+        })
+}
+
+fn background_tabs_for_release() -> Vec<usize> {
+    with_shell(|s| {
+        if !s.memory_queue.is_empty() || s.tabs.iter().any(|tab| tab.unloading) {
+            return Vec::new();
+        }
+        s.tabs
+            .iter()
+            .filter(|tab| can_release_background(s, tab))
+            .map(|tab| tab.key)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn free_background_memory(window: HWND) {
+    let keys = background_tabs_for_release();
+    if keys.is_empty() {
+        return;
+    }
+    let message = wide(&format!(
+        "Unload up to {} background tabs? They stay in the sidebar and reload when selected.\n\nPinned tabs, downloads, camera or microphone use, and inspected tabs are skipped. Other audio and unsaved work can stop or be lost.",
+        keys.len()
+    ));
+    if unsafe {
+        MessageBoxW(
+            window,
+            message.as_ptr(),
+            windows_sys::w!("Free tab memory?"),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        )
+    } != IDYES
+    {
+        return;
+    }
+    change(|s| s.memory_queue.extend(keys));
+    release_next_background_tab();
+}
+
+fn release_next_background_tab() {
+    let next = change(|s| {
+        if s.closing || s.tabs.iter().any(|tab| tab.unloading) {
+            return None;
+        }
+        while let Some(key) = s.memory_queue.pop_front() {
+            let Some(index) = s.tabs.iter().position(|tab| tab.key == key) else {
+                continue;
+            };
+            if can_release_background(s, &s.tabs[index]) {
+                s.tabs[index].unloading = true;
+                return Some((s.controls.window, key));
+            }
+        }
+        None
+    })
+    .flatten();
+    if let Some((window, key)) = next {
+        permissions::cancel_tab(window as usize, key);
+        close_embedded_page(window, key);
+    }
 }
 
 fn unload_tab(key: usize) {
@@ -3605,11 +3860,8 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 CLOSE_TAB => close_tab(None),
-                RESTORE_TAB => {
-                    if let Some(url) = change(|s| s.recently_closed.pop()).flatten() {
-                        let _ = add_tab(&url);
-                    }
-                }
+                RESTORE_TAB => reopen_closed(),
+                FREE_MEMORY => free_background_memory(window),
                 SIDEBAR => {
                     reveal_toolbar(window);
                     toggle_sidebar();
@@ -3683,14 +3935,14 @@ unsafe extern "system" fn window_proc(
                 }
                 FIND => {
                     reveal_toolbar(window);
-                    toggle_find();
+                    open_find();
                 }
                 FOCUS_FIND_PREV | FOCUS_FIND_NEXT => {
                     if with_shell(|s| s.find_open) == Some(true) {
                         find_in_page(id == FOCUS_FIND_NEXT, true);
                     } else {
                         reveal_toolbar(window);
-                        toggle_find();
+                        open_find();
                     }
                 }
                 FIND_PREVIOUS | FIND_NEXT => find_in_page(id == FIND_NEXT, true),
@@ -3756,6 +4008,20 @@ unsafe extern "system" fn window_proc(
             0
         }
         TAB_CLOSE_CANCELLED => {
+            if lp != 0 {
+                change(|s| {
+                    if let Some(tab) = s.tabs.iter_mut().find(|tab| tab.key == wp) {
+                        tab.unloading = false;
+                        tab.close_requested = false;
+                    }
+                });
+                if with_shell(|s| s.closing) == Some(true) {
+                    continue_window_close(window);
+                } else {
+                    release_next_background_tab();
+                }
+                return 0;
+            }
             let native = change(|s| {
                 let tab = s.tabs.iter_mut().find(|tab| tab.key == wp)?;
                 if std::mem::take(&mut tab.close_requested) {

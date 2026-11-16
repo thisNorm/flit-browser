@@ -75,7 +75,7 @@ pub(crate) fn save(profile: &Path, session: &Session) -> io::Result<()> {
     result
 }
 
-fn validated(session: &Session) -> Session {
+pub(crate) fn validated(session: &Session) -> Session {
     let mut entries = Vec::with_capacity(session.entries.len().min(MAX_TABS));
     let mut selected = 0;
     for (index, entry) in session.entries.iter().enumerate() {
