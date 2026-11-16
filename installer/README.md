@@ -22,8 +22,8 @@ curl.exe -fLO 'https://github.com/OWNER/REPO/releases/latest/download/Install-Fl
 
 ## GitHub에 올리기
 
-1. `Install-Flit.cmd`의 `FLIT_INSTALL_REPO`에 공개 저장소의 `OWNER/REPO`를 넣는다. 새 버전을 낼 때는 `FLIT_INSTALL_TAG`와 설치 EXE의 SHA-256도 같이 갱신한다.
-2. GitHub **Releases**에서 `v0.19.0` 릴리스에 같은 버전의 `Install-Flit.cmd`, `FlitSetup-x64.exe`, `FlitSetup-x64.exe.sha256`를 첨부한다.
+1. 빌드하기 전에 `Install-Flit.cmd`의 `FLIT_INSTALL_REPO`에 공개 저장소의 `OWNER/REPO`를 넣는다. 빌드가 출력 폴더의 스크립트에 설치 EXE의 버전과 SHA-256을 넣는다.
+2. GitHub **Releases**에서 `v0.20.0` 릴리스에 출력 폴더의 `Install-Flit.cmd`, `FlitSetup-x64.exe`, `FlitSetup-x64.exe.sha256`를 첨부한다.
 3. 공개 후 별도 폴더에 `Install-Flit.cmd`만 내려받아 설치 화면까지 열리는지 확인한다.
 
 최신 정식 릴리스를 찾아 무인 설치하려면 `.\Install-Flit.ps1 -Repository OWNER/REPO -Silent`를 사용한다. [GitHub 릴리스 다운로드 링크](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)
@@ -34,10 +34,10 @@ curl.exe -fLO 'https://github.com/OWNER/REPO/releases/latest/download/Install-Fl
 
 1. 툴체인 기록의 Rust x64/CEF 환경에서 `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS`를 `-C target-feature=+crt-static`으로 설정한 뒤 `cargo build --release --locked --target x86_64-pc-windows-msvc`를 실행한다.
 2. 0.6.0 런타임 기록의 CEF Windows x64 배포본에서 `Release`의 런타임, `Resources`의 리소스·로캘, 루트의 `LICENSE.txt`와 `CREDITS.html`을 한 디렉터리에 모은다. 그 경로와 새 `flit.dll`을 `tools/New-WindowsBundle.ps1`에 넘긴다. Rust 의존성 고지(`third-party-licenses`)를 포함하고 사용자 프로필과 도구 캐시는 넣지 않는다.
-3. [Inno Setup 7.1.1](https://github.com/jrsoftware/issrc/releases/tag/is-7_1_1)의 `ISCC.exe` 경로와 번들 경로를 넘긴다. 빌드 결과의 SHA-256은 `Get-FileHash -Algorithm SHA256`으로 계산한다.
+3. [Inno Setup 7.1.1](https://github.com/jrsoftware/issrc/releases/tag/is-7_1_1)의 `ISCC.exe` 경로와 번들 경로를 넘긴다. 새 출력 폴더에 설치 EXE, 버전과 SHA-256이 맞는 스크립트, `.sha256` 파일이 함께 생긴다. Windows 서명 등으로 EXE를 수정하면 최종 파일로 SHA-256과 스크립트를 다시 맞춰야 한다.
 
 ```powershell
 .\Build-Setup.ps1 -IsccPath 'C:\Tools\Inno Setup\ISCC.exe' -BundleDir 'C:\Build\Flit-Browser' -OutputDir 'C:\Build\release'
 ```
 
-0.19.0 설치 파일 빌드와 SHA-256 · 초기 설치·제거와 브라우저 실행 검증 · 초기 PowerShell 스크립트 검증
+0.20.0 설치 파일 빌드와 SHA-256 · 초기 설치·제거와 브라우저 실행 검증 · 초기 PowerShell 스크립트 검증

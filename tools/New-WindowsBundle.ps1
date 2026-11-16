@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory)][string]$CefRuntime,
     [Parameter(Mandatory)][string]$FlitDll,
     [Parameter(Mandatory)][string]$Destination,
-    [string]$Version = '0.19.0'
+    [string]$Version = '0.20.0'
 )
 
 $ErrorActionPreference = 'Stop'

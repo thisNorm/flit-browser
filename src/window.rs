@@ -229,6 +229,7 @@ enum DownloadClose {
 struct Tab {
     key: usize,
     return_tab: Option<usize>,
+    background_warm: bool,
     panel: HWND,
     browser: Option<Browser>,
     native_window: Option<Window>,
@@ -2017,11 +2018,12 @@ fn select(index: usize) {
         close_find(false);
     }
     let Some((key, panels, closing)) = change(|s| {
-        let tab = s.tabs.get(index)?;
+        let tab = s.tabs.get_mut(index)?;
         if tab.unloading || tab.retiring {
             return None;
         }
         let key = tab.key;
+        tab.background_warm = false;
         s.active = Some(key);
         Some((
             key,
@@ -2082,11 +2084,47 @@ fn open_tab(url: &str, foreground: bool, source: Option<usize>) -> Result<(), &'
         select(index);
     } else {
         refresh_rows(false);
-        if !DEFER_BACKGROUND.get() && !physical_memory_low() {
-            load_deferred(key)?;
-        }
+        warm_background_tab(key)?;
     }
     queue_session_save();
+    Ok(())
+}
+
+fn warm_background_tab(key: usize) -> Result<(), &'static str> {
+    const LIMIT: usize = 2;
+    if DEFER_BACKGROUND.get() || physical_memory_low() {
+        return Ok(());
+    }
+    let reserved = change(|s| {
+        if s.active == Some(key)
+            || s.tabs
+                .iter()
+                .filter(|t| t.background_warm)
+                .take(LIMIT)
+                .count()
+                == LIMIT
+        {
+            return false;
+        }
+        if let Some(tab) = s
+            .tabs
+            .iter_mut()
+            .find(|t| t.key == key && t.browser.is_none())
+        {
+            // Count the slot before CEF creates the page; selecting it releases the slot.
+            tab.background_warm = true;
+            return true;
+        }
+        false
+    }) == Some(true);
+    if reserved && let Err(error) = load_deferred(key) {
+        change(|s| {
+            if let Some(tab) = s.tabs.iter_mut().find(|t| t.key == key) {
+                tab.background_warm = false;
+            }
+        });
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -2141,6 +2179,7 @@ fn append_tab(
         s.tabs.push(Tab {
             key,
             return_tab,
+            background_warm: false,
             panel,
             browser: None,
             native_window: None,
@@ -2397,6 +2436,7 @@ fn closed(key: usize) {
             return None;
         };
         tab.unloading = false;
+        tab.background_warm = false;
         // Keep tab entries until the entire window closes. If a later page
         // vetoes closing, earlier tabs can still be selected and reloaded.
         tab.unloaded = tab.url != HOME;
