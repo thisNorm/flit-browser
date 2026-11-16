@@ -4,7 +4,10 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     UI::{
         Controls::{EM_GETSEL, EM_REPLACESEL, EM_SETSEL},
-        Input::KeyboardAndMouse::*,
+        Input::{
+            Ime::{GCS_COMPSTR, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext},
+            KeyboardAndMouse::*,
+        },
         WindowsAndMessaging::{
             ES_READONLY, GWL_STYLE, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
             SendMessageW, WM_CHAR, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
@@ -134,6 +137,22 @@ thread_local! {
     static COMPOSING_EDIT: Cell<HWND> = const { Cell::new(null_mut()) };
 }
 
+pub(crate) fn edit_composing(hwnd: HWND) -> bool {
+    if COMPOSING_EDIT.get() == hwnd {
+        return true;
+    }
+    // Some input methods expose composition text without a start message.
+    unsafe {
+        let context = ImmGetContext(hwnd);
+        if context.is_null() {
+            return false;
+        }
+        let bytes = ImmGetCompositionStringW(context, GCS_COMPSTR, null_mut(), 0);
+        ImmReleaseContext(hwnd, context);
+        bytes > 0
+    }
+}
+
 /// Call before browser shortcut routing for every message to a native Unicode EDIT.
 /// Return `Some` directly from the subclass; `None` leaves the message to normal routing.
 pub(crate) fn handle_edit_message(
@@ -141,6 +160,7 @@ pub(crate) fn handle_edit_message(
     message: u32,
     wp: WPARAM,
     lp: LPARAM,
+    composing: bool,
 ) -> Option<LRESULT> {
     match message {
         WM_CHAR | WM_SYSCHAR => {
@@ -176,6 +196,14 @@ pub(crate) fn handle_edit_message(
                 }));
             };
 
+            if composing {
+                if message == WM_KEYDOWN && matches!(key, VK_RETURN | VK_ESCAPE) {
+                    // A queued WM_CHAR can arrive after IME_ENDCOMPOSITION.
+                    expect_char(TranslatedChars::Control(wp));
+                }
+                return None;
+            }
+
             // The caller routes browser actions after this hook; keep their text out of EDIT.
             if shortcut(key, ctrl, shift, alt).is_some() {
                 match (message, key, ctrl, alt) {
@@ -193,7 +221,7 @@ pub(crate) fn handle_edit_message(
                 return None;
             }
 
-            if message != WM_KEYDOWN || !ctrl || shift || alt || COMPOSING_EDIT.get() == hwnd {
+            if message != WM_KEYDOWN || !ctrl || shift || alt {
                 return None;
             }
             match key {
@@ -434,7 +462,7 @@ mod tests {
         struct Edit(HWND, [u8; 256]);
         impl Drop for Edit {
             fn drop(&mut self) {
-                handle_edit_message(self.0, WM_NCDESTROY, 0, 0);
+                handle_edit_message(self.0, WM_NCDESTROY, 0, 0, false);
                 unsafe {
                     SetKeyboardState(self.1.as_ptr());
                     DestroyWindow(self.0);
@@ -448,7 +476,7 @@ mod tests {
         keys[VK_CONTROL as usize] = 0x80;
         assert_ne!(unsafe { SetKeyboardState(keys.as_ptr()) }, 0);
 
-        let message = |msg, wp, lp| handle_edit_message(hwnd, msg, wp, lp);
+        let message = |msg, wp, lp| handle_edit_message(hwnd, msg, wp, lp, edit_composing(hwnd));
         let text = || {
             let mut buffer = [0u16; 32];
             let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
@@ -481,7 +509,12 @@ mod tests {
         assert_eq!(message(WM_IME_STARTCOMPOSITION, 0, 0), None);
         assert_eq!(message(WM_KEYDOWN, VK_BACK as usize, backspace), None);
         assert_eq!(message(WM_CHAR, 0x7f, backspace), None);
+        let enter = 0x001c_0001;
+        assert_eq!(message(WM_KEYDOWN, VK_RETURN as usize, enter), None);
         assert_eq!(message(WM_IME_ENDCOMPOSITION, 0, 0), None);
+        assert_eq!(message(WM_CHAR, VK_RETURN as usize, enter), Some(0));
+        assert_eq!(message(WM_KEYDOWN, VK_RETURN as usize, enter), None);
+        assert_eq!(message(WM_CHAR, VK_RETURN as usize, enter), None);
         keys[VK_MENU as usize] = 0x80;
         assert_ne!(unsafe { SetKeyboardState(keys.as_ptr()) }, 0);
         assert_eq!(message(WM_SYSKEYDOWN, VK_A as usize, 0x201e_0001), None);

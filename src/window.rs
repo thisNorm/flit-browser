@@ -3327,8 +3327,14 @@ unsafe extern "system" fn chrome_proc(
     let _scope = WindowScope::enter(parent);
     let id = unsafe { GetDlgCtrlID(hwnd) } as usize;
     if matches!(id, ADDRESS | FILTER | FIND_TEXT) {
-        if let Some(result) = keyboard::handle_edit_message(hwnd, message, wp, lp) {
+        let composing = (matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN)
+            || (message == WM_CHAR && wp == VK_RETURN as usize))
+            && keyboard::edit_composing(hwnd);
+        if let Some(result) = keyboard::handle_edit_message(hwnd, message, wp, lp, composing) {
             return result;
+        }
+        if composing {
+            return unsafe { DefSubclassProc(hwnd, message, wp, lp) };
         }
     }
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
