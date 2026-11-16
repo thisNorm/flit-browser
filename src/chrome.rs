@@ -602,7 +602,7 @@ fn labeled_new_tab(kind: ButtonKind) -> bool {
     matches!(kind, ButtonKind::NewTab)
 }
 
-pub(crate) fn draw_tab(item: &DRAWITEMSTRUCT, label: &str, dpi: i32) {
+pub(crate) fn draw_tab(item: &DRAWITEMSTRUCT, label: &str, pinned: bool, muted: bool, dpi: i32) {
     let saved = begin_item(item);
     if saved == 0 {
         return;
@@ -635,18 +635,62 @@ pub(crate) fn draw_tab(item: &DRAWITEMSTRUCT, label: &str, dpi: i32) {
     };
     let center = (r.left + px(16, dpi), r.top + (r.bottom - r.top) / 2);
     with_pen(dc, tab_ink, dpi, || {
-        stroke(
-            dc,
-            center,
-            dpi,
-            [(-5, -5), (4, -5), (4, 5), (-5, 5), (-5, -5)],
-        );
-        stroke(dc, center, dpi, [(-5, -2), (4, -2)]);
+        if pinned {
+            stroke(
+                dc,
+                center,
+                dpi,
+                [
+                    (-3, -5),
+                    (3, -5),
+                    (2, -1),
+                    (5, 2),
+                    (-5, 2),
+                    (-2, -1),
+                    (-3, -5),
+                ],
+            );
+            stroke(dc, center, dpi, [(0, 2), (0, 6)]);
+        } else {
+            stroke(
+                dc,
+                center,
+                dpi,
+                [(-5, -5), (4, -5), (4, 5), (-5, 5), (-5, -5)],
+            );
+            stroke(dc, center, dpi, [(-5, -2), (4, -2)]);
+        }
     });
+    if muted {
+        with_pen(dc, foreground, dpi, || {
+            let speaker = (r.right - px(34, dpi), center.1);
+            stroke(
+                dc,
+                speaker,
+                dpi,
+                [
+                    (-6, -2),
+                    (-4, -2),
+                    (0, -5),
+                    (0, 5),
+                    (-4, 2),
+                    (-6, 2),
+                    (-6, -2),
+                ],
+            );
+            stroke(dc, speaker, dpi, [(2, -2), (6, 2)]);
+            stroke(dc, speaker, dpi, [(2, 2), (6, -2)]);
+        });
+    }
     text(
         item,
         label,
-        rect(r.left + px(30, dpi), r.top, r.right - px(27, dpi), r.bottom),
+        rect(
+            r.left + px(30, dpi),
+            r.top,
+            r.right - px(if muted { 45 } else { 27 }, dpi),
+            r.bottom,
+        ),
         foreground,
     );
     let x = r.right - px(14, dpi);

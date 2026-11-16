@@ -1,13 +1,16 @@
 use crate::{
+    bookmarks::{MANAGER_URL, SaveRequest},
     chrome::{self, ButtonKind},
     keyboard::{self, Shortcut},
     navigation::{self, HOME},
     panel_motion::Motion,
+    session::{self, Entry, Session},
 };
 use cef::*;
 use std::{
     cell::{Cell, RefCell},
     os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{
@@ -15,7 +18,7 @@ use windows_sys::Win32::{
     Graphics::Gdi::{
         CreateFontW, DEFAULT_GUI_FONT, DeleteObject, GetMonitorInfoW, GetStockObject, HDC, HFONT,
         InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, RDW_ALLCHILDREN,
-        RDW_INVALIDATE, RedrawWindow, UpdateWindow,
+        RDW_INVALIDATE, RedrawWindow, ScreenToClient, UpdateWindow,
     },
     System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_CENTERIMAGE},
     UI::{
@@ -71,12 +74,25 @@ const FOCUS_SEARCH: usize = 141;
 const FULLSCREEN: usize = 142;
 const FOCUS_FIND_NEXT: usize = 143;
 const FOCUS_FIND_PREV: usize = 144;
+const TOGGLE_RESTORE: usize = 145;
+const SITE_PERMISSIONS: usize = 146;
+const CLEAR_BROWSING: usize = 147;
+const ZOOM_IN: usize = 148;
+const ZOOM_OUT: usize = 149;
+const ZOOM_RESET: usize = 150;
 const SELECT_TAB_FIRST: usize = 151;
 const SELECT_TAB_LAST: usize = 159;
+const SAVE_BOOKMARK: usize = 160;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
 const OPEN_LINK: u32 = WM_APP + 4;
+const TAB_MENU_ACTION: u32 = WM_APP + 5;
+const TAB_CLOSE_CANCELLED: u32 = WM_APP + 6;
+const TAB_PIN: usize = 1;
+const TAB_DUPLICATE: usize = 2;
+const TAB_MUTE: usize = 3;
+const TAB_CLOSE: usize = 4;
 const WINDOW_CLASS: &str = "FlitBrowserWindow";
 const APP_TITLE: &str = "Flit Browser";
 const ICON_ID: usize = 32512;
@@ -137,6 +153,8 @@ impl Controls {
 struct Row {
     key: usize,
     label: String,
+    pinned: bool,
+    muted: bool,
 }
 
 struct Tab {
@@ -147,6 +165,9 @@ struct Tab {
     title: String,
     back: bool,
     forward: bool,
+    pinned: bool,
+    muted: bool,
+    bookmark: Option<SaveRequest>,
 }
 
 struct Shell {
@@ -163,6 +184,9 @@ struct Shell {
     find_open: bool,
     fullscreen: Option<WINDOWPLACEMENT>,
     recently_closed: Vec<String>,
+    profile: PathBuf,
+    restore_tabs: bool,
+    closing_session: Option<Session>,
 }
 
 thread_local! {
@@ -220,6 +244,35 @@ wrap_client! {
         }
         fn find_handler(&self) -> Option<FindHandler> {
             Some(FlitFind::new(self.key))
+        }
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(FlitUnload::new(self.window, self.key))
+        }
+    }
+}
+
+wrap_jsdialog_handler! {
+    struct FlitUnload { window: usize, key: usize }
+    impl JsdialogHandler {
+        fn on_before_unload_dialog(
+            &self, _browser: Option<&mut Browser>, _message: Option<&CefString>,
+            is_reload: i32, callback: Option<&mut JsdialogCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else { return 0 };
+            let message = if is_reload != 0 {
+                windows_sys::w!("Reload this page? Unsaved changes may be lost.")
+            } else {
+                windows_sys::w!("Leave this page? Unsaved changes may be lost.")
+            };
+            let proceed = unsafe { MessageBoxW(self.window as HWND, message,
+                windows_sys::w!("Flit Browser"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) } == IDYES;
+            let cancelled_close = !proceed && is_reload == 0
+                && change(|s| s.closing_session.take().is_some()) == Some(true);
+            callback.cont(i32::from(proceed), None);
+            if cancelled_close {
+                unsafe { PostMessageW(self.window as HWND, TAB_CLOSE_CANCELLED, self.key, 0); }
+            }
+            1
         }
     }
 }
@@ -320,6 +373,11 @@ wrap_load_handler! {
     impl LoadHandler {
         fn on_loading_state_change(&self, _browser: Option<&mut Browser>, _loading: i32, back: i32, forward: i32) {
             update_page(self.key, |tab| { tab.back = back != 0; tab.forward = forward != 0; });
+        }
+        fn on_load_end(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _status: i32) {
+            if let Some(frame) = frame {
+                finish_bookmark(self.key, frame);
+            }
         }
     }
 }
@@ -457,7 +515,7 @@ fn tooltips(ui: Controls) {
         (ui.go, w!("Go to address (Enter)")),
         (ui.add, w!("New tab (Ctrl+T)")),
         (ui.menu, w!("Flit menu")),
-        (ui.bookmark, w!("Open bookmarks")),
+        (ui.bookmark, w!("Bookmark this page (Ctrl+D)")),
         (ui.find_previous, w!("Previous match")),
         (ui.find_next, w!("Next match")),
         (ui.find_close, w!("Close find (Esc)")),
@@ -514,7 +572,7 @@ fn icon(exe: HINSTANCE, width: i32, height: i32) -> HICON {
     file_icon.cast()
 }
 
-pub(crate) fn open(initial_url: &str) -> Result<(), &'static str> {
+pub(crate) fn open(profile: &Path, initial_url: Option<&str>) -> Result<(), &'static str> {
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -585,7 +643,7 @@ pub(crate) fn open(initial_url: &str) -> Result<(), &'static str> {
         label: static_label(window, TAB_LABEL, "Tabs"),
         empty: static_label(window, EMPTY, "No matching tabs"),
         menu: button(window, MENU, "Flit menu"),
-        bookmark: button(window, BOOKMARKS, "Bookmarks"),
+        bookmark: button(window, SAVE_BOOKMARK, "Bookmark this page"),
         find_text: edit(window, FIND_TEXT),
         find_status: static_label(window, FIND_STATUS, ""),
         find_next: standard_button(window, FIND_NEXT, "↓"),
@@ -639,6 +697,8 @@ pub(crate) fn open(initial_url: &str) -> Result<(), &'static str> {
             windows_sys::w!("Find in page") as isize,
         );
     }
+    let saved = session::load(profile);
+    let restore_tabs = saved.as_ref().is_none_or(|state| state.restore);
     SHELL.with(|slot| {
         *slot.borrow_mut() = Some(Shell {
             controls: ui,
@@ -654,6 +714,9 @@ pub(crate) fn open(initial_url: &str) -> Result<(), &'static str> {
             find_open: false,
             fullscreen: None,
             recently_closed: Vec::new(),
+            profile: profile.to_owned(),
+            restore_tabs,
+            closing_session: None,
         });
     });
     tooltips(ui);
@@ -662,8 +725,17 @@ pub(crate) fn open(initial_url: &str) -> Result<(), &'static str> {
         ShowWindow(window, SW_SHOW);
         UpdateWindow(window);
     }
-    add_tab(initial_url)?;
-    if initial_url == HOME {
+    if let Some(state) =
+        saved.filter(|state| initial_url.is_none() && state.restore && !state.entries.is_empty())
+    {
+        for entry in state.entries {
+            append_tab(&entry.url, &entry.title, entry.pinned)?;
+        }
+        select(state.selected);
+    } else {
+        add_tab(initial_url.unwrap_or(HOME))?;
+    }
+    if active().is_none() {
         unsafe {
             SetFocus(ui.address);
             SendMessageW(ui.address, EM_SETSEL, 0, -1);
@@ -1119,6 +1191,8 @@ fn refresh_rows(ensure_visible: bool) {
                 .then_some(Row {
                     key: tab.key,
                     label,
+                    pinned: tab.pinned,
+                    muted: tab.muted,
                 })
             })
             .collect();
@@ -1221,15 +1295,18 @@ fn select(index: usize) {
     {
         close_find(false);
     }
-    let Some(panels) = change(|s| {
-        s.active = Some(s.tabs.get(index)?.key);
-        Some(
+    let Some((key, panels, closing)) = change(|s| {
+        let key = s.tabs.get(index)?.key;
+        s.active = Some(key);
+        Some((
+            key,
             s.tabs
                 .iter()
                 .enumerate()
                 .map(|(i, t)| (t.panel, i == index))
                 .collect::<Vec<_>>(),
-        )
+            s.closing_session.is_some(),
+        ))
     })
     .flatten() else {
         return;
@@ -1241,6 +1318,13 @@ fn select(index: usize) {
     }
     layout();
     refresh(true);
+    if !closing {
+        if let Err(message) = load_deferred(key) {
+            if let Some(ui) = controls() {
+                set_text(ui.window, &format!("{APP_TITLE} — {message}"));
+            }
+        }
+    }
 }
 
 fn add_tab(url: &str) -> Result<(), &'static str> {
@@ -1248,6 +1332,17 @@ fn add_tab(url: &str) -> Result<(), &'static str> {
 }
 
 fn open_tab(url: &str, foreground: bool) -> Result<(), &'static str> {
+    let (key, index) = append_tab(url, "", false)?;
+    if foreground || with_shell(|s| s.active.is_none()) == Some(true) {
+        select(index);
+    } else {
+        refresh_rows(false);
+        load_deferred(key)?;
+    }
+    Ok(())
+}
+
+fn append_tab(url: &str, title: &str, pinned: bool) -> Result<(usize, usize), &'static str> {
     let (ui, key) = change(|s| {
         let key = s.next_key;
         s.next_key += 1;
@@ -1281,37 +1376,39 @@ fn open_tab(url: &str, foreground: bool) -> Result<(), &'static str> {
             panel,
             browser: None,
             url: url.to_owned(),
-            title: String::new(),
+            title: title.to_owned(),
             back: false,
             forward: false,
+            pinned,
+            muted: false,
+            bookmark: None,
         });
         s.tabs.len() - 1
     })
     .ok_or("The Flit window closed during tab creation.")?;
-    if url != HOME {
-        materialize(key)?;
-    }
-    if foreground || with_shell(|s| s.active.is_none()) == Some(true) {
-        select(index);
-    } else {
-        refresh_rows(false);
-    }
-    if url != HOME {
-        if let Some(browser) =
-            with_shell(|s| s.tabs.iter().find(|tab| tab.key == key)?.browser.clone()).flatten()
-        {
-            if let Some(frame) = browser.main_frame() {
-                frame.load_url(Some(&CefString::from(url)));
-            }
+    Ok((key, index))
+}
+
+fn load_deferred(key: usize) -> Result<(), &'static str> {
+    let url = with_shell(|s| {
+        s.tabs
+            .iter()
+            .find(|t| t.key == key && t.browser.is_none() && t.url != HOME)
+            .map(|t| t.url.clone())
+    })
+    .flatten();
+    if let Some(url) = url {
+        if let Some(frame) = materialize(key)?.main_frame() {
+            frame.load_url(Some(&CefString::from(url.as_str())));
         }
     }
     Ok(())
 }
 
 fn materialize(key: usize) -> Result<Browser, &'static str> {
-    let (ui, panel, existing) = with_shell(|s| {
+    let (ui, panel, existing, muted) = with_shell(|s| {
         let tab = s.tabs.iter().find(|tab| tab.key == key)?;
-        Some((s.controls, tab.panel, tab.browser.clone()))
+        Some((s.controls, tab.panel, tab.browser.clone(), tab.muted))
     })
     .flatten()
     .ok_or("The tab is no longer available.")?;
@@ -1342,11 +1439,16 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
     );
     win.ex_style |= WS_EX_NOACTIVATE;
     let mut client = FlitClient::new(key, ui.window as usize);
+    let settings = BrowserSettings {
+        // The embedded host has no Chromium toolbar to anchor a zoom bubble.
+        chrome_zoom_bubble: State::DISABLED,
+        ..Default::default()
+    };
     let Some(browser) = browser_host_create_browser_sync(
         Some(&win),
         Some(&mut client),
         Some(&CefString::from(HOME)),
-        Some(&BrowserSettings::default()),
+        Some(&settings),
         None,
         None,
     ) else {
@@ -1364,6 +1466,9 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
             return false;
         }
         fit_browser(panel, &host);
+        if muted {
+            host.set_audio_muted(1);
+        }
         true
     });
     change(|s| {
@@ -1431,7 +1536,7 @@ fn navigate() {
 }
 
 fn closed(key: usize) {
-    let Some((window, panel, next, was_active)) = change(|s| {
+    let Some((window, panel, next, was_active, closing)) = change(|s| {
         let index = s.tabs.iter().position(|tab| tab.key == key)?;
         let tab = s.tabs.remove(index);
         if tab.url.starts_with("https://") || tab.url.starts_with("http://") {
@@ -1448,7 +1553,13 @@ fn closed(key: usize) {
                 .position(|t| Some(t.key) == s.active)
                 .or_else(|| Some(index.min(s.tabs.len() - 1)))
         };
-        Some((s.controls.window, tab.panel, next, Some(key) == s.active))
+        Some((
+            s.controls.window,
+            tab.panel,
+            next,
+            Some(key) == s.active,
+            s.closing_session.is_some(),
+        ))
     })
     .flatten() else {
         return;
@@ -1462,13 +1573,16 @@ fn closed(key: usize) {
             DestroyWindow(panel);
         }
     }
-    if let Some(next) = next {
+    if closing {
+        continue_window_close(window);
+    } else if let Some(next) = next {
         if was_active {
             select(next);
         } else {
             refresh_rows(false);
         }
     } else {
+        save_session();
         unsafe {
             DestroyWindow(window);
         }
@@ -1493,39 +1607,80 @@ fn close_tab(key: Option<usize>) {
 
 fn close_window(window: HWND) {
     close_find(false);
-    let panels = change(|s| {
-        let panels = s
-            .tabs
-            .iter()
-            .filter(|t| t.browser.is_none())
-            .map(|t| t.panel)
-            .collect::<Vec<_>>();
-        s.tabs.retain(|t| t.browser.is_some());
-        panels
-    })
-    .unwrap_or_default();
-    for panel in panels {
-        unsafe {
-            DestroyWindow(panel);
+    if change(|s| {
+        if s.closing_session.is_some() {
+            return false;
         }
+        s.closing_session = Some(snapshot(s));
+        true
+    }) == Some(true)
+    {
+        continue_window_close(window);
     }
-    let browsers = with_shell(|s| {
+}
+
+fn continue_window_close(window: HWND) {
+    let browser = with_shell(|s| {
         s.tabs
             .iter()
-            .filter_map(|tab| tab.browser.clone())
-            .collect::<Vec<_>>()
+            .find(|t| Some(t.key) == s.active && t.browser.is_some())
+            .or_else(|| s.tabs.iter().find(|t| t.browser.is_some()))?
+            .browser
+            .clone()
     })
-    .unwrap_or_default();
-    if browsers.is_empty() {
+    .flatten();
+    if let Some(host) = browser.and_then(|browser| browser.host()) {
+        host.close_browser(0);
+    } else {
+        if let Some((profile, state)) =
+            change(|s| Some((s.profile.clone(), s.closing_session.take()?))).flatten()
+        {
+            store_session(&profile, &state);
+        }
         unsafe {
             DestroyWindow(window);
         }
-    } else {
-        for browser in browsers {
-            if let Some(host) = browser.host() {
-                host.close_browser(0);
-            }
-        }
+    }
+}
+
+fn snapshot(s: &Shell) -> Session {
+    if !s.restore_tabs {
+        return Session {
+            entries: Vec::new(),
+            selected: 0,
+            restore: false,
+        };
+    }
+    let selected = s
+        .tabs
+        .iter()
+        .position(|tab| Some(tab.key) == s.active)
+        .unwrap_or(0);
+    let entries = s
+        .tabs
+        .iter()
+        .map(|tab| Entry {
+            url: tab.url.clone(),
+            title: tab.title.clone(),
+            pinned: tab.pinned,
+        })
+        .collect();
+    Session {
+        entries,
+        selected,
+        restore: s.restore_tabs,
+    }
+}
+
+fn store_session(profile: &Path, state: &Session) {
+    if let Err(error) = session::save(profile, state) {
+        eprintln!("Flit Browser: Could not save tabs: {error}");
+    }
+}
+
+fn save_session() {
+    if let Some((profile, state)) = with_shell(|s| (s.profile.clone(), snapshot(s))) {
+        store_session(&profile, &state);
     }
 }
 
@@ -1704,6 +1859,17 @@ fn host() -> Option<BrowserHost> {
     active().and_then(|b| b.host())
 }
 
+fn zoom_page(host: &BrowserHost, id: usize) {
+    let command = match id {
+        ZOOM_IN => ZoomCommand::IN,
+        ZOOM_OUT => ZoomCommand::OUT,
+        _ => ZoomCommand::RESET,
+    };
+    if host.can_zoom(command) != 0 {
+        host.zoom(command);
+    }
+}
+
 fn open_builtin(url: &'static str) {
     let existing =
         with_shell(|s| s.tabs.iter().find(|tab| tab.url == url).map(|t| t.key)).flatten();
@@ -1713,6 +1879,65 @@ fn open_builtin(url: &'static str) {
         if let Some(ui) = controls() {
             set_text(ui.window, &format!("{APP_TITLE} — {message}"));
         }
+    }
+}
+
+fn bookmark_page() {
+    let request = with_shell(|s| {
+        let tab = s.tabs.iter().find(|tab| Some(tab.key) == s.active)?;
+        SaveRequest::new(&session::stored_url(&tab.url)?, &clean(&tab.title, 240))
+    })
+    .flatten();
+    let Some(request) = request else {
+        open_builtin(MANAGER_URL);
+        return;
+    };
+    let existing = with_shell(|s| {
+        s.tabs
+            .iter()
+            .find(|tab| tab.url == MANAGER_URL)
+            .map(|t| t.key)
+    })
+    .flatten();
+    let key = match existing
+        .map(Ok)
+        .unwrap_or_else(|| append_tab(MANAGER_URL, "", false).map(|(key, _)| key))
+    {
+        Ok(key) => key,
+        Err(message) => {
+            if let Some(ui) = controls() {
+                set_text(ui.window, &format!("{APP_TITLE} — {message}"));
+            }
+            return;
+        }
+    };
+    change(|s| {
+        if let Some(tab) = s.tabs.iter_mut().find(|tab| tab.key == key) {
+            tab.bookmark = Some(request);
+        }
+    });
+    select_key(key);
+    if let Some(browser) = active().filter(|browser| browser.is_loading() == 0) {
+        if let Some(frame) = browser.main_frame() {
+            finish_bookmark(key, &frame);
+        }
+    }
+}
+
+fn finish_bookmark(key: usize, frame: &Frame) {
+    if frame.is_main() == 0 || CefString::from(&frame.url()).to_string() != MANAGER_URL {
+        return;
+    }
+    let pending = change(|s| {
+        s.tabs
+            .iter_mut()
+            .find(|tab| tab.key == key)?
+            .bookmark
+            .take()
+    })
+    .flatten();
+    if let Some(request) = pending {
+        request.dispatch_on_load_end(frame);
     }
 }
 
@@ -1812,16 +2037,50 @@ fn show_menu(ui: Controls) {
     add(RESTORE_TAB, "Reopen closed tab\tCtrl+Shift+T", restore);
     add(FOCUS_FILTER, "Search open tabs\tCtrl+Shift+A", true);
     separator();
-    add(BOOKMARKS, "Bookmarks", true);
+    add(SAVE_BOOKMARK, "Bookmark this page\tCtrl+D", true);
+    add(BOOKMARKS, "Manage bookmarks", true);
     add(HISTORY, "History\tCtrl+H", true);
     add(DOWNLOADS, "Downloads\tCtrl+J", true);
     separator();
     add(FIND, "Find in page\tCtrl+F", true);
     add(PRINT, "Print…\tCtrl+P", true);
+    if let Some(host) = host() {
+        let percent = (100.0 * 1.2_f64.powf(host.zoom_level())).round() as i32;
+        add(
+            ZOOM_IN,
+            "Zoom in\tCtrl++",
+            host.can_zoom(ZoomCommand::IN) != 0,
+        );
+        add(
+            ZOOM_OUT,
+            "Zoom out\tCtrl+-",
+            host.can_zoom(ZoomCommand::OUT) != 0,
+        );
+        add(
+            ZOOM_RESET,
+            &format!("Reset zoom ({percent}%)\tCtrl+0"),
+            host.can_zoom(ZoomCommand::RESET) != 0,
+        );
+    }
     separator();
     add(SETTINGS, "Settings", true);
+    add(SITE_PERMISSIONS, "Site permissions", true);
+    add(CLEAR_BROWSING, "Clear browsing data…", true);
     add(PASSWORDS, "Password manager", true);
     add(EXTENSIONS, "Extensions", true);
+    unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING
+                | if with_shell(|s| s.restore_tabs) == Some(true) {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            TOGGLE_RESTORE,
+            windows_sys::w!("Continue last tabs on startup"),
+        );
+    }
     separator();
     add(
         MATERIAL,
@@ -1856,6 +2115,7 @@ fn shortcut_command(action: Shortcut) -> usize {
     match action {
         Shortcut::FocusAddress => FOCUS_ADDRESS,
         Shortcut::FocusSearch => FOCUS_SEARCH,
+        Shortcut::Bookmark => SAVE_BOOKMARK,
         Shortcut::NewTab => NEW_TAB,
         Shortcut::RestoreTab => RESTORE_TAB,
         Shortcut::CloseTab => CLOSE_TAB,
@@ -1876,6 +2136,9 @@ fn shortcut_command(action: Shortcut) -> usize {
         Shortcut::Downloads => DOWNLOADS,
         Shortcut::Print => PRINT,
         Shortcut::ToggleFullscreen => FULLSCREEN,
+        Shortcut::ZoomIn => ZOOM_IN,
+        Shortcut::ZoomOut => ZOOM_OUT,
+        Shortcut::ZoomReset => ZOOM_RESET,
     }
 }
 
@@ -1935,6 +2198,135 @@ fn tab_point(hwnd: HWND, lp: LPARAM, close_only: bool) -> Option<usize> {
         return None;
     }
     row_key(index)
+}
+
+fn show_tab_menu(list: HWND, parent: HWND, coordinates: LPARAM) {
+    let mut point = POINT {
+        x: (coordinates as u16 as i16) as i32,
+        y: ((coordinates >> 16) as u16 as i16) as i32,
+    };
+    let key = if coordinates == -1 {
+        let index = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
+        let mut row = RECT::default();
+        if index < 0
+            || unsafe {
+                SendMessageW(
+                    list,
+                    LB_GETITEMRECT,
+                    index as usize,
+                    (&mut row as *mut RECT) as LPARAM,
+                )
+            } < 0
+        {
+            return;
+        }
+        point = POINT {
+            x: row.left,
+            y: row.bottom,
+        };
+        unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(list, &mut point) };
+        row_key(index as usize)
+    } else {
+        let mut client = point;
+        unsafe { ScreenToClient(list, &mut client) };
+        tab_point(
+            list,
+            (client.x as u16 as u32 | (client.y as u16 as u32) << 16) as LPARAM,
+            false,
+        )
+    };
+    let Some(key) = key else {
+        return;
+    };
+    let Some((pinned, muted, copyable)) = with_shell(|s| {
+        let tab = s.tabs.iter().find(|t| t.key == key)?;
+        Some((
+            tab.pinned,
+            tab.muted,
+            session::stored_url(&tab.url).is_some(),
+        ))
+    })
+    .flatten() else {
+        return;
+    };
+    let menu = unsafe { CreatePopupMenu() };
+    if menu.is_null() {
+        return;
+    }
+    for (id, label, enabled) in [
+        (TAB_PIN, if pinned { "Unpin tab" } else { "Pin tab" }, true),
+        (TAB_DUPLICATE, "Duplicate tab", copyable),
+        (
+            TAB_MUTE,
+            if muted { "Unmute tab" } else { "Mute tab" },
+            true,
+        ),
+        (TAB_CLOSE, "Close tab", true),
+    ] {
+        unsafe {
+            AppendMenuW(
+                menu,
+                MF_STRING | if enabled { 0 } else { MF_GRAYED },
+                id,
+                wide(label).as_ptr(),
+            );
+        }
+    }
+    unsafe {
+        let action = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            0,
+            parent,
+            null(),
+        );
+        DestroyMenu(menu);
+        if action != 0 {
+            PostMessageW(parent, TAB_MENU_ACTION, key, action as LPARAM);
+        }
+    }
+}
+
+fn tab_action(key: usize, action: usize) {
+    match action {
+        TAB_PIN => {
+            change(|s| {
+                let i = s.tabs.iter().position(|t| t.key == key)?;
+                let mut tab = s.tabs.remove(i);
+                tab.pinned = !tab.pinned;
+                let boundary = s.tabs.iter().take_while(|t| t.pinned).count();
+                s.tabs.insert(boundary, tab);
+                Some(())
+            });
+            refresh_rows(false);
+        }
+        TAB_DUPLICATE => {
+            if let Some(url) =
+                with_shell(|s| session::stored_url(&s.tabs.iter().find(|tab| tab.key == key)?.url))
+                    .flatten()
+            {
+                let _ = add_tab(&url);
+            }
+        }
+        TAB_MUTE => {
+            if let Some((muted, browser)) = change(|s| {
+                let tab = s.tabs.iter_mut().find(|t| t.key == key)?;
+                tab.muted = !tab.muted;
+                Some((tab.muted, tab.browser.clone()))
+            })
+            .flatten()
+            {
+                if let Some(host) = browser.and_then(|b| b.host()) {
+                    host.set_audio_muted(i32::from(muted));
+                }
+                refresh_rows(false);
+            }
+        }
+        TAB_CLOSE => close_tab(Some(key)),
+        _ => {}
+    }
 }
 
 fn filter_input(command: usize) {
@@ -2036,6 +2428,10 @@ unsafe extern "system" fn chrome_proc(
     }
     if id == TABS {
         match message {
+            WM_CONTEXTMENU => {
+                show_tab_menu(hwnd, parent as HWND, lp);
+                return 0;
+            }
             WM_LBUTTONDOWN | WM_MBUTTONDOWN => {
                 if let Some(key) = tab_point(hwnd, lp, message == WM_LBUTTONDOWN) {
                     ROW_CLOSE.set(Some((key, message)));
@@ -2130,13 +2526,11 @@ unsafe extern "system" fn window_proc(
             let item = unsafe { &*(lp as *const DRAWITEMSTRUCT) };
             let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
             if wp == TABS {
-                let label = with_shell(|s| {
-                    s.rows
-                        .get(item.itemID as usize)
-                        .map(|row| row.label.clone())
-                })
-                .flatten();
-                chrome::draw_tab(item, label.as_deref().unwrap_or_default(), dpi);
+                let row = with_shell(|s| s.rows.get(item.itemID as usize).cloned()).flatten();
+                let (label, pinned, muted) = row.as_ref().map_or(("", false, false), |row| {
+                    (row.label.as_str(), row.pinned, row.muted)
+                });
+                chrome::draw_tab(item, label, pinned, muted, dpi);
                 return 1;
             }
             let kind = match wp {
@@ -2145,7 +2539,7 @@ unsafe extern "system" fn window_proc(
                 FORWARD => ButtonKind::Forward,
                 RELOAD => ButtonKind::Reload,
                 GO => ButtonKind::Go,
-                BOOKMARKS => ButtonKind::Bookmark,
+                SAVE_BOOKMARK => ButtonKind::Bookmark,
                 MENU => ButtonKind::Menu,
                 NEW_TAB
                     if with_shell(|s| !s.sidebar_open && !s.sidebar_motion.running())
@@ -2242,15 +2636,27 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 FULLSCREEN => toggle_fullscreen(window),
+                ZOOM_IN | ZOOM_OUT | ZOOM_RESET => {
+                    if let Some(host) = host() {
+                        zoom_page(&host, id);
+                    }
+                }
                 MENU => {
                     if let Some(ui) = controls() {
                         show_menu(ui);
                     }
                 }
                 HISTORY => open_builtin("chrome://history/"),
-                BOOKMARKS => open_builtin("chrome://bookmarks/"),
+                BOOKMARKS => open_builtin(MANAGER_URL),
+                SAVE_BOOKMARK => bookmark_page(),
                 DOWNLOADS => open_builtin("chrome://downloads/"),
                 SETTINGS => open_builtin("chrome://settings/"),
+                SITE_PERMISSIONS => open_builtin("chrome://settings/content"),
+                CLEAR_BROWSING => open_builtin("chrome://settings/clearBrowserData"),
+                TOGGLE_RESTORE => {
+                    change(|s| s.restore_tabs = !s.restore_tabs);
+                    save_session();
+                }
                 EXTENSIONS => open_builtin("chrome://extensions/"),
                 PASSWORDS => open_builtin("chrome://password-manager/"),
                 MATERIAL => {
@@ -2314,6 +2720,15 @@ unsafe extern "system" fn window_proc(
         }
         CLOSE_BY_KEY => {
             close_tab(Some(wp));
+            0
+        }
+        TAB_MENU_ACTION => {
+            tab_action(wp, lp as usize);
+            0
+        }
+        TAB_CLOSE_CANCELLED => {
+            select_key(wp);
+            focus_page();
             0
         }
         OPEN_LINK => {

@@ -17,6 +17,7 @@ use windows_sys::Win32::{
 pub(crate) enum Shortcut {
     FocusAddress,
     FocusSearch,
+    Bookmark,
     NewTab,
     RestoreTab,
     CloseTab,
@@ -38,6 +39,9 @@ pub(crate) enum Shortcut {
     Downloads,
     Print,
     ToggleFullscreen,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 pub(crate) fn shortcut(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Shortcut> {
@@ -48,6 +52,7 @@ pub(crate) fn shortcut(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<S
             FocusAddress
         }
         (VK_K, true, false, false) => FocusSearch,
+        (VK_D, true, false, false) => Bookmark,
         (VK_T, true, false, false) => NewTab,
         (VK_T, true, true, false) => RestoreTab,
         (VK_W, true, false, false) => CloseTab,
@@ -73,6 +78,9 @@ pub(crate) fn shortcut(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<S
         (VK_J, true, false, false) => Downloads,
         (VK_P, true, false, false) => Print,
         (VK_F11, false, false, false) => ToggleFullscreen,
+        (VK_OEM_PLUS | VK_ADD, true, _, false) => ZoomIn,
+        (VK_OEM_MINUS | VK_SUBTRACT, true, false, false) => ZoomOut,
+        (VK_0 | VK_NUMPAD0, true, false, false) => ZoomReset,
         _ => return None,
     })
 }

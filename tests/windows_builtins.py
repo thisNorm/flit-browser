@@ -33,6 +33,10 @@ PAGES = (
 )
 
 
+SETTINGS_ROUTES = (("site_permissions", 146, "/content"),
+                   ("clear_browsing_dialog", 147, "/clearBrowserData"))
+
+
 def command(browser, cid):
     browser.process.alive()
     require(browser.win.pid(browser.hwnd) == browser.process.pid, "Main window is no longer owned")
@@ -79,6 +83,13 @@ def builtin(browser, cid, host, titles, item):
 
     browser.wait(f"{host} committed title and chrome URL", ready)
     item["scope"] = "Activation only: expected document title and chrome host; no WebUI DOM inspection."
+
+
+def settings_route(browser, cid, path, item):
+    command(browser, cid)
+    expected = "chrome://settings" + path
+    browser.wait(f"{expected} committed", lambda: browser.address() == expected)
+    item["scope"] = "Settings route reached; no permissions changed or browsing data cleared."
 
 
 def find(browser, item):
@@ -159,6 +170,9 @@ def run(exe, work, evidence):
                 for name, cid, host, titles in PAGES:
                     check(results, name, lambda item, cid=cid, host=host, titles=titles:
                           builtin(browser, cid, host, titles, item), browser)
+                for name, cid, path in SETTINGS_ROUTES:
+                    check(results, name, lambda item, cid=cid, path=path:
+                          settings_route(browser, cid, path, item), browser)
                 check(results, "normal_close", lambda item: process.normal_close(browser.hwnd))
         finally:
             evidence["fixture"] = site.report()

@@ -1,5 +1,5 @@
 #define Product "Flit Browser"
-#define ProductVersion "0.4.0"
+#define ProductVersion "0.5.0"
 #ifndef BundleDir
   #error Build with Build-Setup.ps1 or pass --define=BundleDir=PATH to ISCC.
 #endif

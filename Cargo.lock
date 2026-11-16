@@ -355,9 +355,11 @@ dependencies = [
 
 [[package]]
 name = "flit-browser"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cef",
+ "serde",
+ "serde_json",
  "url",
  "windows-sys 0.61.2",
 ]

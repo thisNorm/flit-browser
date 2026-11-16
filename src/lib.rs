@@ -1,9 +1,11 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+mod bookmarks;
 mod chrome;
 mod keyboard;
 mod navigation;
 mod panel_motion;
+mod session;
 mod updater;
 mod window;
 
@@ -13,14 +15,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBo
 
 struct Launch {
     profile: PathBuf,
-    url: String,
+    url: Option<String>,
     default_profile: bool,
 }
 
 impl Launch {
     fn read() -> Result<Self, String> {
         let mut profile = None;
-        let mut url = navigation::HOME.to_owned();
+        let mut url = None;
         for argument in std::env::args_os().skip(1) {
             let Some(argument) = argument.to_str() else {
                 continue;
@@ -28,7 +30,7 @@ impl Launch {
             if let Some(value) = argument.strip_prefix("--flit-profile=") {
                 profile = Some(PathBuf::from(value));
             } else if let Some(value) = argument.strip_prefix("--flit-url=") {
-                url = navigation::address(value).map_err(str::to_owned)?;
+                url = Some(navigation::address(value).map_err(str::to_owned)?);
             }
         }
         let default_profile = profile.is_none();
@@ -85,19 +87,19 @@ impl Launch {
 }
 
 wrap_app! {
-    struct FlitApp { initial_url: String }
+    struct FlitApp { initial_url: Option<String>, profile: PathBuf }
     impl App {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
-            Some(FlitProcess::new(self.initial_url.clone()))
+            Some(FlitProcess::new(self.initial_url.clone(), self.profile.clone()))
         }
     }
 }
 
 wrap_browser_process_handler! {
-    struct FlitProcess { initial_url: String }
+    struct FlitProcess { initial_url: Option<String>, profile: PathBuf }
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
-            if let Err(message) = window::open(&self.initial_url) {
+            if let Err(message) = window::open(&self.profile, self.initial_url.as_deref()) {
                 window::startup_failed(message);
             }
         }
@@ -153,7 +155,7 @@ extern "C" fn RunWinMain(
     let path = CefString::from(launch.profile.to_str().expect("profile path validated"));
     updater::set_profile(launch.default_profile);
     let log = launch.profile.join("flit-cef.log");
-    let mut app = FlitApp::new(launch.url);
+    let mut app = FlitApp::new(launch.url, launch.profile);
     let settings = Settings {
         no_sandbox: 0,
         command_line_args_disabled: 1,

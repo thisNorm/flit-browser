@@ -21,7 +21,7 @@ curl.exe -fLO 'https://github.com/OWNER/REPO/releases/latest/download/Install-Fl
 ## GitHub에 올리기
 
 1. `Install-Flit.cmd`의 `FLIT_INSTALL_REPO`에 공개 저장소의 `OWNER/REPO`를 넣는다. 새 버전을 낼 때는 `FLIT_INSTALL_TAG`와 설치 EXE의 SHA-256도 같이 갱신한다.
-2. GitHub **Releases**에서 `v0.4.0` 릴리스에 같은 버전의 `Install-Flit.cmd`, `FlitSetup-x64.exe`, `FlitSetup-x64.exe.sha256`를 첨부한다.
+2. GitHub **Releases**에서 `v0.5.0` 릴리스에 같은 버전의 `Install-Flit.cmd`, `FlitSetup-x64.exe`, `FlitSetup-x64.exe.sha256`를 첨부한다.
 3. 공개 후 별도 폴더에 `Install-Flit.cmd`만 내려받아 설치 화면까지 열리는지 확인한다.
 
 최신 정식 릴리스를 찾아 무인 설치하려면 `.\Install-Flit.ps1 -Repository OWNER/REPO -Silent`를 사용한다. [GitHub 릴리스 다운로드 링크](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)
