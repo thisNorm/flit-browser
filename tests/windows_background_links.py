@@ -174,6 +174,10 @@ def run(exe, scratch, report):
     with fixture() as site:
         site.RequestHandlerClass = LinkHandler
         seed_profile(profile, scratch / "downloads", site.origin)
+        # Start as an existing profile that explicitly allows speculative loading.
+        (profile / "session.json").write_text(
+            json.dumps({"entries": [], "selected": 0, "defer_background": False}), encoding="utf-8"
+        )
         args = [f"--flit-profile={profile}", f"--flit-url={site.origin}{SOURCE}"]
         try:
             with OwnedProcess(Win32(), exe, args, report["launch"]) as process:

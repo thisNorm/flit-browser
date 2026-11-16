@@ -99,7 +99,7 @@ pub(crate) struct Session {
     pub restore: bool,
     #[serde(default = "default_true")]
     pub sidebar_open: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub defer_background: bool,
     #[serde(default, skip_serializing_if = "SearchEngine::is_default")]
     pub search_engine: SearchEngine,
@@ -401,7 +401,7 @@ mod tests {
                 additional_windows: Vec::new(),
                 restore: true,
                 sidebar_open: true,
-                defer_background: false,
+                defer_background: true,
                 search_engine: SearchEngine::default(),
             })
         );
@@ -646,7 +646,13 @@ mod tests {
                 fs::write(path, current).unwrap();
             }
             let restored = load(&profile.0).expect("recover the previous session");
-            assert_eq!(restored, session("https://example.com/previous"));
+            assert_eq!(
+                restored,
+                Session {
+                    defer_background: true,
+                    ..session("https://example.com/previous")
+                }
+            );
         }
 
         let mut current = session("https://example.com/current");

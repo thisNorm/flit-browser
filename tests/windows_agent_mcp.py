@@ -40,6 +40,7 @@ PAGES = {
 <label>Fixture password <input type="password" value="{PASSWORD}"></label>
 <div style="content-visibility:hidden"><a href="/never-visible">Hidden contents</a></div>
 <a href="/never-visible" style="visibility:hidden">Hidden visibility</a>
+<span style="opacity:0"><a href="/never-visible">Transparent link</a></span>
 <a href="/target">상세 보기</a><a href="/other">다른 페이지</a>
 <script>fetch('/blocked-post', {{method: 'POST', body: 'fixture'}}).catch(() => {{}});
 fetch('/dom-text').then(r => r.text()).then(text => {{
@@ -48,7 +49,9 @@ fetch('/dom-text').then(r => r.text()).then(text => {{
     "/target": (f'<title>{TARGET_TITLE}</title><h1 id="details">링크를 열었습니다</h1>'
                 '<a href="/source">돌아가기</a><a href="#details">이 페이지에서 이동</a>'),
     "/other": f'''<title>{OTHER_TITLE}</title><h1>두 번째 탭의 내용</h1>
-<input type="password" disabled><input type="password" hidden>''',
+<input type="password" disabled><input type="password" hidden>
+<div style="content-visibility:hidden"><input type="password"></div>
+<div style="opacity:0"><input type="password"></div>''',
     "/session": '<title>Flit MCP session</title><p>{}</p>',
 }
 for count in (60, 61):

@@ -315,6 +315,11 @@ struct PendingLink {
     source: Option<usize>,
 }
 
+struct PageChanges {
+    active: bool,
+    save: bool,
+}
+
 struct Shell {
     controls: Controls,
     id: usize,
@@ -328,6 +333,7 @@ struct Shell {
     filter: String,
     filter_cursor: FilterCursor,
     rows: Vec<Row>,
+    page_changes: Option<PageChanges>,
     page_counts: (usize, usize),
     deferred_restore: bool,
     font: HFONT,
@@ -361,7 +367,7 @@ thread_local! {
     static PRIVATE_CONTEXT: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESTORE_TABS: Cell<bool> = const { Cell::new(true) };
     static SIDEBAR_DEFAULT: Cell<bool> = const { Cell::new(true) };
-    static DEFER_BACKGROUND: Cell<bool> = const { Cell::new(false) };
+    static DEFER_BACKGROUND: Cell<bool> = const { Cell::new(true) };
     static SEARCH_ENGINE: Cell<SearchEngine> = const { Cell::new(SearchEngine::DuckDuckGo) };
     static MEMORY_SITES: RefCell<SiteExceptions> = RefCell::new(SiteExceptions::default());
     static RECOVERY_WINDOW: Cell<usize> = const { Cell::new(0) };
@@ -432,18 +438,22 @@ fn request_context() -> Result<Option<RequestContext>, &'static str> {
     Ok(Some(context))
 }
 
-fn update_page(key: usize, f: impl FnOnce(&mut Tab)) {
-    let window = change(|state| {
-        let index = state.tabs.iter().position(|tab| tab.key == key)?;
-        f(&mut state.tabs[index]);
-        Some(state.controls.window)
-    })
-    .flatten();
-    if let Some(window) = window {
-        unsafe {
-            PostMessageW(window, PAGE_CHANGED, key, 0);
+fn update_page(key: usize, save: bool, f: impl FnOnce(&mut Tab) -> bool) {
+    change(|s| {
+        let Some(tab) = s.tabs.iter_mut().find(|tab| tab.key == key) else {
+            return;
+        };
+        if !f(tab) {
+            return;
         }
-    }
+        let active = s.active == Some(key);
+        if let Some(pending) = &mut s.page_changes {
+            pending.active |= active;
+            pending.save |= save;
+        } else if unsafe { PostMessageW(s.controls.window, PAGE_CHANGED, 0, 0) } != 0 {
+            s.page_changes = Some(PageChanges { active, save });
+        }
+    });
 }
 
 fn browser_closed(window: usize, message: u32, key: usize) {
@@ -883,21 +893,37 @@ wrap_display_handler! {
                 if with_shell(|s| s.tabs.iter().any(|tab| tab.key == self.key && tab.url != url)) == Some(true) {
                     permissions::cancel_tab(self.window, self.key);
                 }
-                update_page(self.key, |tab| tab.url = url);
+                update_page(self.key, true, |tab| {
+                    if tab.url == url {
+                        return false;
+                    }
+                    tab.url = url;
+                    true
+                });
             }
         }
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
             let _scope = WindowScope::enter(self.window);
             let title = title.map(CefString::to_string).unwrap_or_default();
-            update_page(self.key, |tab| tab.title = title);
+            update_page(self.key, true, |tab| {
+                if tab.title == title {
+                    return false;
+                }
+                tab.title = title;
+                true
+            });
         }
         fn on_media_access_change(
             &self, _browser: Option<&mut Browser>, has_video_access: i32, has_audio_access: i32,
         ) {
             let _scope = WindowScope::enter(self.window);
-            update_page(self.key, |tab| {
-                tab.has_video_access = has_video_access != 0;
-                tab.has_audio_access = has_audio_access != 0;
+            update_page(self.key, false, |tab| {
+                let capture = (has_video_access != 0, has_audio_access != 0);
+                if (tab.has_video_access, tab.has_audio_access) == capture {
+                    return false;
+                }
+                (tab.has_video_access, tab.has_audio_access) = capture;
+                true
             });
         }
     }
@@ -1143,7 +1169,7 @@ pub(crate) fn open(
     let saved = session::load(profile);
     RESTORE_TABS.set(saved.as_ref().is_none_or(|state| state.restore));
     SIDEBAR_DEFAULT.set(saved.as_ref().is_none_or(|state| state.sidebar_open));
-    DEFER_BACKGROUND.set(saved.as_ref().is_some_and(|state| state.defer_background));
+    DEFER_BACKGROUND.set(saved.as_ref().is_none_or(|state| state.defer_background));
     SEARCH_ENGINE.set(
         saved
             .as_ref()
@@ -1392,6 +1418,7 @@ fn create_window(
                 filter: String::new(),
                 filter_cursor: FilterCursor::Off,
                 rows: Vec::new(),
+                page_changes: None,
                 page_counts: (0, 0),
                 deferred_restore: false,
                 font: null_mut(),
@@ -1725,7 +1752,7 @@ fn layout() {
         set_bounds(ui.find_close, l.width - d(38), f.top, d(24), d(29));
     }
     position_sidebar(ui, &l, false);
-    position_pages(&l, false);
+    position_active_page(ui.window, &l);
 }
 
 fn position_sidebar(ui: Controls, l: &Layout, animating: bool) {
@@ -1801,25 +1828,23 @@ fn set_visible(hwnd: HWND, show: bool) {
     }
 }
 
-fn position_pages(l: &Layout, active_only: bool) {
-    let Some((window, panels)) = with_shell(|s| {
-        let panels = s
-            .tabs
-            .iter()
-            .filter(|t| !active_only || Some(t.key) == s.active)
-            .map(|t| (t.panel, t.browser.clone()))
-            .collect::<Vec<_>>();
-        (s.controls.window, panels)
-    }) else {
-        return;
-    };
+fn position_page(l: &Layout, panel: HWND, browser: Option<&Browser>) {
     let p = l.page_bounds();
     let (width, height) = (p.right - p.left, p.bottom - p.top);
-    for (panel, browser) in panels {
-        set_bounds(panel, p.left, p.top, width, height);
-        if let Some(host) = browser.and_then(|browser| browser.host()) {
-            fit_browser(panel, &host);
-        }
+    set_bounds(panel, p.left, p.top, width, height);
+    if let Some(host) = browser.and_then(|browser| browser.host()) {
+        fit_browser(panel, &host);
+    }
+}
+
+fn position_active_page(window: HWND, l: &Layout) {
+    if let Some((panel, browser)) = with_shell(|s| {
+        let tab = s.tabs.iter().find(|tab| Some(tab.key) == s.active)?;
+        Some((tab.panel, tab.browser.clone()))
+    })
+    .flatten()
+    {
+        position_page(l, panel, browser.as_ref());
     }
     unsafe {
         InvalidateRect(window, null(), 0);
@@ -2078,6 +2103,10 @@ fn refresh_rows(ensure_visible: bool) {
 
 fn refresh(force_address: bool) {
     refresh_rows(force_address);
+    refresh_active_page(force_address);
+}
+
+fn refresh_active_page(force_address: bool) {
     refresh_load_controls();
     let Some((ui, url, title, capture, web)) = with_shell(|s| {
         let tab = s.tabs.iter().find(|t| Some(t.key) == s.active)?;
@@ -2190,52 +2219,54 @@ fn select_tab(index: usize, load_page: bool) {
         }
         close_find(false);
     }
-    let Some((key, panels, closing)) = change(|s| {
-        let tab = s.tabs.get_mut(index)?;
-        if tab.unloading || tab.retiring {
-            return None;
-        }
-        let key = tab.key;
-        tab.background_warm = false;
-        s.deferred_restore = !load_page && tab.browser.is_none() && tab.url != HOME;
-        s.active = Some(key);
-        Some((
-            key,
-            s.tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    (
-                        t.panel,
-                        t.native_window.clone(),
-                        i == index,
-                        t.close_requested,
-                    )
-                })
-                .collect::<Vec<_>>(),
-            s.closing,
-        ))
-    })
-    .flatten() else {
+    let Some((window, key, panel, browser, native, close_requested, previous, closing)) =
+        change(|s| {
+            let tab = s.tabs.get_mut(index)?;
+            if tab.unloading || tab.retiring {
+                return None;
+            }
+            let key = tab.key;
+            tab.background_warm = false;
+            s.deferred_restore = !load_page && tab.browser.is_none() && tab.url != HOME;
+            let previous = s.active.replace(key).filter(|&previous| previous != key);
+            let (panel, browser, native, close_requested) = (
+                tab.panel,
+                tab.browser.clone(),
+                tab.native_window.clone(),
+                tab.close_requested,
+            );
+            let previous = previous.and_then(|key| {
+                let tab = s.tabs.iter().find(|tab| tab.key == key)?;
+                Some((tab.panel, tab.native_window.clone()))
+            });
+            Some((
+                s.controls.window,
+                key,
+                panel,
+                browser,
+                native,
+                close_requested,
+                previous,
+                s.closing,
+            ))
+        })
+        .flatten()
+    else {
         return;
     };
-    for (panel, native, visible, closing) in panels {
-        if !visible {
-            if let Some(native) = native.as_ref().filter(|native| native.is_closed() == 0) {
-                // An ancestor HWND hide alone leaves Chrome's WebContents visible.
-                native.hide();
-            }
+    if let Some((previous, native)) = previous {
+        if let Some(native) = native.filter(|native| native.is_closed() == 0) {
+            // An ancestor HWND hide alone leaves Chrome's WebContents visible.
+            native.hide();
         }
-        unsafe {
-            ShowWindow(panel, if visible { SW_SHOWNA } else { SW_HIDE });
-        }
-        if visible && !closing {
-            if let Some(native) = native.filter(|native| native.is_closed() == 0) {
-                native.show();
-            }
-        }
+        set_visible(previous, false);
     }
-    layout();
+    // Hidden views keep their old bounds until they become visible again.
+    position_page(&current_layout(window), panel, browser.as_ref());
+    set_visible(panel, true);
+    if !close_requested && let Some(native) = native.filter(|native| native.is_closed() == 0) {
+        native.show();
+    }
     refresh(true);
     if !closing && load_page {
         if let Err(message) = load_deferred(key) {
@@ -2266,18 +2297,24 @@ fn open_tab(url: &str, foreground: bool, source: Option<usize>) -> Result<(), &'
 
 fn warm_background_tab(key: usize) -> Result<(), &'static str> {
     const LIMIT: usize = 2;
-    if DEFER_BACKGROUND.get() || physical_memory_low() {
+    if DEFER_BACKGROUND.get() {
+        return Ok(());
+    }
+    let budget_full = WINDOWS.with(|windows| {
+        windows
+            .borrow()
+            .values()
+            .flat_map(|s| &s.tabs)
+            .filter(|tab| tab.background_warm)
+            .take(LIMIT)
+            .count()
+            == LIMIT
+    });
+    if budget_full || physical_memory_low() {
         return Ok(());
     }
     let reserved = change(|s| {
-        if s.active == Some(key)
-            || s.tabs
-                .iter()
-                .filter(|t| t.background_warm)
-                .take(LIMIT)
-                .count()
-                == LIMIT
-        {
+        if s.active == Some(key) {
             return false;
         }
         if let Some(tab) = s
@@ -2328,9 +2365,6 @@ fn append_tab(
     })
     .flatten()
     .ok_or("The Flit window is not available.")?;
-    let l = current_layout(ui.window);
-    let p = l.page_bounds();
-    let (width, height) = (p.right - p.left, p.bottom - p.top);
     let panel = child(
         ui.window,
         0,
@@ -2348,7 +2382,6 @@ fn append_tab(
         }
         return Err("Could not initialize the new-tab page.");
     }
-    set_bounds(panel, p.left, p.top, width, height);
     let index = change(|s| {
         s.tabs.push(Tab {
             key,
@@ -2433,6 +2466,7 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
     if let Some(browser) = existing {
         return Ok(browser);
     }
+    position_page(&current_layout(ui.window), panel, None);
     let mut context = request_context()?;
     let mut rect = RECT::default();
     unsafe {
@@ -3567,7 +3601,7 @@ fn tick_sidebar(window: HWND) {
     }
     let l = current_layout(window);
     position_sidebar(ui, &l, true);
-    position_pages(&l, true);
+    position_active_page(window, &l);
 }
 
 fn cycle_tab(previous: bool) {
@@ -4892,7 +4926,7 @@ fn free_background_memory(window: HWND) {
         return;
     }
     let message = wide(&format!(
-        "Unload up to {} background tabs? They stay in the sidebar and reload when selected.\n\nKept sites, pinned tabs, downloads, camera or microphone use, and inspected tabs are skipped. Other audio and unsaved work can stop or be lost.",
+        "Unload up to {} background tabs? They stay in the sidebar and reload when selected.\n\nKept sites, pinned tabs, downloads, camera or microphone use, and inspected tabs are skipped. Back and Forward history is cleared in the unloaded tabs. Other audio and unsaved work can stop or be lost.",
         keys.len()
     ));
     if unsafe {
@@ -4946,7 +4980,7 @@ fn unload_tab(key: usize) {
         MessageBoxW(
             window,
             windows_sys::w!(
-                "This tab will reload when you select it. Audio and calls will stop, and unsaved changes may be lost. Unload the tab?"
+                "This tab will reload when you select it. Back and Forward history will be cleared, audio and calls will stop, and unsaved changes may be lost. Unload the tab?"
             ),
             windows_sys::w!("Unload tab?"),
             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
@@ -5883,8 +5917,15 @@ unsafe extern "system" fn window_proc(
             0
         }
         PAGE_CHANGED => {
-            refresh(false);
-            queue_session_save();
+            if let Some(pending) = change(|s| s.page_changes.take()).flatten() {
+                refresh_rows(false);
+                if pending.active {
+                    refresh_active_page(false);
+                }
+                if pending.save {
+                    queue_session_save();
+                }
+            }
             0
         }
         LOAD_STATE_CHANGED => {

@@ -43,11 +43,10 @@ const READ_DOM: &str = r#"(() => {
   const normalize = text => text.replace(/[^\S\r\n]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
   const raw = root ? root.innerText || '' : '';
   const text = normalize(raw.slice(0, 24000));
-  const visible = node => node.getClientRects().length && getComputedStyle(node).visibility === 'visible';
+  const visibility = {visibilityProperty: true, opacityProperty: true};
   const links = [];
   let linksTruncated = false;
   const anchors = root?.getElementsByTagName('a');
-  const visibility = {visibilityProperty: true};
   // Indexed access lets us stop at the first extra eligible link.
   if (anchors) for (let i = 0; ; i++) {
     const a = anchors.item(i);
@@ -59,9 +58,13 @@ const READ_DOM: &str = r#"(() => {
     if (links.length >= 60) { linksTruncated = true; break; }
     links.push({ url: href, text: normalize((a.innerText || a.getAttribute('aria-label') || a.title || '').slice(0, 256)) });
   }
+  let loginFormDetected = false;
+  for (const input of document.querySelectorAll('input[type=password]:enabled')) {
+    if (input.checkVisibility(visibility)) { loginFormDetected = true; break; }
+  }
   return { url: location.href, title: document.title.slice(0, 512),
            text, links, truncated: raw.length > 24000 || linksTruncated,
-           login_form_detected: [...document.querySelectorAll('input[type=password]:enabled')].some(visible) };
+           login_form_detected: loginFormDetected };
 })()"#;
 
 thread_local! {
@@ -828,7 +831,7 @@ fn page_result(id: u32, mut page: Page) -> Result<Value, String> {
 }
 
 fn receive(id: u32, pending: Pending, bytes: Option<&[u8]>) -> Result<(), String> {
-    let result: Value = bytes
+    let mut result: Value = bytes
         .filter(|bytes| bytes.len() <= 512 * 1024)
         .and_then(|bytes| serde_json::from_slice(bytes).ok())
         .ok_or("The page was unavailable or the page query exceeded its size limit.")?;
@@ -869,8 +872,8 @@ fn receive(id: u32, pending: Pending, bytes: Option<&[u8]>) -> Result<(), String
         }
         Stage::Read => {
             let page = result
-                .pointer("/result/value")
-                .cloned()
+                .pointer_mut("/result/value")
+                .map(Value::take)
                 .and_then(|data| serde_json::from_value(data).ok())
                 .ok_or("This document did not return a readable page snapshot.")?;
             let _ = pending.reply.send(page_result(id, page));
