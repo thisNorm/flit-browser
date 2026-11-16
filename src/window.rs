@@ -128,6 +128,7 @@ const IMPORT_EDGE_BOOKMARKS: usize = 186;
 const REOPEN_RECENT: usize = 187;
 pub(crate) const TAB_STATUS: usize = 188;
 const BOOKMARK_ALL_TABS: usize = 189;
+const DOWNLOADS_BUTTON: usize = 190;
 const RECENT_MENU_FIRST: usize = 0x400;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
@@ -143,6 +144,7 @@ const EXIT_NEXT_WINDOW: u32 = WM_APP + 11;
 const TAB_DOWNLOAD_ENDED: u32 = WM_APP + 12;
 const LOAD_RESTORED_WINDOW: u32 = WM_APP + 13;
 const SELECT_POPUP_TAB: u32 = WM_APP + 14;
+const DOWNLOADS_CHANGED: u32 = WM_APP + 15;
 const TAB_PIN: usize = 1;
 const TAB_DUPLICATE: usize = 2;
 const TAB_MUTE: usize = 3;
@@ -160,6 +162,7 @@ const SIDEBAR_TIMER: usize = 1;
 const RECOVERY_TIMER: usize = 2;
 const SETTINGS_URL: &str = "chrome://settings/";
 const CLEAR_DATA_URL: &str = "chrome://settings/clearBrowserData";
+const DOWNLOADS_URL: &str = "chrome://downloads/";
 
 #[derive(Clone, Copy)]
 struct Controls {
@@ -178,6 +181,7 @@ struct Controls {
     tab_status: HWND,
     empty: HWND,
     menu: HWND,
+    downloads: HWND,
     bookmark: HWND,
     find_text: HWND,
     find_status: HWND,
@@ -187,7 +191,7 @@ struct Controls {
 }
 
 impl Controls {
-    fn chrome(self) -> [HWND; 13] {
+    fn chrome(self) -> [HWND; 14] {
         [
             self.sidebar,
             self.back,
@@ -197,6 +201,7 @@ impl Controls {
             self.address,
             self.go,
             self.bookmark,
+            self.downloads,
             self.menu,
             self.add,
             self.filter,
@@ -338,6 +343,7 @@ struct Shell {
     sidebar_motion: Motion,
     tooltip: HWND,
     reload_is_stop: bool,
+    active_downloads: usize,
     filter: String,
     filter_cursor: FilterCursor,
     rows: Vec<Row>,
@@ -1180,6 +1186,7 @@ fn tooltips(ui: Controls) -> HWND {
         (ui.go, w!("Open (Enter), or open in a new tab (Alt+Enter)")),
         (ui.add, w!("New tab (Ctrl+T)")),
         (ui.menu, w!("Flit menu")),
+        (ui.downloads, w!("Downloads (Ctrl+J)")),
         (ui.bookmark, w!("Bookmark this page (Ctrl+D)")),
         (ui.find_previous, w!("Previous match")),
         (ui.find_next, w!("Next match")),
@@ -1421,6 +1428,7 @@ fn create_window(
         tab_status: static_label(window, TAB_STATUS, "No pages loaded"),
         empty: static_label(window, EMPTY, "No matching tabs"),
         menu: button(window, MENU, "Flit menu"),
+        downloads: button(window, DOWNLOADS_BUTTON, "Downloads"),
         bookmark: button(window, SAVE_BOOKMARK, "Bookmark this page"),
         find_text: edit(window, FIND_TEXT),
         find_status: static_label(window, FIND_STATUS, ""),
@@ -1493,6 +1501,7 @@ fn create_window(
                 sidebar_motion: Motion::new(sidebar_open),
                 tooltip,
                 reload_is_stop: false,
+                active_downloads: 0,
                 filter: String::new(),
                 filter_cursor: FilterCursor::Off,
                 rows: Vec::new(),
@@ -1682,7 +1691,7 @@ impl Layout {
             address_frame: RECT {
                 left: d(170),
                 top: d(10),
-                right: (width - d(if sidebar_open { 62 } else { 101 })).max(d(245)),
+                right: (width - d(if sidebar_open { 98 } else { 137 })).max(d(245)),
                 bottom: d(50),
             },
             filter_frame: RECT {
@@ -1769,9 +1778,7 @@ fn fit_browser(panel: HWND, host: &BrowserHost) {
 }
 
 fn layout() {
-    let Some((ui, sidebar_open, find_open)) =
-        with_shell(|s| (s.controls, s.sidebar_open, s.find_open))
-    else {
+    let Some((ui, find_open)) = with_shell(|s| (s.controls, s.find_open)) else {
         return;
     };
     let l = current_layout(ui.window);
@@ -1786,6 +1793,7 @@ fn layout() {
         ui.address,
         ui.go,
         ui.bookmark,
+        ui.downloads,
         ui.menu,
         ui.add,
     ] {
@@ -1806,10 +1814,8 @@ fn layout() {
     );
     set_bounds(ui.bookmark, a.right - d(61), a.top + d(5), d(26), d(30));
     set_bounds(ui.go, a.right - d(33), a.top + d(5), d(24), d(30));
+    set_bounds(ui.downloads, l.width - d(83), d(15), d(30), d(30));
     set_bounds(ui.menu, l.width - d(47), d(15), d(30), d(30));
-    if !sidebar_open && l.side == 0 {
-        set_bounds(ui.add, l.width - d(93), d(10), d(34), d(40));
-    }
     for hwnd in ui.find() {
         unsafe {
             ShowWindow(hwnd, if find_open { SW_SHOWNA } else { SW_HIDE });
@@ -1888,7 +1894,7 @@ fn position_sidebar(ui: Controls, l: &Layout, animating: bool) {
             d(34),
         );
     } else {
-        set_bounds(ui.add, l.width - d(93), d(10), d(34), d(40));
+        set_bounds(ui.add, l.width - d(129), d(10), d(34), d(40));
     }
     if !animating {
         unsafe {
@@ -2986,6 +2992,26 @@ fn tab_download_close(window: HWND, key: usize, count: usize) {
     }) == Some(true);
     if scheduled {
         complete_deferred_close(window, key);
+    }
+}
+
+pub(crate) fn downloads_changed(window: usize) {
+    unsafe { PostMessageW(window as HWND, DOWNLOADS_CHANGED, 0, 0) };
+}
+
+fn refresh_downloads_button(window: HWND) {
+    let count = download_guard::count(window as usize, None);
+    let button = change(|s| {
+        (std::mem::replace(&mut s.active_downloads, count) != count).then_some(s.controls.downloads)
+    })
+    .flatten();
+    if let Some(button) = button {
+        if count == 0 {
+            set_text(button, "Downloads");
+        } else {
+            set_text(button, &format!("Downloads ({count} active)"));
+        }
+        unsafe { InvalidateRect(button, null(), 0) };
     }
 }
 
@@ -5701,6 +5727,9 @@ unsafe extern "system" fn window_proc(
                 GO => ButtonKind::Go,
                 SAVE_BOOKMARK => ButtonKind::Bookmark,
                 SITE_INFO => ButtonKind::SiteInfo,
+                DOWNLOADS_BUTTON => {
+                    ButtonKind::Downloads(with_shell(|s| s.active_downloads != 0) == Some(true))
+                }
                 MENU => ButtonKind::Menu,
                 NEW_TAB
                     if with_shell(|s| !s.sidebar_open && !s.sidebar_motion.running())
@@ -5849,7 +5878,10 @@ unsafe extern "system" fn window_proc(
                 IMPORT_BOOKMARKS => run_bookmark_request(BookmarkRequest::Import),
                 EXPORT_BOOKMARKS => run_bookmark_request(BookmarkRequest::Export),
                 SITE_INFO => show_site_info(window),
-                DOWNLOADS => open_builtin("chrome://downloads/"),
+                DOWNLOADS | DOWNLOADS_BUTTON => {
+                    reveal_toolbar(window);
+                    open_builtin(DOWNLOADS_URL);
+                }
                 SETTINGS if !private() => open_builtin(SETTINGS_URL),
                 SITE_PERMISSIONS if !private() => open_builtin("chrome://settings/content"),
                 CLEAR_BROWSING if !private() => open_builtin(CLEAR_DATA_URL),
@@ -6005,6 +6037,10 @@ unsafe extern "system" fn window_proc(
         }
         TAB_DOWNLOAD_ENDED => {
             complete_deferred_close(window, wp);
+            0
+        }
+        DOWNLOADS_CHANGED => {
+            refresh_downloads_button(window);
             0
         }
         TAB_CLOSE_CANCELLED => {

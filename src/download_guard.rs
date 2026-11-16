@@ -22,11 +22,15 @@ pub(crate) fn count(window: usize, tab: Option<usize>) -> usize {
 
 // Once the source browser is destroyed, CEF stops delivering updates for its items.
 pub(crate) fn clear_browser(window: usize, browser_id: i32) {
-    ACTIVE.with(|items| {
-        items
-            .borrow_mut()
-            .retain(|&(owner, _, id, _)| (owner, id) != (window, browser_id));
+    let changed = ACTIVE.with(|items| {
+        let mut items = items.borrow_mut();
+        let before = items.len();
+        items.retain(|&(owner, _, id, _)| (owner, id) != (window, browser_id));
+        items.len() != before
     });
+    if changed {
+        crate::window::downloads_changed(window);
+    }
 }
 
 pub(crate) fn clear_window(window: usize) {
@@ -67,16 +71,19 @@ wrap_download_handler! {
             }
             let id = (self.window, self.key, browser.identifier(), item.id());
             let in_progress = item.is_in_progress() != 0;
-            let ended = ACTIVE.with(|items| {
+            let changed = ACTIVE.with(|items| {
+                let mut items = items.borrow_mut();
                 if in_progress {
-                    items.borrow_mut().insert(id);
-                    false
+                    items.insert(id)
                 } else {
-                    items.borrow_mut().remove(&id)
+                    items.remove(&id)
                 }
             });
-            if ended && self.key != 0 {
-                crate::window::download_ended(self.window, self.key, item.is_complete() != 0);
+            if changed {
+                crate::window::downloads_changed(self.window);
+                if !in_progress && self.key != 0 {
+                    crate::window::download_ended(self.window, self.key, item.is_complete() != 0);
+                }
             }
         }
     }

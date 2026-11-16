@@ -239,8 +239,8 @@ def uia(browser, hwnd, *, confirm=False):
     return json.loads(result.stdout)
 
 
-def web_controls(browser):
-    require(browser.address() == EXTENSIONS, "The active tab is not chrome://extensions/")
+def web_controls(browser, *, expected_url=EXTENSIONS):
+    require(browser.address() == expected_url, f"The active tab is not {expected_url}")
     return uia(browser, browser.hwnd)
 
 
@@ -268,14 +268,14 @@ def card_button(browser, control_id, *, state=None):
     return browser.wait(f"synthetic card {control_id} {state or ''}".strip(), find)
 
 
-def click_web(browser, control):
+def click_web(browser, control, *, expected_url=EXTENSIONS):
     win, process = browser.win, browser.process
-    require(browser.address() == EXTENSIONS, "Extensions tab changed before WebUI click")
-    panel = browser.wait("owned Extensions page panel", browser.page_panel)
+    require(browser.address() == expected_url, f"The active tab changed before clicking {expected_url}")
+    panel = browser.wait("owned WebUI page panel", browser.page_panel)
     user = C.WinDLL("user32", use_last_error=True)
     is_child = api(user, "IsChild", W.BOOL, W.HWND, W.HWND)
     require(win.pid(browser.hwnd) == win.pid(panel) == process.pid and is_child(browser.hwnd, panel),
-            "Extensions panel is not an owned descendant of the Flit window")
+            "WebUI panel is not an owned descendant of the Flit window")
 
     def widgets(parent):
         for child in win.visible_children(parent):
@@ -285,10 +285,10 @@ def click_web(browser, control):
                 yield from widgets(child)
 
     matches = list(widgets(panel))
-    require(len(matches) == 1, f"Expected one visible Extensions render widget, got {matches}")
+    require(len(matches) == 1, f"Expected one visible WebUI render widget, got {matches}")
     widget = matches[0]
     require(win.pid(widget) == process.pid and is_child(panel, widget),
-            "Extensions render widget is not an owned descendant of the active panel")
+            "WebUI render widget is not an owned descendant of the active panel")
     bounds = control["rect"]
     require(isinstance(bounds, list) and len(bounds) == 4, f"No UIA bounds for {control['id']}")
     x, y, width, height = bounds
@@ -300,7 +300,7 @@ def click_web(browser, control):
         left, top, right, bottom = win.rect(widget, client=True)
         require(left <= point.x < right and top <= point.y < bottom, f"{control['id']} is outside its owned widget")
         require(is_child(browser.hwnd, panel) and is_child(panel, widget),
-                "Extensions widget ancestry changed before click")
+                "WebUI widget ancestry changed before click")
         packed = point.x | (point.y << 16)
         post(process, widget, 0x0201, 1, packed)  # WM_LBUTTONDOWN, MK_LBUTTON
         post(process, widget, 0x0202, 0, packed)  # WM_LBUTTONUP

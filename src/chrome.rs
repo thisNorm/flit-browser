@@ -79,6 +79,7 @@ pub(crate) enum ButtonKind {
     NewTabCompact,
     Bookmark,
     SiteInfo,
+    Downloads(bool),
     Menu,
 }
 
@@ -334,7 +335,7 @@ fn paint_strip(dc: HDC, bounds: RECT, layout: &Layout, colors: &Palette) {
         for plate in [
             rect(d(10), d(8), d(56), d(52)),
             rect(d(57), d(8), d(164), d(52)),
-            rect(layout.width - d(55), d(8), layout.width - d(9), d(52)),
+            rect(layout.width - d(91), d(8), layout.width - d(9), d(52)),
         ] {
             glass_plate(dc, plate, d(37), colors.navigation, colors, layout.dpi);
         }
@@ -557,6 +558,11 @@ fn button_icon(dc: HDC, kind: ButtonKind, center: (i32, i32), dpi: i32, color: C
                 ],
             );
         }
+        ButtonKind::Downloads(_) => {
+            stroke(dc, center, dpi, [(0, -7), (0, 2)]);
+            stroke(dc, center, dpi, [(-4, -2), (0, 2), (4, -2)]);
+            stroke(dc, center, dpi, [(-6, 3), (-6, 6), (6, 6), (6, 3)]);
+        }
         ButtonKind::Menu => {
             for y in [-5, 0, 5] {
                 stroke(dc, center, dpi, [(-1, y), (2, y)]);
@@ -620,6 +626,25 @@ pub(crate) fn draw_button(item: &DRAWITEMSTRUCT, kind: ButtonKind, dpi: i32) {
     };
     let y = r.top + (r.bottom - r.top) / 2;
     button_icon(dc, kind, (x, y), dpi, foreground);
+    if matches!(kind, ButtonKind::Downloads(true)) {
+        let badge = if colors.high_contrast {
+            foreground
+        } else {
+            colors.active_text
+        };
+        rounded(
+            dc,
+            rect(
+                x + px(7, dpi),
+                y - px(12, dpi),
+                x + px(13, dpi),
+                y - px(6, dpi),
+            ),
+            px(6, dpi),
+            badge,
+            None,
+        );
+    }
     if labeled {
         text(
             item,
