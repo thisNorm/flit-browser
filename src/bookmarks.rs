@@ -4,10 +4,14 @@ use cef::{
 
 pub(crate) const MANAGER_URL: &str = "chrome://bookmarks/";
 
-pub(crate) struct SaveRequest(CefString);
+pub(crate) enum Request {
+    Save(CefString),
+    Import,
+    Export,
+}
 
-impl SaveRequest {
-    pub(crate) fn new(url: &str, title: &str) -> Option<Self> {
+impl Request {
+    pub(crate) fn save(url: &str, title: &str) -> Option<Self> {
         let parsed = url::Url::parse(url).ok()?;
         if !matches!(parsed.scheme(), "http" | "https")
             || parsed.host().is_none()
@@ -32,7 +36,7 @@ impl SaveRequest {
         if json.to_string().is_empty() {
             return None;
         }
-        Some(Self(json))
+        Some(Self::Save(json))
     }
 
     /// Consume a pending request on the UI thread after the owned manager's main-frame load.
@@ -46,8 +50,9 @@ impl SaveRequest {
             return false;
         }
         // The renderer may have started another navigation since the native frame check.
-        let script = format!(
-            r#"(async () => {{
+        let script = match self {
+            Self::Save(json) => format!(
+                r#"(async () => {{
     if (window !== window.top || location.href !== "chrome://bookmarks/") return;
     try {{
         const {{url, title}} = {};
@@ -63,8 +68,28 @@ impl SaveRequest {
         document.title = "Bookmarks — Could not save page";
     }}
 }})();"#,
-            self.0,
-        );
+                json
+            ),
+            transfer => {
+                let method = if matches!(transfer, Self::Import) {
+                    "import"
+                } else {
+                    "export"
+                };
+                // Use the same API as the Bookmark Manager menu. The native
+                // file picker and Chromium own the file and bookmark writes.
+                format!(
+                    r#"(async () => {{
+    if (window !== window.top || location.href !== "chrome://bookmarks/") return;
+    try {{
+        await chrome.bookmarkManagerPrivate.{method}();
+    }} catch {{
+        document.title = "Bookmarks — Could not open file picker";
+    }}
+}})();"#
+                )
+            }
+        };
         frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
         true
     }

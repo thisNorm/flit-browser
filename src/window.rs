@@ -1,5 +1,5 @@
 use crate::{
-    bookmarks::{MANAGER_URL, SaveRequest},
+    bookmarks::{MANAGER_URL, Request as BookmarkRequest},
     chrome::{self, ButtonKind},
     download_guard,
     keyboard::{self, Shortcut},
@@ -108,6 +108,8 @@ const VAULT_SAVE: usize = 170;
 const VAULT_REMOVE: usize = 171;
 const EXIT_FLIT: usize = 172;
 const RECOVERY_COPY: usize = 173;
+const IMPORT_BOOKMARKS: usize = 174;
+const EXPORT_BOOKMARKS: usize = 175;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
 const CLOSE_BY_KEY: u32 = WM_APP + 3;
@@ -231,7 +233,7 @@ struct Tab {
     muted: bool,
     unloading: bool,
     unloaded: bool,
-    bookmark: Option<SaveRequest>,
+    bookmark: Option<BookmarkRequest>,
 }
 
 enum ClosedItem {
@@ -3333,17 +3335,26 @@ fn bookmark_page() {
     }
     let request = with_shell(|s| {
         let tab = s.tabs.iter().find(|tab| Some(tab.key) == s.active)?;
-        SaveRequest::new(&session::stored_url(&tab.url)?, &clean(&tab.title, 240))
+        BookmarkRequest::save(&session::stored_url(&tab.url)?, &clean(&tab.title, 240))
     })
     .flatten();
     let Some(request) = request else {
         open_builtin(MANAGER_URL);
         return;
     };
+    run_bookmark_request(request);
+}
+
+fn run_bookmark_request(request: BookmarkRequest) {
+    if exiting() || with_shell(|s| !s.private && !s.closing) != Some(true) {
+        return;
+    }
     let existing = with_shell(|s| {
         s.tabs
             .iter()
-            .find(|tab| tab.url == MANAGER_URL)
+            .find(|tab| {
+                tab.url == MANAGER_URL && !tab.retiring && !tab.unloading && !tab.close_requested
+            })
             .map(|t| t.key)
     })
     .flatten();
@@ -3531,6 +3542,8 @@ fn show_menu(ui: Controls) {
     separator();
     add(SAVE_BOOKMARK, "Bookmark this page\tCtrl+D", !private());
     add(BOOKMARKS, "Manage bookmarks\tCtrl+Shift+O", !private());
+    add(IMPORT_BOOKMARKS, "Import bookmarks from HTML…", !private());
+    add(EXPORT_BOOKMARKS, "Export bookmarks to HTML…", !private());
     add(HISTORY, "History\tCtrl+H", !private());
     add(DOWNLOADS, "Downloads\tCtrl+J", true);
     separator();
@@ -4601,6 +4614,8 @@ unsafe extern "system" fn window_proc(
                 HISTORY if !private() => open_builtin("chrome://history/"),
                 BOOKMARKS if !private() => open_builtin(MANAGER_URL),
                 SAVE_BOOKMARK => bookmark_page(),
+                IMPORT_BOOKMARKS => run_bookmark_request(BookmarkRequest::Import),
+                EXPORT_BOOKMARKS => run_bookmark_request(BookmarkRequest::Export),
                 SITE_INFO => show_site_info(window),
                 DOWNLOADS => open_builtin("chrome://downloads/"),
                 SETTINGS if !private() => open_builtin(SETTINGS_URL),
