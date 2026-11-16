@@ -122,6 +122,7 @@ def recovered_windows(process, site, before, evidence):
         window = Window(process, site, hwnd)
         label = window.wait(f"saved selected address in HWND 0x{hwnd:x}", lambda: expected.get(window.address()))
         require(label not in windows, f"Multiple HWNDs restored {label}")
+        send(window, 0x0006, 1)  # WM_ACTIVATE, WA_ACTIVE with a zero minimize word.
         check_window(window, site, label, before, observed)
         windows[label] = window
     require(Window.handles(process) == handles, "Restoring the session added or lost a window")
@@ -193,6 +194,11 @@ def run(exe, profile, report):
 
             manual_before = before_restart()
             from_copy = first_window.open_window(RECOVERY_COPY, "manual_recovery_copy", evidence)
+            from_copy.wait("saved address in the backup window",
+                           lambda: from_copy.address() == site.origin + site.paths["normal-restart"])
+            require(loaded_panels(from_copy) == 0 and requests(site, "normal-restart") == manual_before["normal-restart"],
+                    "Opening the backup loaded a background window before activation")
+            send(from_copy, 0x0006, 1)  # Activate before checking the restored page.
             check_window(from_copy, site, "second", manual_before, evidence["manual_recovery_copy"])
             check_idle(site, manual_before["idle"], evidence["manual_recovery_copy"])
             await_snapshot(first_window, primary, expected, evidence, "after_manual_copy")

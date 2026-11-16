@@ -787,7 +787,7 @@ pub(crate) fn field_colors(dc: HDC, id: usize) -> HBRUSH {
     }
 }
 
-pub(crate) fn paint_start(window: HWND, font: HFONT) {
+pub(crate) fn paint_start(window: HWND, font: HFONT, waiting: bool) {
     let mut paint = PAINTSTRUCT::default();
     let dc = unsafe { BeginPaint(window, &mut paint) };
     if !dc.is_null() {
@@ -832,7 +832,9 @@ pub(crate) fn paint_start(window: HWND, font: HFONT) {
                 SetBkMode(dc, TRANSPARENT as i32);
                 DrawTextW(
                     dc,
-                    if crate::window::private() {
+                    if waiting {
+                        windows_sys::w!("Tab ready to load")
+                    } else if crate::window::private() {
                         windows_sys::w!("Private browsing")
                     } else {
                         windows_sys::w!("Flit")
@@ -860,7 +862,9 @@ pub(crate) fn paint_start(window: HWND, font: HFONT) {
             unsafe {
                 DrawTextW(
                     dc,
-                    if crate::window::private() {
+                    if waiting {
+                        windows_sys::w!("Switch to this window to load the selected page.")
+                    } else if crate::window::private() {
                         windows_sys::w!(
                             "Flit clears private browsing data when the last private window closes."
                         )

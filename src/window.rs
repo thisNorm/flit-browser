@@ -42,9 +42,9 @@ use windows_sys::Win32::{
             SetThreadDpiAwarenessContext,
         },
         Input::KeyboardAndMouse::{
-            EnableWindow, GetCapture, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture,
-            SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_MENU, VK_RETURN,
-            VK_SHIFT, VK_TAB, VK_UP,
+            EnableWindow, GetActiveWindow, GetCapture, GetFocus, GetKeyState, IsWindowEnabled,
+            ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE,
+            VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
         },
         Shell::{DefSubclassProc, SetWindowSubclass},
         WindowsAndMessaging::*,
@@ -138,6 +138,7 @@ const LOAD_STATE_CHANGED: u32 = WM_APP + 9;
 const STOP_LOADING: u32 = WM_APP + 10;
 const EXIT_NEXT_WINDOW: u32 = WM_APP + 11;
 const TAB_DOWNLOAD_ENDED: u32 = WM_APP + 12;
+const LOAD_RESTORED_WINDOW: u32 = WM_APP + 13;
 const TAB_PIN: usize = 1;
 const TAB_DUPLICATE: usize = 2;
 const TAB_MUTE: usize = 3;
@@ -325,6 +326,7 @@ struct Shell {
     filter_cursor: FilterCursor,
     rows: Vec<Row>,
     page_counts: (usize, usize),
+    deferred_restore: bool,
     font: HFONT,
     font_dpi: i32,
     find_open: bool,
@@ -1217,6 +1219,9 @@ fn open_saved_windows(saved: Session, initial_url: Option<&str>) -> Result<(), &
     OPENING_SESSION.set(false);
     if let Some(window) = primary.as_ref().ok().copied().or_else(normal_window) {
         let _scope = WindowScope::enter(window as usize);
+        if primary.is_err() {
+            load_waiting_window(window);
+        }
         queue_session_save();
         if incomplete || primary.is_err() {
             set_text(
@@ -1351,6 +1356,7 @@ fn create_window(
                 filter_cursor: FilterCursor::Off,
                 rows: Vec::new(),
                 page_counts: (0, 0),
+                deferred_restore: false,
                 font: null_mut(),
                 font_dpi: 0,
                 find_open: false,
@@ -1400,7 +1406,8 @@ fn create_window(
         // the link, leaving the restored tabs idle until selected.
         add_tab(url)?;
     } else if let Some(selected) = restored {
-        select(selected);
+        let defer = show == SW_SHOWNOACTIVATE && unsafe { GetActiveWindow() } != window;
+        select_tab(selected, !defer);
     } else {
         add_tab(HOME)?;
     }
@@ -2123,6 +2130,10 @@ fn select_key(key: usize) {
 }
 
 fn select(index: usize) {
+    select_tab(index, true);
+}
+
+fn select_tab(index: usize, load_page: bool) {
     if with_shell(|s| {
         s.tabs
             .get(index)
@@ -2141,6 +2152,7 @@ fn select(index: usize) {
         }
         let key = tab.key;
         tab.background_warm = false;
+        s.deferred_restore = !load_page && tab.browser.is_none() && tab.url != HOME;
         s.active = Some(key);
         Some((
             key,
@@ -2180,7 +2192,7 @@ fn select(index: usize) {
     }
     layout();
     refresh(true);
-    if !closing {
+    if !closing && load_page {
         if let Err(message) = load_deferred(key) {
             if let Some(ui) = controls() {
                 set_text(ui.window, &format!("{} — {message}", app_title()));
@@ -2339,6 +2351,25 @@ fn load_deferred(key: usize) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+fn load_waiting_window(window: HWND) {
+    if exiting() || unsafe { IsIconic(window) } != 0 {
+        return;
+    }
+    let key = change(|s| {
+        if s.closing || !s.deferred_restore {
+            return None;
+        }
+        s.deferred_restore = false;
+        s.active
+    })
+    .flatten();
+    if let Some(key) = key
+        && let Err(message) = load_deferred(key)
+    {
+        set_text(window, &format!("{} — {message}", app_title()));
+    }
 }
 
 fn materialize(key: usize) -> Result<Browser, &'static str> {
@@ -3304,8 +3335,10 @@ unsafe extern "system" fn start_proc(
             if with_shell(|s| s.tabs.iter().any(|t| t.key == key && t.browser.is_none()))
                 == Some(true) =>
         {
-            let font = with_shell(|s| s.font).unwrap_or(null_mut());
-            chrome::paint_start(hwnd, font);
+            let (font, waiting) =
+                with_shell(|s| (s.font, s.deferred_restore && s.active == Some(key)))
+                    .unwrap_or((null_mut(), false));
+            chrome::paint_start(hwnd, font, waiting);
             0
         }
         WM_LBUTTONUP => {
@@ -5240,11 +5273,19 @@ unsafe extern "system" fn window_proc(
         WM_ACTIVATE => {
             if wp & 0xffff != WA_INACTIVE as usize
                 && with_shell(|s| !s.private && !s.closing) == Some(true)
-                && LAST_NORMAL.replace(window as usize) != window as usize
             {
-                queue_session_save();
+                if LAST_NORMAL.replace(window as usize) != window as usize {
+                    queue_session_save();
+                }
+                if (wp >> 16) & 0xffff == 0 && with_shell(|s| s.deferred_restore) == Some(true) {
+                    unsafe { PostMessageW(window, LOAD_RESTORED_WINDOW, 0, 0) };
+                }
             }
             unsafe { DefWindowProcW(window, message, wp, lp) }
+        }
+        LOAD_RESTORED_WINDOW => {
+            load_waiting_window(window);
+            0
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let (ctrl, shift, alt) = modifiers();
