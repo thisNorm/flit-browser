@@ -123,6 +123,7 @@ const PREPARE_CLIPBOARD: usize = 184;
 const IMPORT_CHROME_BOOKMARKS: usize = 185;
 const IMPORT_EDGE_BOOKMARKS: usize = 186;
 const REOPEN_RECENT: usize = 187;
+pub(crate) const TAB_STATUS: usize = 188;
 const RECENT_MENU_FIRST: usize = 0x400;
 const PAGE_CHANGED: u32 = WM_APP + 1;
 const PAGE_CLOSED: u32 = WM_APP + 2;
@@ -168,6 +169,7 @@ struct Controls {
     sidebar: HWND,
     filter: HWND,
     label: HWND,
+    tab_status: HWND,
     empty: HWND,
     menu: HWND,
     bookmark: HWND,
@@ -321,6 +323,7 @@ struct Shell {
     filter: String,
     filter_cursor: FilterCursor,
     rows: Vec<Row>,
+    page_counts: (usize, usize),
     font: HFONT,
     font_dpi: i32,
     find_open: bool,
@@ -1268,6 +1271,7 @@ fn create_window(
         sidebar: button(window, SIDEBAR, "Show or hide vertical tabs"),
         filter: edit(window, FILTER),
         label: static_label(window, TAB_LABEL, "Tabs"),
+        tab_status: static_label(window, TAB_STATUS, "No pages loaded"),
         empty: static_label(window, EMPTY, "No matching tabs"),
         menu: button(window, MENU, "Flit menu"),
         bookmark: button(window, SAVE_BOOKMARK, "Bookmark this page"),
@@ -1292,6 +1296,7 @@ fn create_window(
     if ui.chrome().iter().any(|p| p.is_null())
         || ui.find().iter().any(|p| p.is_null())
         || ui.empty.is_null()
+        || ui.tab_status.is_null()
         || ui.chrome().into_iter().chain(ui.find()).any(|hwnd| unsafe {
             SetWindowSubclass(hwnd, Some(chrome_proc), 1, window as usize) == 0
         })
@@ -1344,6 +1349,7 @@ fn create_window(
                 filter: String::new(),
                 filter_cursor: FilterCursor::Off,
                 rows: Vec::new(),
+                page_counts: (0, 0),
                 font: null_mut(),
                 font_dpi: 0,
                 find_open: false,
@@ -1672,7 +1678,7 @@ fn layout() {
 fn position_sidebar(ui: Controls, l: &Layout, animating: bool) {
     let d = |n| l.scale(n);
     let visible = !l.fullscreen && (l.side > 0 || with_shell(|s| s.sidebar_open) == Some(true));
-    for hwnd in [ui.label, ui.filter, ui.tabs] {
+    for hwnd in [ui.label, ui.filter, ui.tabs, ui.tab_status] {
         set_visible(hwnd, visible);
     }
     let show_empty =
@@ -1707,7 +1713,14 @@ fn position_sidebar(ui: Controls, l: &Layout, animating: bool) {
             x + d(16),
             l.top + d(88),
             l.side_full - d(29),
-            l.height - l.top - d(109),
+            l.height - l.top - d(134),
+        );
+        set_bounds(
+            ui.tab_status,
+            x + d(18),
+            l.height - d(40),
+            l.side_full - d(34),
+            d(25),
         );
         set_bounds(
             ui.empty,
@@ -1793,7 +1806,12 @@ fn update_fonts(ui: Controls, dpi: i32) {
         } else {
             font
         };
-        for hwnd in ui.chrome().into_iter().chain(ui.find()).chain([ui.empty]) {
+        for hwnd in ui
+            .chrome()
+            .into_iter()
+            .chain(ui.find())
+            .chain([ui.empty, ui.tab_status])
+        {
             SendMessageW(hwnd, WM_SETFONT, applied as usize, 1);
         }
         SendMessageW(ui.tabs, LB_SETITEMHEIGHT, 0, (34 * dpi / 96) as isize);
@@ -1888,7 +1906,8 @@ fn update_empty(ui: Controls) {
 }
 
 fn refresh_rows(ensure_visible: bool) {
-    let Some((ui, changed, index, matches, total)) = change(|s| {
+    let Some((ui, changed, index, matches, total, status)) = change(|s| {
+        let mut counts = (0, 0);
         let words = s.filter.split_whitespace();
         let phrase = !words
             .clone()
@@ -1897,6 +1916,11 @@ fn refresh_rows(ensure_visible: bool) {
             .tabs
             .iter()
             .filter_map(|tab| {
+                if tab.browser.is_some() {
+                    counts.0 += 1;
+                } else if tab.unloaded {
+                    counts.1 += 1;
+                }
                 let label = tab_label(tab);
                 if !s.filter.is_empty() {
                     let title = label.to_lowercase();
@@ -1940,7 +1964,8 @@ fn refresh_rows(ensure_visible: bool) {
             s.rows = rows;
             Some(s.rows.clone())
         };
-        (s.controls, changed, index, matches, s.tabs.len())
+        let status = (std::mem::replace(&mut s.page_counts, counts) != counts).then_some(counts);
+        (s.controls, changed, index, matches, s.tabs.len(), status)
     }) else {
         return;
     };
@@ -1984,6 +2009,16 @@ fn refresh_rows(ensure_visible: bool) {
     };
     if text(ui.label, 32) != heading {
         set_text(ui.label, &heading);
+    }
+    if let Some((live, on_demand)) = status {
+        if live == 0 && on_demand == 0 {
+            set_text(ui.tab_status, "No pages loaded");
+        } else {
+            set_text(
+                ui.tab_status,
+                &format!("{live} live · {on_demand} on demand"),
+            );
+        }
     }
     update_empty(ui);
 }
@@ -2405,6 +2440,7 @@ fn materialize(key: usize) -> Result<Browser, &'static str> {
         }
         return Err("CEF did not provide a windowed Chrome-style browser.");
     }
+    refresh_rows(false);
     Ok(browser)
 }
 

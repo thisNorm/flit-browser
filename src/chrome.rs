@@ -1,4 +1,4 @@
-use crate::window::Layout;
+use crate::window::{Layout, TAB_STATUS};
 use windows_sys::Win32::{
     Foundation::{COLORREF, HWND, POINT, RECT},
     Graphics::{Dwm::*, Gdi::*},
@@ -697,6 +697,24 @@ pub(crate) fn draw_tab(
                 ],
             );
             stroke(dc, center, dpi, [(0, 2), (0, 6)]);
+        } else if unloaded {
+            stroke(
+                dc,
+                center,
+                dpi,
+                [
+                    (-3, -5),
+                    (3, -5),
+                    (5, -3),
+                    (5, 3),
+                    (3, 5),
+                    (-3, 5),
+                    (-5, 3),
+                    (-5, -3),
+                    (-3, -5),
+                ],
+            );
+            stroke(dc, center, dpi, [(0, -3), (0, 0), (2, 2)]);
         } else {
             stroke(
                 dc,
@@ -757,6 +775,7 @@ pub(crate) fn field_colors(dc: HDC, id: usize) -> HBRUSH {
         101 | 125 => (colors.field, colors.field_text),
         110 => (colors.filter, colors.field_text),
         126 => (colors.surface, colors.text),
+        TAB_STATUS if !colors.high_contrast => (colors.panel, colors.disabled),
         _ => (colors.panel, colors.text),
     };
     unsafe {
