@@ -642,6 +642,7 @@ pub(crate) fn draw_tab(
     pinned: bool,
     muted: bool,
     unloaded: bool,
+    active: bool,
     dpi: i32,
 ) {
     let saved = begin_item(item);
@@ -651,25 +652,29 @@ pub(crate) fn draw_tab(
     let dc = item.hDC;
     let r = item.rcItem;
     let colors = palette();
-    let selected = item.itemState & ODS_SELECTED != 0;
-    let foreground = if selected {
+    let preview = !active && item.itemState & ODS_SELECTED != 0;
+    let foreground = if active {
         colors.active_text
-    } else if unloaded || item.itemState & (ODS_DISABLED | ODS_GRAYED) != 0 {
+    } else if !preview && (unloaded || item.itemState & (ODS_DISABLED | ODS_GRAYED) != 0) {
         colors.disabled
     } else {
         colors.text
     };
     fill(dc, &r, colors.panel);
-    if selected {
+    if active || preview {
         rounded(
             dc,
             inset(r, px(1, dpi), px(2, dpi)),
             px(19, dpi),
-            colors.active,
-            None,
+            if active { colors.active } else { colors.panel },
+            preview.then_some(if colors.high_contrast {
+                colors.text
+            } else {
+                colors.active_text
+            }),
         );
     }
-    let tab_ink = if selected && !colors.high_contrast && !crate::window::private() {
+    let tab_ink = if active && !colors.high_contrast && !crate::window::private() {
         rgb(0x00, 0x66, 0xcc)
     } else {
         foreground

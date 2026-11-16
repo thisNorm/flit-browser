@@ -43,8 +43,8 @@ use windows_sys::Win32::{
         },
         Input::KeyboardAndMouse::{
             EnableWindow, GetCapture, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture,
-            SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT,
-            VK_TAB,
+            SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_MENU, VK_RETURN,
+            VK_SHIFT, VK_TAB, VK_UP,
         },
         Shell::{DefSubclassProc, SetWindowSubclass},
         WindowsAndMessaging::*,
@@ -215,6 +215,31 @@ struct Row {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterCursor {
+    Off,
+    First,
+    Tab(usize),
+}
+
+impl FilterCursor {
+    fn index(self, rows: &[Row]) -> Option<usize> {
+        if rows.is_empty() {
+            return None;
+        }
+        match self {
+            Self::Off => None,
+            Self::First => Some(0),
+            Self::Tab(key) => Some(rows.iter().position(|row| row.key == key).unwrap_or(0)),
+        }
+    }
+
+    fn highlight(self, rows: &[Row], active: Option<usize>) -> Option<usize> {
+        self.index(rows)
+            .or_else(|| rows.iter().position(|row| Some(row.key) == active))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct TabDrop {
     key: usize,
     after: bool,
@@ -287,6 +312,7 @@ struct Shell {
     tooltip: HWND,
     reload_is_stop: bool,
     filter: String,
+    filter_cursor: FilterCursor,
     rows: Vec<Row>,
     font: HFONT,
     font_dpi: i32,
@@ -1281,7 +1307,7 @@ fn create_window(
             ui.filter,
             EM_SETCUEBANNER,
             1,
-            windows_sys::w!("Search tabs") as isize,
+            windows_sys::w!("Search tabs…") as isize,
         );
         SendMessageW(
             ui.find_text,
@@ -1308,6 +1334,7 @@ fn create_window(
                 tooltip,
                 reload_is_stop: false,
                 filter: String::new(),
+                filter_cursor: FilterCursor::Off,
                 rows: Vec::new(),
                 font: null_mut(),
                 font_dpi: 0,
@@ -1645,7 +1672,13 @@ fn position_sidebar(ui: Controls, l: &Layout, animating: bool) {
     set_visible(ui.empty, show_empty);
     if visible {
         let x = l.side_offset;
-        set_bounds(ui.label, x + d(22), l.top + d(11), d(46), d(30));
+        set_bounds(
+            ui.label,
+            x + d(18),
+            l.top + d(11),
+            l.side_full - d(128),
+            d(30),
+        );
         set_bounds(
             ui.add,
             x + l.side_full - d(105),
@@ -1847,16 +1880,36 @@ fn update_empty(ui: Controls) {
 }
 
 fn refresh_rows(ensure_visible: bool) {
-    let Some((ui, changed, index)) = change(|s| {
+    let Some((ui, changed, index, matches, total)) = change(|s| {
+        let words = s.filter.split_whitespace();
+        let phrase = !words
+            .clone()
+            .all(|word| word.chars().any(char::is_alphanumeric));
         let rows: Vec<_> = s
             .tabs
             .iter()
             .filter_map(|tab| {
                 let label = tab_label(tab);
-                (s.filter.is_empty()
-                    || label.to_lowercase().contains(&s.filter)
-                    || tab.url.to_lowercase().contains(&s.filter))
-                .then(|| Row {
+                if !s.filter.is_empty() {
+                    let title = label.to_lowercase();
+                    let mut url = None;
+                    let mut contains = |word: &str| {
+                        title.contains(word)
+                            || url
+                                .get_or_insert_with(|| tab.url.to_lowercase())
+                                .contains(word)
+                    };
+                    // A standalone symbol (e.g. ": docs") is an intentional phrase.
+                    let matches = if phrase {
+                        contains(&s.filter)
+                    } else {
+                        words.clone().all(contains)
+                    };
+                    if !matches {
+                        return None;
+                    }
+                }
+                Some(Row {
                     key: tab.key,
                     label: if tab.download_close == DownloadClose::Waiting {
                         format!("After download — {label}")
@@ -1871,14 +1924,15 @@ fn refresh_rows(ensure_visible: bool) {
                 })
             })
             .collect();
-        let index = rows.iter().position(|row| Some(row.key) == s.active);
+        let index = s.filter_cursor.highlight(&rows, s.active);
+        let matches = rows.len();
         let changed = if rows == s.rows {
             None
         } else {
             s.rows = rows;
             Some(s.rows.clone())
         };
-        (s.controls, changed, index)
+        (s.controls, changed, index, matches, s.tabs.len())
     }) else {
         return;
     };
@@ -1912,6 +1966,16 @@ fn refresh_rows(ensure_visible: bool) {
         if rebuild {
             InvalidateRect(ui.tabs, null(), 1);
         }
+    }
+    let heading = if matches != total {
+        format!("{matches}/{total}")
+    } else if total == 1 {
+        "1 tab".into()
+    } else {
+        format!("{total} tabs")
+    };
+    if text(ui.label, 32) != heading {
+        set_text(ui.label, &heading);
     }
     update_empty(ui);
 }
@@ -4680,16 +4744,57 @@ fn tab_action(key: usize, action: usize) {
     }
 }
 
-fn filter_input(command: usize) {
+fn set_filter_cursor(cursor: FilterCursor) {
+    let Some((tabs, index)) = change(|s| {
+        if s.filter_cursor == cursor {
+            return None;
+        }
+        s.filter_cursor = cursor;
+        Some((s.controls.tabs, cursor.highlight(&s.rows, s.active)))
+    })
+    .flatten() else {
+        return;
+    };
+    unsafe { SendMessageW(tabs, LB_SETCURSEL, index.unwrap_or(usize::MAX), 0) };
+}
+
+fn filter_input(command: u16) {
     let Some(ui) = controls() else {
         return;
     };
-    let selection = (command == VK_RETURN as usize)
-        .then(|| row_key(0))
-        .flatten();
-    if command == VK_RETURN as usize && selection.is_none() {
-        return;
-    }
+    let selection = match command {
+        VK_UP | VK_DOWN => {
+            let target = with_shell(|s| {
+                let end = s.rows.len().checked_sub(1)?;
+                let index = s.filter_cursor.index(&s.rows).unwrap_or(0);
+                let next = if command == VK_UP {
+                    index.saturating_sub(1)
+                } else {
+                    (index + 1).min(end)
+                };
+                Some(s.rows[next].key)
+            })
+            .flatten();
+            if let Some(key) = target {
+                set_filter_cursor(FilterCursor::Tab(key));
+            }
+            return;
+        }
+        VK_RETURN => {
+            let Some(key) = with_shell(|s| {
+                s.rows
+                    .get(s.filter_cursor.index(&s.rows).unwrap_or(0))
+                    .map(|row| row.key)
+            })
+            .flatten() else {
+                return;
+            };
+            Some(key)
+        }
+        VK_ESCAPE => None,
+        _ => return,
+    };
+    set_filter_cursor(FilterCursor::Off);
     set_text(ui.filter, "");
     if let Some(key) = selection {
         select_key(key);
@@ -4720,6 +4825,13 @@ unsafe extern "system" fn chrome_proc(
         }
         if composing {
             return unsafe { DefSubclassProc(hwnd, message, wp, lp) };
+        }
+    }
+    if id == FILTER {
+        match message {
+            WM_SETFOCUS => set_filter_cursor(FilterCursor::First),
+            WM_KILLFOCUS => set_filter_cursor(FilterCursor::Off),
+            _ => {}
         }
     }
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
@@ -4757,7 +4869,11 @@ unsafe extern "system" fn chrome_proc(
                 return 0;
             }
             (FILTER, VK_ESCAPE) => {
-                filter_input(wp);
+                filter_input(VK_ESCAPE);
+                return 0;
+            }
+            (FILTER, key @ (VK_UP | VK_DOWN)) if !ctrl && !shift && !alt => {
+                filter_input(key);
                 return 0;
             }
             (FIND_TEXT, VK_ESCAPE) => {
@@ -4823,7 +4939,7 @@ unsafe extern "system" fn chrome_proc(
             ADDRESS => unsafe {
                 PostMessageW(parent as HWND, WM_COMMAND, GO, 0);
             },
-            FILTER => filter_input(wp),
+            FILTER => filter_input(VK_RETURN),
             FIND_TEXT => find_in_page(true, true),
             TABS => (),
             _ => return unsafe { DefSubclassProc(hwnd, message, wp, lp) },
@@ -5007,12 +5123,24 @@ unsafe extern "system" fn window_proc(
             let item = unsafe { &*(lp as *const DRAWITEMSTRUCT) };
             let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
             if wp == TABS {
-                let row = with_shell(|s| s.rows.get(item.itemID as usize).cloned()).flatten();
+                let Some((row, active)) =
+                    with_shell(|s| (s.rows.get(item.itemID as usize).cloned(), s.active))
+                else {
+                    return 0;
+                };
                 let (label, pinned, muted, unloaded) =
                     row.as_ref().map_or(("", false, false, false), |row| {
                         (row.label.as_str(), row.pinned, row.muted, row.unloaded)
                     });
-                chrome::draw_tab(item, label, pinned, muted, unloaded, dpi);
+                chrome::draw_tab(
+                    item,
+                    label,
+                    pinned,
+                    muted,
+                    unloaded,
+                    row.as_ref().is_some_and(|row| Some(row.key) == active),
+                    dpi,
+                );
                 if let Some((row, drop)) = row
                     .as_ref()
                     .zip(with_shell(|s| s.tab_drag.and_then(|drag| drag.target)).flatten())
@@ -5156,6 +5284,7 @@ unsafe extern "system" fn window_proc(
                     }
                     if let Some(ui) = controls() {
                         focus_control(ui.filter, true);
+                        set_filter_cursor(FilterCursor::First);
                     }
                 }
                 NEXT_TAB | PREVIOUS_TAB => cycle_tab(id == PREVIOUS_TAB),
@@ -5305,7 +5434,12 @@ unsafe extern "system" fn window_proc(
                 FILTER if notification == EN_CHANGE => {
                     if let Some(ui) = controls() {
                         let value = text(ui.filter, 256);
-                        change(|s| s.filter = value.trim().to_lowercase());
+                        change(|s| {
+                            s.filter = value.trim().to_lowercase();
+                            if s.filter_cursor != FilterCursor::Off {
+                                s.filter_cursor = FilterCursor::First;
+                            }
+                        });
                         refresh_rows(false);
                     }
                 }
