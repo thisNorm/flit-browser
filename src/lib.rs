@@ -1,5 +1,8 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+mod agent;
+mod agent_protocol;
+mod agent_view;
 mod bookmarks;
 mod chrome;
 mod download_guard;
@@ -179,6 +182,14 @@ extern "C" fn RunWinMain(
     let subprocess_result = execute_process(Some(&main_args), None, sandbox_info);
     if subprocess_result >= 0 {
         return subprocess_result;
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|arg| arg == "--flit-agent") {
+        if args.next().is_some() {
+            eprintln!("Flit agent mode does not accept additional arguments.");
+            return 1;
+        }
+        return agent::run(&main_args, sandbox_info);
     }
     // No browser profile is accessed from the renderer/utility/GPU branch above.
     let launch = match Launch::read() {
