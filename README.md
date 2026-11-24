@@ -4,7 +4,7 @@ Flit은 Windows 11 x64용 브라우저입니다. 왼쪽 세로 탭을 기본으�
 
 Windows 11 x64에서는 GitHub Releases에서 `FlitSetup-x64.exe`를 받아 설치할 수 있습니다. 명령으로 설치하는 방법과 소스 빌드 절차는 설치 안내에 있습니다. [0.41.0 다운로드](https://github.com/thisNorm/flit-browser/releases/tag/v0.41.0) · [설치와 빌드](installer/README.md)
 
-Flit을 만든 이유와 Rust·Exact·Chromium의 역할, 실제 사이트에서 측정한 RAM 차이와 남은 한계를 정리했습니다. [프로젝트 회고](PROJECT.md)
+Flit을 만든 이유와 Rust·Win32, Expo Exact, CEF를 각각 선택한 이유를 실제 RAM 측정과 함께 정리했습니다. [프로젝트 회고](PROJECT.md)
 
 AI가 일반 창의 별도 작업 탭에서 페이지의 본문과 링크를 읽고, 지원되는 사이트에서는 Flit Vault로 로그인할 수 있다. [Codex 연결과 Vault 사용법](AGENT.md)
 
