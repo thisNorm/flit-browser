@@ -1,15 +1,16 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-rem Release settings: set the repository before publishing this file.
-set "FLIT_INSTALL_REPO=OWNER/REPO"
-set "FLIT_INSTALL_TAG=v0.31.0"
-set "FLIT_INSTALL_SHA256=c5bf7f904f5af77de26a545e26e5d07b993f7ff5db1ba6b577a64108f9d75451"
+rem Build-Setup.ps1 fills the release tag and SHA-256 for the final installer.
+set "FLIT_INSTALL_REPO=thisNorm/flit-browser"
+set "FLIT_INSTALL_TAG=UNBUILT"
+set "FLIT_INSTALL_SHA256=UNBUILT"
 set "FLIT_INSTALL_DIR=%~dp0"
 rem Use Windows PowerShell modules even when launched from PowerShell 7.
 set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
 
 "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command ^
     "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; $tempDir = $null;" ^
+    "if ($env:FLIT_INSTALL_SHA256 -notmatch '^[0-9a-f]{64}$') { [Console]::Error.WriteLine('Download the installer script from GitHub Releases.'); exit 1 };" ^
     "try {" ^
     "    $file = Join-Path $env:FLIT_INSTALL_DIR 'FlitSetup-x64.exe';" ^
     "    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {" ^

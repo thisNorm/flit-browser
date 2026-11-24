@@ -16,11 +16,14 @@ $launcher = Join-Path $destination 'Install-Flit.cmd'
 foreach ($path in @($output, $checksum, $launcher)) {
     if (Test-Path -LiteralPath $path) { throw "Release output already exists: $path" }
 }
-$required = @('Flit.exe','Flit.dll','libcef.dll','chrome_elf.dll','icudtl.dat','resources.pak',
-    'v8_context_snapshot.bin','locales','LICENSE.txt','CREDITS.html','third-party-licenses')
+$required = @('Flit.exe','Flit.dll','FlitExact.dll','libcef.dll','chrome_elf.dll','icudtl.dat','resources.pak',
+    'v8_context_snapshot.bin','locales','LICENSE.txt','CREDITS.html',
+    'third-party-licenses/ExpoExact/LICENSE','third-party-licenses/ExpoExact/NOTICE',
+    'third-party-licenses/ExpoExact/DEPENDENCIES.txt','third-party-licenses/ExpoExact/ExactRevision.txt')
 foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $payload $name))) { throw "Missing bundle item: $name" }
 }
+& (Join-Path $PSScriptRoot '../tools/New-WindowsBundle.ps1') -VerifyStack (Join-Path $payload 'Flit.exe') | Out-Null
 if ((Test-Path -LiteralPath (Join-Path $payload 'User Data')) -or
     (Test-Path -LiteralPath (Join-Path $payload '.flit-browser-profile'))) {
     throw 'Use an application bundle, not a browser profile.'
