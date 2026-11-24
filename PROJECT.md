@@ -14,6 +14,14 @@ Aside를 쓰면서 왼쪽에 탭과 북마크를 모아 두는 방식, 그리고
 
 Flit은 Exact의 `.contract` 파일을 빌드할 때 실행 계획으로 컴파일한다. 시작 화면, 설정, 주소창 후보와 도구 패널은 이 계획으로 그린다. Exact가 필요한 첫 화면을 열 때 `FlitExact.dll`을 브라우저와 같은 프로세스에 읽어 들인다. 0.41.0에 사용한 Exact 리비전에서 Windows 지원은 개발 중이어서, 그리기 부분을 가져오고 창과 연결하는 코드는 Flit에서 작성했다. [Exact UI 구현](native-ui/app/src/lib.rs) · [Windows 창 연결](src/exact_ui.rs)
 
+#### AI 친화적인 프레임워크를 채택한 의의
+
+Exact는 코딩 에이전트가 앱을 수정하고 실제 화면에서 결과를 검증할 수 있도록 설계됐다. Flit에서 사용한 **Contract**는 Exact의 UI 선언 언어다. 화면에 필요한 데이터의 타입과 버튼이 호출할 동작을 한곳에서 읽을 수 있고, 타입이나 선언에 오류가 있으면 빌드할 때 컴파일러가 알려 준다. Windows 지원이 초기 단계였던 Exact를 Flit의 Win32 창에 직접 연결해 0.41.0 설치본에 넣었다. [Exact의 에이전트 설계](https://github.com/expo/exact/blob/2186c53dc96d43c20294dc5e88f9e229ed8a555c/README.md#1-agent-native) · [Flit UI 선언](native-ui/app/surface.contract)
+
+검증에는 Windows UI Automation을 사용했다. 한국어·영어 설정 화면에서 검색 엔진을 선택하고 키보드로 절전 시간을 바꾼 뒤, 재시작 후에도 두 값이 유지되는 것을 확인했다. 자동화 도구가 버튼과 선택 상태를 읽고 화면이 실제로 동작하는지 검증할 수 있다는 사례다. 취지에 맞는 UI 구조는 구현했으며, 기존 방식과 AI의 개발 속도나 수정 정확도를 직접 비교한 수치는 없다. [Windows 설정 검증](tests/windows_exact_ui.py)
+
+사용자가 AI에게 웹 탐색을 맡기는 기능은 Flit의 MCP가 담당한다. AI는 작업 탭을 열고 Chromium이 렌더링한 페이지에서 본문과 링크를 읽는다. 그 동작은 별도 테스트로 확인했다. Exact 공식 에이전트 드라이버 연동과 Aside 대비 웹 작업 성공률은 검증 범위 밖이다. [Flit MCP 사용법](AGENT.md) · [MCP 작업 탭 검증](tests/windows_agent_mcp.py)
+
 ### 왜 Rust와 Win32를 함께 썼나
 
 탭을 열고 닫을 때 렌더러와 창을 언제 만들고 해제할지 직접 제어해야 했다. Rust로 탭·창·세션의 소유 관계를 관리하고, 주소창의 한글 조합 입력과 클립보드, 세로 탭의 드래그, 분할 화면의 크기 조절은 Win32에 연결했다. Windows의 포커스와 창 메시지를 직접 받아 네이티브 UI와 웹페이지 사이의 키보드 이동도 관리할 수 있다. [UI와 메모리 설계](DESIGN.md)
