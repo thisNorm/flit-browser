@@ -230,7 +230,7 @@ class VaultMcp(Mcp):
 
 
 def open_page(mcp, url, title, *, login_form=False):
-    opened = mcp.tool("flit_open", {"url": url}, timeout=27)
+    opened = mcp.tool("flit_open", {"url": url}, timeout=40)
     tab = opened.get("tab")
     require(type(tab) is int and opened.get("url") == url, "flit_open did not return the requested tab")
     mcp.ready_snapshot(tab, url, title, title, login_form=login_form)
@@ -300,15 +300,17 @@ def run(exe, tls, report):
                 parent_out, child_out = pipe(process_stack)
                 parent_err, child_err = pipe(process_stack)
                 process = process_stack.enter_context(StdioProcess(
-                    [exe, "--flit-agent"], env, (child_in, child_out, child_err), report))
+                    [exe, "--flit-agent"], env, (child_in, child_out, child_err), report, owner_mode=True))
                 exercise(VaultMcp(process, parent_in, parent_out, parent_err, site),
                          site, entry, credential_stack, report)
+                require("owner_pid" in report, "Vault did not run in the staged desktop owner")
             entry.require_absent()
             require(not foreign.counts(), "A blocked login redirected to another origin")
             report["blocked_origin_requests"] = 0
             report["synthetic_vault_entry_removed"] = True
             require(not report["cleanup_needed"], "Flit needed forced cleanup after EOF")
-            require(not (Path(env["LOCALAPPDATA"]) / "Flit Browser").exists(), "Flit created a normal profile")
+            require((Path(env["LOCALAPPDATA"]) / "Flit Browser" / "User Data").is_dir(),
+                    "The staged owner did not use its fixture profile")
             require(not list(Path(env["TEMP"]).glob("FlitAgent-*")), "Agent left its temporary session behind")
         finally:
             report["https_requests"] = dict(site.counts())
@@ -343,6 +345,8 @@ def main():
         parser.error("--exe must point to Flit.exe next to Flit.dll")
     if not all(path.is_file() for path in (cert, key, openssl)):
         parser.error("--cert, --key, and --openssl must point to files")
+    if exe.with_name("flit-installed.ini").exists():
+        parser.error("owner fixture requires a portable, uninstalled bundle")
     report = {"result": "fail", "stage": "verify fixture build and TLS inputs"}
     try:
         report["dll_sha256"] = fixture_build(dll, cert, openssl)

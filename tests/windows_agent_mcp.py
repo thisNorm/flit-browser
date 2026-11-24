@@ -35,23 +35,26 @@ TARGET_TITLE = "Flit MCP 링크 도착"
 OTHER_TITLE = "Flit MCP 두 번째 탭"
 COOKIE = "flit_fixture_session=owned"
 LINKS_TITLE = "Flit MCP link limit"
+OWNER_WINDOW_CLASS = "FlitBrowserWindow"
+LOGIN_FIELDS = {
+    "/source": f'<label>Fixture password <input type="password" value="{PASSWORD}"></label>',
+    "/other": ('<input type="password" disabled><input type="password" hidden>'
+               '<div style="content-visibility:hidden"><input type="password"></div>'
+               '<div style="opacity:0"><input type="password"></div>'),
+}
 PAGES = {
     "/source": f'''<title>{SOURCE_TITLE}</title><p id="dynamic">Waiting for the fixture</p>
-<label>Fixture password <input type="password" value="{PASSWORD}"></label>
 <div style="content-visibility:hidden"><a href="/never-visible">Hidden contents</a></div>
 <a href="/never-visible" style="visibility:hidden">Hidden visibility</a>
 <span style="opacity:0"><a href="/never-visible">Transparent link</a></span>
 <a href="/target">상세 보기</a><a href="/other">다른 페이지</a>
-<script>fetch('/blocked-post', {{method: 'POST', body: 'fixture'}}).catch(() => {{}});
-fetch('/dom-text').then(r => r.text()).then(text => {{
+<script>fetch('/blocked-post', {{method: 'POST', body: 'fixture'}}).catch(() => {{}})
+.then(() => fetch('/dom-text')).then(r => r.text()).then(text => {{
     document.getElementById('dynamic').textContent = text;
 }});</script>''',
     "/target": (f'<title>{TARGET_TITLE}</title><h1 id="details">링크를 열었습니다</h1>'
                 '<a href="/source">돌아가기</a><a href="#details">이 페이지에서 이동</a>'),
-    "/other": f'''<title>{OTHER_TITLE}</title><h1>두 번째 탭의 내용</h1>
-<input type="password" disabled><input type="password" hidden>
-<div style="content-visibility:hidden"><input type="password"></div>
-<div style="opacity:0"><input type="password"></div>''',
+    "/other": f'<title>{OTHER_TITLE}</title><h1>두 번째 탭의 내용</h1>',
     "/session": '<title>Flit MCP session</title><p>{}</p>',
 }
 for count in (60, 61):
@@ -94,6 +97,8 @@ class Handler(BaseHTTPRequestHandler):
                 "Owned cookie present" if has_cookie else "No session cookie")
         elif self.path in PAGES:
             content_type, body = "text/html", '<!doctype html><meta charset="utf-8">' + PAGES[self.path]
+            if self.server.include_login_fields:
+                body += LOGIN_FIELDS.get(self.path, "")
         else:
             self.send_error(404)
             return
@@ -116,12 +121,13 @@ class JobAccounting(C.Structure):
 
 
 class StdioProcess(OwnedProcess):
-    def __init__(self, argv, env, child_ends, report):
+    def __init__(self, argv, env, child_ends, report, *, owner_mode=False):
         import msvcrt
 
         win = self.win = Win32()
         native = win.native
         self.report = report
+        self.owner_mode = owner_mode
         self.process = thread = None
         self.foreground = api(C.WinDLL("user32", use_last_error=True), "GetForegroundWindow", W.HWND)
         handles = [msvcrt.get_osfhandle(end.fileno()) for end in child_ends]
@@ -173,16 +179,28 @@ class StdioProcess(OwnedProcess):
         pids = self.pids()
         win = self.win
         require(win.pid(self.foreground()) not in pids, "Flit agent took the foreground")
-        visible = []
+        owners, unexpected = [], []
 
         @win.callback
         def collect(hwnd, _):
-            if win.pid(hwnd) in pids and win.visible(hwnd):
-                visible.append(hwnd)
+            pid = win.pid(hwnd)
+            if pid not in pids:
+                return True
+            visible = bool(win.visible(hwnd))
+            window_class = win.class_name(hwnd)
+            if self.owner_mode and pid != self.pid and window_class == OWNER_WINDOW_CLASS:
+                owners.append((pid, visible))
+            elif visible:
+                unexpected.append((hwnd, pid, window_class))
             return True
 
         win.check(win.enum(collect, 0))
-        require(not visible, f"Flit agent showed a top-level window: {visible}")
+        require(not unexpected, f"Unexpected visible window in the agent job: {unexpected}")
+        require(len(owners) <= 1, f"More than one Flit owner window in the agent job: {owners}")
+        if owners:
+            pid, visible = owners[0]
+            require(self.report.setdefault("owner_pid", pid) == pid, "Flit owner process changed")
+            self.report["owner_window_visible"] = visible or self.report.get("owner_window_visible", False)
 
 
 def pipe(stack):
@@ -210,10 +228,13 @@ class Mcp:
         self.output = self.stderr_tail = b""
         self.eof = False
         self.request_id = 0
-        self.deadline = time.monotonic() + 80
+        self.other_process = None
+        self.deadline = time.monotonic() + (130 if process.owner_mode else 80)
 
     def pump(self):
         self.process.observe_windows()
+        if self.other_process is not None:
+            self.other_process.observe_windows()
         native = self.process.win.native
         out, self.eof = read_available(native, self.output_handle, self.stdout)
         err, _ = read_available(native, self.error_handle, self.stderr)
@@ -333,6 +354,9 @@ def handshake(mcp):
 
 def exercise(mcp, peer, site, report):
     handshake(mcp)
+    owner_mode = mcp.process.owner_mode
+    # The relay can wait 25 seconds for its owner and 12 more for its request.
+    first_open_timeout = 40 if owner_mode else 27
 
     def list_tabs():
         tabs = mcp.tool("flit_list_tabs", {}).get("tabs")
@@ -356,12 +380,14 @@ def exercise(mcp, peer, site, report):
         return ident
 
     report["stage"] = "render and inspect two tabs"
-    first = navigation(mcp.tool("flit_open", {"url": source}, timeout=27), source)
+    first = navigation(mcp.tool("flit_open", {"url": source}, timeout=first_open_timeout), source)
+    if owner_mode:
+        require("owner_pid" in report, "First open did not start a Flit owner window in the owned job")
     second = navigation(mcp.tool("flit_open", {"url": other}, timeout=13), other)
     require(first != second, "Two opens returned the same tab ID")
     mcp.tool("flit_eval", {"tab": first, "script": "void 0"}, reject=True)
     mcp.tool("flit_snapshot", {"tab": first, "script": "void 0"}, reject=True)
-    page = mcp.ready_snapshot(first, source, SOURCE_TITLE, DOM_TEXT, login_form=True)
+    page = mcp.ready_snapshot(first, source, SOURCE_TITLE, DOM_TEXT, login_form=site.include_login_fields)
     mcp.ready_snapshot(second, other, OTHER_TITLE, "두 번째 탭의 내용")
     require(site.count("/dom-text") > 0 and site.count("/target") == 0,
             "Expected the DOM update fetch and no request to the unfollowed target")
@@ -369,7 +395,8 @@ def exercise(mcp, peer, site, report):
     require(len(links) == 2 and {link.get("url"): link.get("text") for link in links}
             == {target: "상세 보기", other: "다른 페이지"} and all(type(link.get("id")) is int for link in links)
             and len({link["id"] for link in links}) == 2, f"Unexpected snapshot links: {links!r}")
-    report["dynamic_dom_and_login_form_checked"] = True
+    report["dynamic_dom_checked"] = True
+    report["dynamic_dom_and_login_form_checked"] = site.include_login_fields
     tabs = list_tabs()
     require(len(tabs) == 2 and {(t["tab"], t["url"], t["title"], t["status"]) for t in tabs}
             == {(first, source, SOURCE_TITLE, "ready"), (second, other, OTHER_TITLE, "ready")},
@@ -406,7 +433,8 @@ def exercise(mcp, peer, site, report):
     require(site.count("/target") == 1, "Same-document link reloaded the page")
     report["same_document_link_stays_readable"] = True
 
-    report["stage"] = "verify cookies and tabs are scoped to one MCP connection"
+    report["stage"] = ("verify cookies and tabs are scoped to their scratch profiles" if owner_mode
+                       else "verify cookies and tabs are scoped to one MCP connection")
     session_url = site.origin + "/session"
     same = navigation(mcp.tool("flit_open", {"url": session_url}), session_url)
     mcp.ready_snapshot(same, session_url, "Flit MCP session", "Owned cookie present")
@@ -414,8 +442,16 @@ def exercise(mcp, peer, site, report):
     handshake(peer)
     require(peer.tool("flit_list_tabs", {}) == {"tabs": []}, "Another connection sees the first connection's tabs")
     peer.tool("flit_snapshot", {"tab": first}, reject=True)
-    isolated = navigation(peer.tool("flit_open", {"url": session_url}, timeout=27), session_url)
+    peer_record = peer.process.report
+    peer_record["processes_before_first_open"] = peer.process.total_processes()
+    require(peer_record["processes_before_first_open"] == 1, "Peer started a browser before its first open")
+    isolated = navigation(peer.tool("flit_open", {"url": session_url}, timeout=first_open_timeout), session_url)
+    if owner_mode:
+        require("owner_pid" in peer_record and peer_record["owner_pid"] != report["owner_pid"],
+                "The peer did not reach a separate Flit owner in its own job")
     peer.ready_snapshot(isolated, session_url, "Flit MCP session", "No session cookie")
+    require([tab["tab"] for tab in peer.tool("flit_list_tabs", {})["tabs"]] == [isolated],
+            "The peer owner contains unexpected tabs")
 
     report["stage"] = "stop a held load in the owning connection"
     held_url = site.origin + "/held-load"
@@ -440,7 +476,9 @@ def exercise(mcp, peer, site, report):
     peer.finish()
     require({tab["tab"]: tab["url"] for tab in list_tabs()} == {first: anchor, second: other},
             "Closing the other connection changed the first connection's tabs")
-    report["tabs_and_cookie_isolated_between_connections"] = True
+    isolation = ("tabs_and_cookie_isolated_between_profiles" if owner_mode
+                 else "tabs_and_cookie_isolated_between_connections")
+    report[isolation] = True
 
     report["stage"] = "close one tab and send stdin EOF with the other open"
     closed = mcp.tool("flit_close_tab", {"tab": first})
@@ -448,54 +486,81 @@ def exercise(mcp, peer, site, report):
     mcp.tool("flit_snapshot", {"tab": first}, reject=True)
     require([tab["tab"] for tab in list_tabs()] == [second], "Close changed the wrong tabs")
     mcp.finish()
-    require(site.count("POST /blocked-post") == 0, "The page sent a non-read request")
-    report["page_post_blocked"] = True
 
 
-def run(exe, report):
-    with tempfile.TemporaryDirectory(prefix="flit-mcp-fixture-", ignore_cleanup_errors=True) as root, fixture() as site:
-        site.RequestHandlerClass = Handler
-        root = Path(root)
-        # Give even an accidental normal launch no path to the actual Flit profile.
-        env = {key: os.environ[key] for key in ("SystemRoot", "SystemDrive", "WINDIR") if key in os.environ}
-        for key in ("LOCALAPPDATA", "APPDATA", "USERPROFILE", "TEMP", "TMP"):
-            path = root / ("temp" if key in ("TEMP", "TMP") else key)
-            path.mkdir(exist_ok=True)
-            env[key] = str(path)
-        def connect(stack, record):
+
+def fixture_env(root):
+    # A staged owner derives its default profile and pipe from this private LOCALAPPDATA.
+    env = {key: os.environ[key] for key in ("SystemRoot", "SystemDrive", "WINDIR") if key in os.environ}
+    for key in ("LOCALAPPDATA", "APPDATA", "USERPROFILE", "TEMP", "TMP"):
+        path = root / ("temp" if key in ("TEMP", "TMP") else key)
+        path.mkdir(parents=True, exist_ok=True)
+        env[key] = str(path)
+    return env
+
+
+def run(exe, report, *, owner_mode, smoke, scratch):
+    with tempfile.TemporaryDirectory(prefix="flit-mcp-", dir=scratch, ignore_cleanup_errors=True) as work, fixture() as site:
+        root = Path(work)
+        primary_env = fixture_env(root / "primary")
+        # The host serializes MCP connections within a profile. Use two distinct pipes.
+        peer_env = fixture_env(root / "peer") if owner_mode else primary_env
+
+        def connect(stack, env, record):
             child_in, parent_in = pipe(stack)
             parent_out, child_out = pipe(stack)
             parent_err, child_err = pipe(stack)
             proc = stack.enter_context(StdioProcess(
-                [exe, "--flit-agent"], env, (child_in, child_out, child_err), record))
+                [exe, "--flit-agent"], env, (child_in, child_out, child_err), record, owner_mode=owner_mode))
             return Mcp(proc, parent_in, parent_out, parent_err)
 
+        site.RequestHandlerClass = Handler
+        site.include_login_fields = not smoke
         report["stage"] = "initialize and list without Chromium children"
         try:
             with ExitStack() as stack:
-                mcp = connect(stack, report)
+                mcp = connect(stack, primary_env, report)
                 report["second_connection"] = {}
-                peer = connect(stack, report["second_connection"])
+                peer = connect(stack, peer_env, report["second_connection"])
+                mcp.other_process, peer.other_process = peer.process, mcp.process
                 try:
                     exercise(mcp, peer, site, report)
                 finally:
-                    if mcp.stderr_tail:
-                        report["stderr_tail"] = mcp.stderr_tail.decode("utf-8", errors="replace")
-                    if peer.stderr_tail:
-                        report["second_connection"]["stderr_tail"] = peer.stderr_tail.decode("utf-8", errors="replace")
+                    for connection in (mcp, peer):
+                        if connection.stderr_tail:
+                            connection.process.report["stderr_tail"] = connection.stderr_tail.decode(
+                                "utf-8", errors="replace")
             require(not report["cleanup_needed"] and not report["second_connection"]["cleanup_needed"],
                     "Flit needed forced cleanup after EOF")
-            require(not (Path(env["LOCALAPPDATA"]) / "Flit Browser").exists(),
-                    "Flit touched the normal profile location inside isolated LOCALAPPDATA")
-            require(not list(Path(env["TEMP"]).glob("FlitAgent-*")), "Agent left its temporary session behind")
-            report["no_visible_window_or_profile_left"] = True
+            report["stage"] = "verify scratch profiles and request restrictions"
+            for env in (primary_env, peer_env):
+                local = Path(env["LOCALAPPDATA"]) / "Flit Browser"
+                if owner_mode:
+                    require((local / "User Data" / ".flit-browser-profile").is_file(),
+                            "The Flit owner did not use its dedicated scratch profile")
+                else:
+                    require(not local.exists(), "The windowless agent touched the normal profile location")
+                require(not list(Path(env["TEMP"]).glob("FlitAgent-*")),
+                        "Agent left its temporary session behind")
         finally:
             report["http_requests"] = site.report()["requests"]
+            posts = site.count("POST /blocked-post")
+            if posts or site.count("/dom-text"):
+                report["page_post_blocked"] = posts == 0
+
+    require(not root.exists(), f"Could not remove the scratch profiles: {root}")
+    report["scratch_profiles_removed"] = True
+    require(report.get("page_post_blocked") is True, "The page sent a non-read request")
+    if not owner_mode:
+        report["no_visible_window_or_profile_left"] = True
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", required=True, type=Path, help="staged agent-capable Flit.exe next to Flit.dll")
+    parser.add_argument("--owner-smoke", action="store_true",
+                        help="require GUI owner mode and omit the dummy password fields")
+    parser.add_argument("--scratch", type=Path, help="existing parent for the disposable fixture profiles")
     args = parser.parse_args()
     if sys.platform != "win32":
         parser.error("requires Windows")
@@ -503,6 +568,8 @@ def main():
     dll = exe.with_name("Flit.dll")
     if exe.name.lower() != "flit.exe" or not exe.is_file() or not dll.is_file():
         parser.error("--exe must point to Flit.exe next to Flit.dll")
+    if args.scratch is not None and not args.scratch.is_dir():
+        parser.error("--scratch must be an existing directory")
 
     with dll.open("rb") as file:
         report = {"result": "fail", "dll_sha256": file_digest(file, "sha256").hexdigest()}
@@ -513,7 +580,14 @@ def main():
             report.update(result="skip", reason="Flit.dll has no agent MCP markers; no process was started")
             code = 77
         else:
-            run(exe, report)
+            owner_mode = b"--flit-agent-launch" in image and b"FlitBrowser-agent-" in image
+            report["mode"] = "owner" if owner_mode else "windowless"
+            if args.owner_smoke and not owner_mode:
+                raise RuntimeError("Flit.dll has no Rust owner-mode markers; no process was started")
+            if owner_mode and exe.with_name("flit-installed.ini").exists():
+                raise RuntimeError("Use a staged bundle without the installed updater marker; no process was started")
+            scratch = args.scratch.resolve() if args.scratch is not None else None
+            run(exe, report, owner_mode=owner_mode, smoke=args.owner_smoke, scratch=scratch)
             report.update(result="pass", stage="complete")
             code = 0
     except (RuntimeError, OSError, ValueError, TypeError, KeyError, AttributeError) as error:
