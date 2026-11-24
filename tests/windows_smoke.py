@@ -239,6 +239,14 @@ class Win32:
             if self.visible(child):
                 yield child
 
+    def cef_view(self, panel):
+        child = None
+        while child := self.find_child(panel, child, None, None):
+            name = self.class_name(child)
+            if name.startswith("Chrome_WidgetWin_") or name == "Chrome_RenderWidgetHostHWND":
+                return child
+        return None
+
     @contextmanager
     def window_coordinates(self, hwnd):
         previous = self.check(self.thread_dpi_context(self.check(self.window_dpi_context(hwnd))))
@@ -448,7 +456,7 @@ class Browser:
     def page_panel(self):
         win = self.win
         visible = [child for child in win.visible_children(self.hwnd, "Static")
-                   if next(win.visible_children(child), None)]
+                   if (view := win.cef_view(child)) and win.visible(view)]
         return visible[0] if len(visible) == 1 else None
 
     def in_client(self, hwnd):
@@ -528,9 +536,10 @@ def sidebar_layout(browser):
             require(add[2] <= page[0] or add[3] <= page[1], f"New Tab button {add} overlaps page {page}")
             require(max(tabs[2], edit[2]) <= page[0] and min(tabs[1], edit[1]) >= page[1],
                     f"Tab list {tabs} and filter {edit} are not beside page {page}")
-            require(row_height > 0 and tabs[3] - tabs[1] >= 2 * row_height
+            visible_rows = min(2, browser.tab_count())
+            require(row_height > 0 and visible_rows > 0 and tabs[3] - tabs[1] >= visible_rows * row_height
                     and (edit[3] <= tabs[1] or tabs[3] <= edit[1]),
-                    f"Sidebar does not have room for the filter and two vertical tab rows: {edit}, {tabs}")
+                    f"Sidebar does not fit the filter and {visible_rows} vertical tab rows: {edit}, {tabs}")
             return {"client": client, "page": page, "tabs": tabs, "filter": edit}
 
         def toggle_cycle(observe_motion=False):

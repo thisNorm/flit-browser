@@ -104,6 +104,18 @@ def settings_route(browser, cid, path, item, existing=None):
                 scope="Separate Chromium window title; no settings changed or browsing data cleared.")
 
 
+def settings_tab(browser, cid, address, item):
+    """Flit settings and Chromium settings pages other than clearing data open as Flit tabs."""
+    command(browser, cid)
+
+    def opened():
+        item["observed"] = snapshot(browser)
+        return item["observed"]["url"].startswith(address)
+
+    browser.wait(f"settings tab at {address}", opened)
+    item.update(address=address, scope="Flit tab address only; no settings changed.")
+
+
 def find(browser, item):
     command(browser, FIND)
     for cid, expected in ((FIND_TEXT, "edit"), (FIND_STATUS, "static")):
@@ -184,6 +196,11 @@ def run(exe, work, evidence):
                           builtin(browser, cid, host, titles, item), browser)
                 settings_hwnd = None
                 for name, cid, path in SETTINGS_ROUTES:
+                    if path != "/clearBrowserData":
+                        address = "flit://settings" if path == "/" else f"chrome://settings{path}"
+                        check(results, name, lambda item, cid=cid, address=address:
+                              settings_tab(browser, cid, address, item), browser)
+                        continue
                     item = check(results, name, lambda item, cid=cid, path=path:
                                  settings_route(browser, cid, path, item, settings_hwnd), browser)
                     settings_hwnd = item.get("hwnd", settings_hwnd)

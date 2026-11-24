@@ -1,4 +1,4 @@
-"""Check mouse and keyboard focus handoff with two loaded loopback tabs."""
+"""Check mouse and keyboard focus and minimize with two loaded loopback tabs."""
 
 import argparse
 import ctypes as C
@@ -95,6 +95,24 @@ def exercise(b, checks):
         expect(label, index, page=False, keep_list_focus=True)
     b.press(TABS, 0x0D)  # VK_RETURN; the helper also sends translated WM_CHAR.
     expect("Enter", 0, page=True)
+
+    view = win.cef_view(first)
+    require(view, "No Chrome widget in the selected tab")
+    is_iconic = api(user, "IsIconic", W.BOOL, W.HWND)
+    show_window = api(user, "ShowWindowAsync", W.BOOL, W.HWND, C.c_int)
+    # The child widget's own style excludes visibility inherited from its parent.
+    def widget_shown():
+        return win.cef_view(first) == view and win.get_style(view, -16) & 0x10000000
+
+    win.check(show_window(b.hwnd, 6))  # SW_MINIMIZE
+    try:
+        b.wait("minimized window hides the Chrome widget", lambda: is_iconic(b.hwnd) and not widget_shown())
+        require(win.cef_view(first) == view, "Minimize detached the selected Chrome widget")
+    finally:
+        win.check(show_window(b.hwnd, 9))  # SW_RESTORE
+    b.wait("restore shows the same Chrome widget",
+           lambda: not is_iconic(b.hwnd) and widget_shown() and b.page_panel() == first)
+    checks["minimize_retains_selected_widget"] = True
 
 
 def run(exe, profile, evidence):

@@ -19,6 +19,7 @@ from windows_smoke import ADDRESS, NEW_TAB, SIDEBAR_TOGGLE, TABS, Browser, Owned
 
 
 DOWNLOADS = 190
+ALL_DOWNLOADS = 121
 IDLE, ACTIVE = "Downloads", "Downloads (1 active)"
 URL = "chrome://downloads/"
 PAGE_TITLES = ("Downloads", "Download history", "다운로드", "다운로드 기록")
@@ -112,10 +113,12 @@ def exercise(browser, site, downloads, report, *, interrupt):
         return (address == URL and title.partition(" — ")[2] in PAGE_TITLES and panel
                 and win.pid(panel) == pid and any(win.pid(child) == pid for child in win.visible_children(panel)))
 
-    browser.click(DOWNLOADS)
-    browser.wait("Downloads URL, title and visible owned CEF panel from one click", downloads_visible)
+    # The toolbar button opens Flit's own downloads menu; its "All downloads" item is
+    # the menu command 121, which a modal popup menu would otherwise hide from this test.
+    browser.win.message(browser.hwnd, 0x0111, ALL_DOWNLOADS)
+    browser.wait("Downloads URL, title and visible owned CEF panel from one command", downloads_visible)
     tab_count = browser.tab_count()
-    browser.click(DOWNLOADS)
+    browser.win.message(browser.hwnd, 0x0111, ALL_DOWNLOADS)
     require(browser.address() == URL and browser.tab_count() == tab_count,
             "Clicking Downloads again duplicated the Downloads tab")
     require(not site.release.is_set() and partial.is_file() and browser.control_text(DOWNLOADS) == ACTIVE,

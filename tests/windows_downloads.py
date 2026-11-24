@@ -102,10 +102,13 @@ def click_attachment(browser, index):
             else:
                 yield from widgets(child)
 
-    panel = browser.wait("visible Flit page panel", browser.page_panel)
-    matches = list(widgets(panel))
-    require(len(matches) == 1, f"Expected one visible Chromium render widget, got {len(matches)}")
-    widget = matches[0]
+    def ready_widget():
+        panel = browser.page_panel()
+        matches = list(widgets(panel)) if panel else []
+        require(len(matches) <= 1, "Multiple visible Chromium render widgets in one Flit panel")
+        return next(iter(matches), None)
+
+    widget = browser.wait("owned Chromium render widget for attachments", ready_widget)
     with win.window_coordinates(widget):
         _, _, width, height = win.rect(widget, client=True)
         require(width > 0 and height > 0, "Flit render widget has no client area")

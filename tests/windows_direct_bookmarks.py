@@ -38,7 +38,7 @@ def write_source(bookmarks, source, *, merge=False):
     top = link(LITERAL_TITLE, f"https://{host}:8443/guides/a%20b?next=%2Fdeep&n=2#overview")
     nested = link("Nested HTTP link", f"http://{host}/nested/page?word=two%20words&n=1#details")
     other = link("Another HTTPS link", f"https://{host}:8443/guides/other?mode=full#section")
-    new = link("New link on reimport", f"https://{host}:8443/guides/new?next=%2Fdeep#update")
+    new = link("New link on reimport", f"https://{host}:8443/guides/new/{bookmarks.name}?next=%2Fdeep#update")
     rejected = [
         link("Username and password", f"https://fixture-user:fixture-pass@{host}/discard"),
         link("Username only", f"http://fixture-user@{host}/discard"),
@@ -114,7 +114,8 @@ def verify_store(profile, original, wrapper, expected, report):
 def exercise(exe, root, site, source, report):
     command, vendor = SOURCES[source]
     local, profile = root / "localappdata", root / "flit-profile"
-    bookmarks = local / vendor / "User Data" / "Default" / "Bookmarks"
+    bookmarks = (local / vendor / "User Data" / "Default"
+                 / ("AccountBookmarks" if source == "Chrome" else "Bookmarks"))
     start = site.origin + "/start"
     args = [f"--flit-profile={profile}", f"--flit-url={start}"]
     wrapper = f"From {source} - Default"
@@ -135,6 +136,7 @@ def exercise(exe, root, site, source, report):
                 process.normal_close(browser.hwnd)
 
     payload, expected = write_source(bookmarks, source)
+    source_payloads = {bookmarks: payload}
     with launch("seed_and_decline") as browser:
         post(browser.process, browser.hwnd, WM_COMMAND, SAVE_BOOKMARK)
         wait_manager(browser, "Bookmarks — Page saved")
@@ -161,14 +163,19 @@ def exercise(exe, root, site, source, report):
             require(step["manager"]["url"] == MANAGER, "Import did not use the native bookmark manager")
             if reuse:
                 require(browser.tab_count() == tab_count, "Reimport opened another bookmark manager tab")
-        step["source_unchanged"] = bookmarks.read_bytes() == payload
-        require(step["source_unchanged"], "Synthetic source Bookmarks was changed by Flit")
+        step["source_unchanged"] = all(path.read_bytes() == data for path, data in source_payloads.items())
+        require(step["source_unchanged"], "A synthetic bookmark source was changed by Flit")
         return verify_store(profile, original, wrapper, current, step)
 
     initial = accept("import", expected, added=len(expected))
-    # A fresh link in the same nested folder proves the second import actually ran.
-    payload, expected = write_source(bookmarks, source, merge=True)
-    merged = accept("merge", expected, added=1, reuse=True)
+    source_payloads[bookmarks], expected = write_source(bookmarks, source, merge=True)
+    if source == "Chrome":
+        # Each file has a new link in the same folder as the shared links.
+        legacy = bookmarks.with_name("Bookmarks")
+        source_payloads[legacy], legacy_expected = write_source(legacy, source, merge=True)
+        report["legacy_bookmarks"] = str(legacy)
+        expected.append(legacy_expected[-1])
+    merged = accept("merge", expected, added=len(expected) - len(initial), reuse=True)
     require(merged[:len(initial)] == initial, "Reimport replaced an existing imported bookmark")
     report["stage"] = "complete"
 

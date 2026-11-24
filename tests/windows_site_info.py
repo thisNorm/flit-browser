@@ -36,15 +36,10 @@ def run(exe, work, report):
             browser = Browser(process, site)
             browser.page("/start", require_request=True)
             button = win.get_item(browser.hwnd, SITE_INFO)
-            require(button and win.pid(button) == process.pid and win.enabled(button), "Site information button missing")
+            require(button and win.pid(button) == process.pid, "Site information button missing")
+            browser.wait("site information enabled after page commit",
+                         lambda: win.visible(button) and win.enabled(button))
 
-            # Open Settings first to verify the site-specific route reuses its window.
-            post(process, browser.hwnd, WM_COMMAND, SETTINGS)
-            def native_settings():
-                return next(((hwnd, title) for hwnd, title in tools_windows(browser).items()
-                             if "settings" in title.casefold() or "\uc124\uc815" in title), None)
-
-            settings_hwnd, _ = browser.wait("general settings window", native_settings)
             browser.edit_address(site.origin.replace("127.0.0.1", "localhost") + "/not-submitted")
             post(process, button, 0x00F5)  # BM_CLICK, on the owned toolbar button only.
             dialog = browser.wait("site information dialog", lambda: next(iter(owned_windows(process, "#32770")), None))
@@ -76,21 +71,21 @@ def run(exe, work, report):
 
             post(process, dialog, WM_COMMAND, IDYES, win.get_item(dialog, IDYES))
 
+            # Site settings open as a Flit tab (with the Flit skin), not a separate Chromium window.
             def settings():
-                address = settings_address(browser, settings_hwnd)
-                route = urlsplit(address)
-                return address if route.path == "/content/siteDetails" and parse_qs(route.query) == {"site": [site.origin]} else None
+                route = urlsplit(browser.address())
+                return browser.address() if route.path == "/content/siteDetails" and parse_qs(route.query) == {"site": [site.origin]} else None
 
-            report["settings"] = browser.wait("per-site settings route in the same window", settings)
-            require(browser.tab_count() == 1 and browser.selected() == 0, "Site settings altered the Flit tab list")
+            report["settings"] = browser.wait("per-site settings route in a Flit tab", settings)
+            require(not tools_windows(browser) and browser.tab_count() == 2,
+                    "Site settings did not open as one Flit tab")
 
             route = "chrome://settings/content"
             browser.edit_address(route)
             browser.click(GO)
-            report["typed_settings"] = browser.wait("typed route in the same settings window",
-                                                    lambda: settings_address(browser, settings_hwnd) == route)
-            browser.page("/start")
-            require(browser.tab_count() == 1 and browser.selected() == 0, "Typed settings replaced the Flit tab")
+            report["typed_settings"] = browser.wait("typed route in the settings tab",
+                                                    lambda: browser.address() == route)
+            require(browser.tab_count() == 2, "Typed settings opened another tab")
             process.normal_close(browser.hwnd)
 
 

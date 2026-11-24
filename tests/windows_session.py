@@ -46,10 +46,10 @@ def titles(browser):
 
 
 def loaded_panels(browser):
-    # Include hidden tab panels: a materialized CEF view attaches a child HWND.
+    # Include hidden Chromium views in the tab count.
     count, panel = 0, None
     while panel := browser.win.find_child(browser.hwnd, panel, "Static", None):
-        count += bool(browser.win.find_child(panel, None, None, None))
+        count += bool(browser.win.cef_view(panel))
     return count
 
 

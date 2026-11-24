@@ -1,4 +1,4 @@
-"""Verify Flit's vertical tab reorder in an owned Win32 process and loopback profile."""
+"""Verify Flit's tab reorder and duplication in an owned Win32 process and loopback profile."""
 
 import argparse
 import ctypes as C
@@ -21,20 +21,24 @@ from windows_smoke import (
 WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON = 0x0200, 0x0201, 0x0202, 0x0001
 LB_GETITEMRECT, LB_ITEMFROMPOINT = 0x0198, 0x01A9
 TAB_MENU_ACTION = 0x8005  # WM_APP + 5
-TAB_PIN, TAB_MOVE_UP, TAB_MOVE_DOWN = 1, 7, 8
+TAB_PIN, TAB_DUPLICATE, TAB_MOVE_UP, TAB_MOVE_DOWN = 1, 2, 7, 8
 
 START, PINNED, ACTIVE = "/start", "/tab", "/second"
 LABELS = {START: "Flit smoke: start", PINNED: TAB_TITLE, ACTIVE: "Flit smoke: second"}
 BEFORE, AFTER = (PINNED, START, ACTIVE), (PINNED, ACTIVE, START)
+DUPLICATED = (PINNED, PINNED, ACTIVE, ACTIVE, START)
+DUPLICATE_SELECTION = 3
 
 
-def check_ui(browser, order, panel, evidence):
+def check_ui(browser, order, panel, evidence, *, selected=None):
+    if selected is None:
+        selected = order.index(ACTIVE)
     evidence.update(rows=titles(browser), selected=browser.selected(),
                     address=browser.address(), active_panel=browser.page_panel())
     expected = tuple(LABELS[path] for path in order)
     require(evidence["rows"] == expected, f"Expected ListBox order {expected}, got {evidence['rows']}")
-    require(evidence["selected"] == order.index(ACTIVE)
-            and evidence["address"] == browser.site.origin + ACTIVE
+    require(evidence["selected"] == selected
+            and evidence["address"] == browser.site.origin + order[selected]
             and evidence["active_panel"] == panel, f"Active tab changed: {evidence}")
 
 
@@ -55,13 +59,15 @@ def row_point(browser, index, quarter, dpi):
 
 def exercise(browser, checks):
     browser.page(START, require_request=True)
+    source_panels = {}
     for index, path in enumerate((PINNED, ACTIVE), start=1):
         browser.click(NEW_TAB)
         browser.wait(f"new tab selected at row {index}", lambda: browser.selected() == index)
         browser.navigate(path)
+        source_panels[path] = browser.wait(f"source tab panel for {path}", browser.page_panel)
     browser.wait("three titled tabs", lambda: titles(browser) == (LABELS[START], LABELS[PINNED], LABELS[ACTIVE]))
     browser.wait("three loaded tab panels", lambda: loaded_panels(browser) == 3)
-    panel = browser.wait("active tab panel", browser.page_panel)
+    panel = source_panels[ACTIVE]
     send(browser, TAB_MENU_ACTION, 2, TAB_PIN)  # Second created tab; keys do not follow row indices.
     check_ui(browser, BEFORE, panel, checks.setdefault("initial", {"loaded_panels": loaded_panels(browser)}))
 
@@ -103,6 +109,19 @@ def exercise(browser, checks):
     browser.set_text(TAB_FILTER, "")
     check_ui(browser, AFTER, panel, checks.setdefault("final", {}))
 
+    duplicates = (
+        ("duplicate_pinned", 2, PINNED, (PINNED, PINNED, ACTIVE, START), 1),
+        ("duplicate_unpinned", 3, ACTIVE, DUPLICATED, DUPLICATE_SELECTION),
+    )
+    for label, key, path, order, selected in duplicates:
+        trace = checks[label] = {"source_key": key, "source_panel": source_panels[path]}
+        browser.page(path, lambda: send(browser, TAB_MENU_ACTION, key, TAB_DUPLICATE),
+                     require_request=True)
+        duplicate_panel = browser.wait("duplicate tab panel", browser.page_panel)
+        check_ui(browser, order, duplicate_panel, trace, selected=selected)
+        require(duplicate_panel != source_panels[path],
+                f"Duplication selected the original tab panel: {trace}")
+
 
 def run(exe, profile, evidence):
     win = Win32()
@@ -116,8 +135,8 @@ def run(exe, profile, evidence):
                 process.normal_close(browser.hwnd)
 
             saved = evidence["session"] = json.loads((profile / "session.json").read_text(encoding="utf-8"))
-            entries = [{"url": site.origin + path, "title": LABELS[path], "pinned": path == PINNED} for path in AFTER]
-            require(saved["entries"] == entries and saved["selected"] == AFTER.index(ACTIVE) and saved["restore"] is True,
+            entries = [{"url": site.origin + path, "title": LABELS[path], "pinned": path == PINNED} for path in DUPLICATED]
+            require(saved["entries"] == entries and saved["selected"] == DUPLICATE_SELECTION and saved["restore"] is True,
                     "Session JSON did not retain the final tab order, titles, pins and active selection")
 
             baseline = page_counts(site, ACTIVE)
@@ -125,7 +144,7 @@ def run(exe, profile, evidence):
                 browser = Browser(process, site)
                 browser.page(ACTIVE, require_request=True, baseline=baseline)
                 panel = browser.wait("restored active tab panel", browser.page_panel)
-                check_ui(browser, AFTER, panel, checks.setdefault("restored", {}))
+                check_ui(browser, DUPLICATED, panel, checks.setdefault("restored", {}), selected=DUPLICATE_SELECTION)
                 process.normal_close(browser.hwnd)
         finally:
             evidence["fixture"] = site.report()
