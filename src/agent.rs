@@ -17,10 +17,11 @@ use std::{
 use url::Url;
 use windows_sys::{
     Win32::{
+        Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation},
         Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType},
         System::{
             Com::CoCreateGuid,
-            Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+            Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
         },
     },
     core::GUID,
@@ -69,6 +70,12 @@ const READ_DOM: &str = r#"(() => {
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
+    /// Running inside the user's Flit: agent tabs are real tabs in its window.
+    static HOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn host_mode() {
+    HOST.set(true);
 }
 
 #[derive(Default)]
@@ -233,7 +240,8 @@ pub(crate) fn vault_allows_navigation(id: u32, url: &str, redirect: bool) -> boo
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(tab) = state.tabs.get_mut(&id) else {
-            return false;
+            // Kept desktop tabs still use the owner's read-only request policy.
+            return HOST.get();
         };
         let Some(login) = &mut tab.login else {
             return true;
@@ -358,6 +366,15 @@ pub(crate) fn closed(id: u32) {
     finish_stopping();
 }
 
+pub(crate) fn detach_owner_tabs() {
+    // The user can keep the visible tabs, while the next MCP connection starts
+    // with an empty list. Closing also cancels any outstanding Vault request.
+    let ids = STATE.with(|state| state.borrow().tabs.keys().copied().collect::<Vec<_>>());
+    for id in ids {
+        closed(id);
+    }
+}
+
 fn open(url: &str) -> Result<Value, String> {
     let url = web_url(url).ok_or("Enter a literal HTTP or HTTPS URL without credentials.")?;
     let (id, mut context) = STATE.with(|state| {
@@ -365,10 +382,15 @@ fn open(url: &str) -> Result<Value, String> {
         if s.tabs.len() >= MAX_TABS {
             return Err("This agent session has eight open or closing tabs. Close a tab first.");
         }
-        let context = s
-            .context
-            .clone()
-            .ok_or("The isolated agent context is unavailable.")?;
+        let context = if HOST.get() {
+            None
+        } else {
+            Some(
+                s.context
+                    .clone()
+                    .ok_or("The isolated agent context is unavailable.")?,
+            )
+        };
         s.next_tab = s
             .next_tab
             .checked_add(1)
@@ -377,27 +399,38 @@ fn open(url: &str) -> Result<Value, String> {
         s.tabs.insert(id, Tab::new(url.clone()));
         Ok((id, context))
     })?;
-    let mut client = agent_view::client(id);
-    let window = WindowInfo::default().set_as_windowless(sys::HWND(null_mut()));
-    let settings = BrowserSettings {
-        windowless_frame_rate: 5,
-        javascript_access_clipboard: cef::State::DISABLED,
-        javascript_dom_paste: cef::State::DISABLED,
-        ..Default::default()
-    };
-    let Some(browser) = browser_host_create_browser_sync(
-        Some(&window),
-        Some(&mut client),
-        Some(&CefString::from(url.as_str())),
-        Some(&settings),
-        None,
-        Some(&mut context),
-    ) else {
-        closed(id);
-        return Err("Flit could not open the agent tab.".into());
+    let browser = match context.as_mut() {
+        None => crate::window::open_agent_tab(id, &url).map_err(|error| {
+            closed(id);
+            error.to_owned()
+        })?,
+        Some(context) => {
+            let mut client = agent_view::client(id);
+            let window = WindowInfo::default().set_as_windowless(sys::HWND(null_mut()));
+            let settings = BrowserSettings {
+                windowless_frame_rate: 5,
+                javascript_access_clipboard: cef::State::DISABLED,
+                javascript_dom_paste: cef::State::DISABLED,
+                ..Default::default()
+            };
+            let Some(browser) = browser_host_create_browser_sync(
+                Some(&window),
+                Some(&mut client),
+                Some(&CefString::from(url.as_str())),
+                Some(&settings),
+                None,
+                Some(context),
+            ) else {
+                closed(id);
+                return Err("Flit could not open the agent tab.".into());
+            };
+            browser
+        }
     };
     let observer = browser.host().and_then(|host| {
-        host.set_audio_muted(1);
+        if !HOST.get() {
+            host.set_audio_muted(1);
+        }
         let mut observer = AgentObserver::new(id);
         host.add_dev_tools_message_observer(Some(&mut observer))
     });
@@ -432,7 +465,11 @@ fn close(id: u32) -> Result<Value, String> {
         tab.closing = true;
         Ok::<_, &str>(tab.browser.clone())
     })?;
-    if let Some(host) = browser.as_ref().and_then(|b| b.host()) {
+    if HOST.get() {
+        if !crate::window::close_agent_tab(id) {
+            closed(id);
+        }
+    } else if let Some(host) = browser.as_ref().and_then(|b| b.host()) {
         host.close_browser(1);
     } else {
         closed(id);
@@ -604,7 +641,7 @@ fn send_login(id: u32, data: vault_login::Probe) -> Result<(), &'static str> {
         Some("no_password_form") => "no_password_form",
         _ => vault_login::UNSUPPORTED,
     })?;
-    let (attempt, origin, mut context) = STATE.with(|state| {
+    let (attempt, origin, browser) = STATE.with(|state| {
         let s = state.borrow();
         let tab = s.tabs.get(&id).ok_or("no_such_tab")?;
         let login = tab.login.as_ref().ok_or("page_changed")?;
@@ -614,9 +651,14 @@ fn send_login(id: u32, data: vault_login::Probe) -> Result<(), &'static str> {
         Ok((
             login.attempt,
             login.origin.clone(),
-            s.context.clone().ok_or("vault_unavailable")?,
+            tab.browser.clone().ok_or("vault_unavailable")?,
         ))
     })?;
+    // Use the tab's cookie store in both the desktop owner and isolated modes.
+    let mut context = browser
+        .host()
+        .and_then(|host| host.request_context())
+        .ok_or("vault_unavailable")?;
     let credential = vault_store::load(&origin)
         .map_err(|_| "vault_unavailable")?
         .ok_or("not_saved")?;
@@ -1012,10 +1054,7 @@ wrap_app! {
                     command.append_switch(Some(&CefString::from("disable-background-networking")));
                     command.append_switch(Some(&CefString::from("disable-extensions")));
                     #[cfg(feature = "vault-fixture")]
-                    command.append_switch_with_value(
-                        Some(&CefString::from("ignore-certificate-errors-spki-list")),
-                        Some(&CefString::from(env!("FLIT_FIXTURE_SPKI"))),
-                    );
+                    vault_login::configure_fixture_tls(command);
                 }
             }
         }
@@ -1069,7 +1108,7 @@ impl Drop for Scratch {
     }
 }
 
-fn request(command: Option<Command>) -> Result<Value, String> {
+pub(crate) fn request(command: Option<Command>) -> Result<Value, String> {
     let (reply, result) = mpsc::channel();
     let mut task = AgentTask::new(command, reply, false);
     if post_task(ThreadId::UI, Some(&mut task)) == 0 {
@@ -1088,11 +1127,36 @@ pub(crate) fn run(args: &MainArgs, sandbox_info: *mut u8) -> i32 {
         eprintln!("Flit agent mode requires redirected MCP stdin and stdout pipes.");
         return 1;
     }
+    // The GUI owner can outlive the relay when the user keeps its tabs.
+    // Close the MCP stream at relay exit regardless of the owner's lifetime.
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(stream) };
+        if unsafe { GetFileType(handle) } == FILE_TYPE_PIPE
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+        {
+            eprintln!("Flit could not isolate the MCP stream from child processes.");
+            return 1;
+        }
+    }
     let mut scratch = None;
     let mut initialized = false;
     let mut startup_attempted = false;
     let mut ready = false;
+    let mut relay: Option<crate::agent_host::Relay> = None;
     let protocol = agent_protocol::serve(|command| {
+        // Prefer the user's own Flit: its tabs are visible and share their sign-ins.
+        if !initialized {
+            if relay.is_none() {
+                relay = crate::agent_host::Relay::connect(matches!(command, Command::Open { .. }));
+            }
+            if let Some(connection) = relay.as_mut() {
+                let result = connection.call(&command);
+                if result.as_ref().is_err_and(|e| e.starts_with("Flit closed")) {
+                    relay = None;
+                }
+                return result;
+            }
+        }
         if !initialized && matches!(command, Command::List) {
             return Ok(json!({"tabs": []}));
         }

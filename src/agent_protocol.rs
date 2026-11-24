@@ -18,7 +18,7 @@ const CLOSE: &str = "flit_close_tab";
 const SIGN_IN: &str = "flit_sign_in";
 const STOP_LOADING: &str = "flit_stop_loading";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) enum Command {
     Open { url: String },
     List,

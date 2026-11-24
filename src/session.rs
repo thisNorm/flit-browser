@@ -22,6 +22,8 @@ pub(crate) struct Entry {
     pub title: String,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "read_optional_metadata")]
+    pub bookmark_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -31,9 +33,23 @@ pub(crate) struct WindowState {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "read_placement"
+        deserialize_with = "read_optional_metadata"
     )]
     pub placement: Option<WindowPlacement>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_optional_metadata"
+    )]
+    pub split: Option<SplitPlacement>,
+}
+
+// Pane indexes into the serialized entries and a ratio in permille.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct SplitPlacement {
+    pub left: usize,
+    pub right: usize,
+    pub ratio: u16,
 }
 
 // The outer window rectangle in physical screen pixels, before maximizing.
@@ -82,10 +98,12 @@ impl WindowPlacement {
     }
 }
 
-fn read_placement<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<WindowPlacement>, D::Error> {
-    // Placement is optional metadata; a bad rectangle should not cost any tabs.
+fn read_optional_metadata<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    // Malformed optional metadata should not discard the window's tabs.
     Ok(serde_json::from_value(serde_json::Value::deserialize(deserializer)?).ok())
 }
 
@@ -101,12 +119,28 @@ pub(crate) struct Session {
     pub sidebar_open: bool,
     #[serde(default = "default_true")]
     pub defer_background: bool,
+    /// Close the tabs an AI (MCP) session opened when that session ends.
+    #[serde(default = "default_true")]
+    pub agent_auto_close: bool,
+    /// Minutes before an unseen background tab sleeps; 0 turns Memory Saver off.
+    #[serde(default = "default_memory_saver")]
+    pub memory_saver_minutes: u32,
     #[serde(default, skip_serializing_if = "SearchEngine::is_default")]
     pub search_engine: SearchEngine,
+    /// Acrylic instead of Mica for the window material.
+    #[serde(default)]
+    pub acrylic: bool,
+    /// 0 follows Windows, 1 light, 2 dark.
+    #[serde(default)]
+    pub theme: u8,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_memory_saver() -> u32 {
+    30
 }
 
 pub(crate) fn load(profile: &Path) -> Option<Session> {
@@ -242,6 +276,7 @@ fn validated(session: &Session) -> Session {
                 entries: Vec::new(),
                 selected: 0,
                 placement: None,
+                split: None,
             },
             Vec::new(),
         )
@@ -255,6 +290,7 @@ fn validated(session: &Session) -> Session {
 
 pub(crate) fn validated_window(window: &WindowState) -> WindowState {
     let mut entries = Vec::with_capacity(window.entries.len().min(MAX_TABS));
+    let mut original_indices = [0; MAX_TABS];
     let mut selected = 0;
     for (index, entry) in window.entries.iter().enumerate() {
         let active = index == window.selected;
@@ -276,18 +312,47 @@ pub(crate) fn validated_window(window: &WindowState) -> WindowState {
             }
             selected = entries.len();
         }
+        original_indices[entries.len()] = index;
+        let bookmark_url = entry.bookmark_url.as_deref().and_then(stored_url).filter(|url| {
+            (url.starts_with("http://") || url.starts_with("https://"))
+                && !entries.iter().any(|entry: &Entry| entry.bookmark_url.as_ref() == Some(url))
+        });
         entries.push(Entry {
             url,
             title: entry.title[..entry.title.floor_char_boundary(MAX_TITLE_BYTES)].to_owned(),
             pinned: entry.pinned,
+            bookmark_url,
         });
     }
+    let original_indices = &original_indices[..entries.len()];
+    let split = window.split.and_then(|split| {
+        if split.left == split.right
+            || !(200..=800).contains(&split.ratio)
+            || ![split.left, split.right].contains(&window.selected)
+        {
+            return None;
+        }
+        let left = original_indices.binary_search(&split.left).ok()?;
+        let right = original_indices.binary_search(&split.right).ok()?;
+        [left, right]
+            .iter()
+            .all(|&index| {
+                let url = &entries[index].url;
+                url.starts_with("http://") || url.starts_with("https://")
+            })
+            .then_some(SplitPlacement {
+                left,
+                right,
+                ..split
+            })
+    });
     WindowState {
         entries,
         selected,
         placement: window
             .placement
             .filter(|placement| placement.edges().is_some()),
+        split,
     }
 }
 
@@ -346,6 +411,7 @@ mod tests {
             url: url.into(),
             title: title.into(),
             pinned,
+            bookmark_url: None,
         }
     }
 
@@ -355,12 +421,17 @@ mod tests {
                 entries: vec![entry(url, "", false)],
                 selected: 0,
                 placement: None,
+                split: None,
             },
             additional_windows: Vec::new(),
             restore: true,
             sidebar_open: true,
             defer_background: false,
+            agent_auto_close: true,
+                memory_saver_minutes: 30,
             search_engine: SearchEngine::default(),
+            acrylic: false,
+            theme: 0,
         }
     }
 
@@ -397,12 +468,17 @@ mod tests {
                     ],
                     selected: 1,
                     placement: None,
+                    split: None,
                 },
                 additional_windows: Vec::new(),
                 restore: true,
                 sidebar_open: true,
                 defer_background: true,
+                agent_auto_close: true,
+                memory_saver_minutes: 30,
                 search_engine: SearchEngine::default(),
+                acrylic: false,
+                theme: 0,
             })
         );
     }
@@ -427,6 +503,11 @@ mod tests {
             entries,
             selected,
             placement: None,
+            split: Some(SplitPlacement {
+                left: selected,
+                right: 1,
+                ratio: 800,
+            }),
         };
         state.additional_windows.push(state.primary.clone());
         save(&profile.0, &state).unwrap();
@@ -439,10 +520,21 @@ mod tests {
             restored.primary.entries[restored.primary.selected],
             entry("https://example.com/active", &title_prefix, true)
         );
+        assert_eq!(
+            restored.primary.split,
+            Some(SplitPlacement {
+                left: MAX_TABS - 1,
+                right: 0,
+                ratio: 800,
+            })
+        );
         assert_eq!(restored.additional_windows, [restored.primary.clone()]);
         let on_disk: Session =
             serde_json::from_slice(&fs::read(profile.0.join(FILE_NAME)).unwrap()).unwrap();
         assert_eq!(on_disk, restored);
+
+        state.primary.split.as_mut().unwrap().right = selected - 1;
+        assert!(validated_window(&state.primary).split.is_none());
     }
 
     #[test]
@@ -455,12 +547,17 @@ mod tests {
                     entries: Vec::new(),
                     selected: 0,
                     placement: None,
+                    split: None,
                 },
                 additional_windows: Vec::new(),
                 restore,
                 sidebar_open: !restore,
                 defer_background: restore,
+                agent_auto_close: true,
+                memory_saver_minutes: 30,
                 search_engine: SearchEngine::Naver,
+                acrylic: restore,
+                theme: 2,
             };
             save(&profile.0, &empty).unwrap();
             assert_eq!(load(&profile.0), Some(empty));
@@ -493,6 +590,7 @@ mod tests {
         let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(written.get("additional_windows").is_none());
         assert!(written.get("placement").is_none());
+        assert!(written.get("split").is_none());
 
         state.additional_windows = (0..17)
             .map(|i| session(&format!("https://example.com/window-{i}")).primary)
@@ -570,6 +668,63 @@ mod tests {
     }
 
     #[test]
+    fn validates_split_against_retained_web_pages() {
+        use serde_json::json;
+
+        let mut fixture = json!({
+            "entries": [
+                {"url": "https://example.com/first", "title": ""},
+                {"url": "file:///private", "title": ""},
+                {"url": "HTTP://example.com/selected", "title": "", "pinned": true},
+                {"url": "chrome://settings/", "title": ""},
+                {"url": "about:blank", "title": ""},
+                {"url": "https://example.com/other", "title": ""}
+            ],
+            "selected": 2,
+            "split": {"left": 2, "right": 0, "ratio": 200}
+        });
+        let decode = |fixture: &serde_json::Value| {
+            let session = serde_json::from_str(&fixture.to_string()).unwrap();
+            validated(&session).primary
+        };
+        let restored = decode(&fixture);
+        assert_eq!(restored.selected, 1);
+        assert_eq!(restored.entries[0].url, "https://example.com/first");
+        assert_eq!(restored.entries[1].url, "http://example.com/selected");
+        assert_eq!(
+            restored.split,
+            Some(SplitPlacement {
+                left: 1,
+                right: 0,
+                ratio: 200,
+            })
+        );
+
+        for invalid in [
+            json!("bad split"),
+            json!({"left": 2, "right": "0", "ratio": 200}),
+            json!({"left": 2, "right": 1, "ratio": 200}),
+            json!({"left": 2, "right": 2, "ratio": 200}),
+            json!({"left": 2, "right": 9, "ratio": 200}),
+            json!({"left": 2, "right": 0, "ratio": 199}),
+            json!({"left": 2, "right": 0, "ratio": 801}),
+            json!({"left": 2, "right": 3, "ratio": 200}),
+            json!({"left": 2, "right": 4, "ratio": 200}),
+            json!({"left": 0, "right": 5, "ratio": 200}),
+        ] {
+            fixture["split"] = invalid;
+            let window = decode(&fixture);
+            assert_eq!(window.split, None, "{}", fixture["split"]);
+            assert_eq!(window.entries, restored.entries);
+            assert_eq!(window.selected, restored.selected);
+        }
+
+        fixture["selected"] = json!(1);
+        fixture["split"] = json!({"left": 2, "right": 0, "ratio": 200});
+        assert!(decode(&fixture).split.is_none());
+    }
+
+    #[test]
     fn fits_saved_geometry_to_a_current_work_area() {
         let normal = WindowPlacement {
             x: -1100,
@@ -621,6 +776,7 @@ mod tests {
             entries: vec![entry(&long_url, &long_title, false); 128],
             selected: 127,
             placement: None,
+            split: None,
         };
         let mut state = session("https://example.com/primary");
         state.primary = heavy.clone();

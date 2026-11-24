@@ -1,4 +1,15 @@
 use std::time::{Duration, Instant};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW,
+};
+
+pub(crate) fn enabled() -> bool {
+    let mut allowed = 0;
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&mut allowed as *mut i32).cast(), 0)
+    };
+    ok != 0 && allowed != 0
+}
 
 // Critically damped and bounded. Retargeting preserves the current velocity.
 const SPEED: f64 = 27.0;

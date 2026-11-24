@@ -1,19 +1,26 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 mod agent;
+mod agent_host;
 mod agent_protocol;
 mod agent_view;
 mod bookmarks;
 mod chrome;
 mod download_guard;
+mod engine;
+mod exact_model;
+mod exact_ui;
+mod i18n;
 mod keyboard;
 mod launch_url;
 mod memory_sites;
 mod navigation;
 mod panel_motion;
 mod permissions;
+mod popover;
 mod session;
 mod site_setup;
+mod tab_memory;
 mod updater;
 mod vault_login;
 mod vault_store;
@@ -47,6 +54,8 @@ impl Launch {
             };
             if let Some(value) = argument.strip_prefix("--flit-profile=") {
                 profile = Some(PathBuf::from(value));
+            } else if argument == "--flit-agent-launch" {
+                window::set_agent_launch();
             } else if let Some(value) = argument.strip_prefix("--flit-url=") {
                 url = Some(navigation::address(value).map_err(str::to_owned)?);
                 skip_restore = true;
@@ -118,16 +127,7 @@ wrap_app! {
             // HTTP(S) address through Chromium's existing single-instance handoff.
             if process_type.is_none_or(|kind| kind.to_string().is_empty()) {
                 let Some(command) = command_line else { return; };
-                // Flit draws its own new-tab page and does not need Chrome's
-                // component extensions that start a background page.
-                command.append_switch(Some(&CefString::from("disable-component-extensions-with-background-pages")));
-                // Reuse suitable renderers sooner without closing any tabs.
-                // Site Isolation still permits more processes for distinct sites.
-                command.append_switch(Some(&CefString::from("site-per-process")));
-                command.append_switch_with_value(
-                    Some(&CefString::from("renderer-process-limit")),
-                    Some(&CefString::from("16")),
-                );
+                engine::configure(command);
                 if let Some(url) = self.initial_url.as_deref().and_then(launch_url::literal_http_url) {
                     command.append_argument(Some(&CefString::from(url)));
                 }
@@ -191,7 +191,11 @@ extern "C" fn RunWinMain(
         // Fail closed; the application is not supported without the official sandbox broker.
         return 1;
     }
-    let subprocess_result = execute_process(Some(&main_args), None, sandbox_info);
+    let subprocess_result = execute_process(
+        Some(&main_args),
+        Some(&mut tab_memory::ChildApp::new()),
+        sandbox_info,
+    );
     if subprocess_result >= 0 {
         return subprocess_result;
     }
@@ -209,11 +213,13 @@ extern "C" fn RunWinMain(
         Err(message) => return error(&message),
     };
     let path = CefString::from(launch.profile.to_str().expect("profile path validated"));
+    let locale = i18n::startup(&launch.profile);
     updater::set_profile(launch.default_profile);
     let log = launch.profile.join("flit-cef.log");
     let mut app = FlitApp::new(launch.url, launch.profile, launch.skip_restore);
     let settings = Settings {
         no_sandbox: 0,
+        locale: CefString::from(locale.as_str()),
         command_line_args_disabled: 1,
         root_cache_path: path.clone(),
         cache_path: path,

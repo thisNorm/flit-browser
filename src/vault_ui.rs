@@ -65,7 +65,7 @@ pub(crate) fn manage(owner: HWND, site: &Site, remove: bool, current: impl Fn() 
         unsafe {
             MessageBoxW(
                 owner,
-                wide(message).as_ptr(),
+                wide(crate::i18n::text(message)).as_ptr(),
                 w!("Flit Vault"),
                 MB_OK | MB_ICONERROR,
             );
@@ -81,14 +81,20 @@ fn confirm_and_remove(
     if !vault_store::has(origin).map_err(|_| "Could not check the Flit Vault login.")? {
         return Ok(());
     }
-    let message = wide(&format!(
-        "Remove the Flit Vault login for {origin}?\n\nThis revokes AI access to this saved login."
-    ));
+    let message = wide(&if crate::i18n::korean() {
+        format!(
+            "{origin}의 Flit Vault 로그인을 삭제할까요?\n\nAI가 이 로그인을 더 이상 사용할 수 없게 됩니다."
+        )
+    } else {
+        format!(
+            "Remove the Flit Vault login for {origin}?\n\nThis revokes AI access to this saved login."
+        )
+    });
     let answer = unsafe {
         MessageBoxW(
             owner,
             message.as_ptr(),
-            w!("Remove Flit Vault login"),
+            wide(crate::i18n::text("Remove Flit Vault login")).as_ptr(),
             MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
         )
     };
@@ -131,16 +137,24 @@ fn prompt_and_save(
     origin: &str,
     still_current: impl FnOnce() -> bool,
 ) -> Result<(), &'static str> {
-    let message = wide(&format!(
-        "{origin}\n\nSaving lets the Flit AI agent use this login on this exact site. \
-        It replaces any existing Flit Vault login for this site."
-    ));
+    let message = wide(&if crate::i18n::korean() {
+        format!(
+            "{origin}\n\n저장하면 Flit AI 에이전트가 이 사이트에서만 이 로그인을 사용할 수 있습니다. \
+            이 사이트에 저장된 기존 Flit Vault 로그인은 교체됩니다."
+        )
+    } else {
+        format!(
+            "{origin}\n\nSaving lets the Flit AI agent use this login on this exact site. \
+            It replaces any existing Flit Vault login for this site."
+        )
+    });
+    let caption = wide(crate::i18n::text("Add or update Flit Vault login"));
     let target = wide(&format!("Flit Vault enrollment: {origin}"));
     let info = CREDUI_INFOW {
         cbSize: size_of::<CREDUI_INFOW>() as u32,
         hwndParent: owner,
         pszMessageText: message.as_ptr(),
-        pszCaptionText: w!("Add or update Flit Vault login"),
+        pszCaptionText: caption.as_ptr(),
         hbmBanner: null_mut(),
     };
     let mut user = Wiped([0u16; USERNAME_BUFFER]);

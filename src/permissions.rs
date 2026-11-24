@@ -6,21 +6,16 @@ use std::{
     rc::Rc as Shared,
 };
 use url::{Host, Url};
-use windows_sys::{
-    Win32::{
-        Foundation::{HWND, LPARAM, WPARAM},
-        UI::{
-            Controls::{
-                TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TDF_ALLOW_DIALOG_CANCELLATION,
-                TDF_POSITION_RELATIVE_TO_WINDOW, TDM_CLICK_BUTTON, TDN_CREATED, TDN_DESTROYED,
-                TaskDialogIndirect,
-            },
-            WindowsAndMessaging::{
-                GA_ROOT, GetAncestor, IDCANCEL, IDNO, IsWindowVisible, PostMessageW,
-            },
+use windows_sys::Win32::{
+    Foundation::{HWND, LPARAM, WPARAM},
+    UI::{
+        Controls::{
+            TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TDF_ALLOW_DIALOG_CANCELLATION,
+            TDF_POSITION_RELATIVE_TO_WINDOW, TDM_CLICK_BUTTON, TDN_CREATED, TDN_DESTROYED,
+            TaskDialogIndirect,
         },
+        WindowsAndMessaging::{GA_ROOT, GetAncestor, IDCANCEL, IDNO, IsWindowVisible, PostMessageW},
     },
-    w,
 };
 
 const MIC: u32 =
@@ -245,30 +240,46 @@ unsafe extern "system" fn dialog_event(
 }
 
 fn show_dialog(owner: usize, ticket: &Ticket, origin: &str, mask: u32) -> bool {
+    use crate::i18n::{choose, text as tr};
     let device = if mask == MIC {
-        "microphone"
+        choose("microphone", "마이크")
     } else if mask == CAMERA {
-        "camera"
+        choose("camera", "카메라")
     } else {
-        "camera and microphone"
+        choose("camera and microphone", "카메라와 마이크")
     };
-    let instruction = crate::window::wide(&format!("Use your {device}?"));
-    let text = crate::window::wide(&format!("{origin}\n\nAllow access for this request only."));
+    let instruction = crate::window::wide(&if crate::i18n::korean() {
+        format!("{device} 사용을 허용할까요?")
+    } else {
+        format!("Use your {device}?")
+    });
+    let text = crate::window::wide(&format!(
+        "{origin}\n\n{}",
+        choose(
+            "Allow access for this request only.",
+            "이번 요청에만 사용을 허용합니다."
+        )
+    ));
+    let (deny, allow, title) = (
+        crate::window::wide(tr("Deny")),
+        crate::window::wide(tr("Allow this time")),
+        crate::window::wide(tr("Flit Browser — Site permission")),
+    );
     let buttons = [
         TASKDIALOG_BUTTON {
             nButtonID: IDNO,
-            pszButtonText: w!("Deny"),
+            pszButtonText: deny.as_ptr(),
         },
         TASKDIALOG_BUTTON {
             nButtonID: ALLOW_ONCE,
-            pszButtonText: w!("Allow this time"),
+            pszButtonText: allow.as_ptr(),
         },
     ];
     let config = TASKDIALOGCONFIG {
         cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
         hwndParent: owner as HWND,
         dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
-        pszWindowTitle: w!("Flit Browser — Site permission"),
+        pszWindowTitle: title.as_ptr(),
         pszMainInstruction: instruction.as_ptr(),
         pszContent: text.as_ptr(),
         cButtons: buttons.len() as u32,

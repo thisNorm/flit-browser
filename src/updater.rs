@@ -131,12 +131,20 @@ pub(crate) fn check_manual() -> String {
     );
     let Some(update) = Update::discover() else {
         return format!(
-            "{headline}\n\nAutomatic updates are not configured for this installation.\nTo update an installed copy on Windows, close Flit and run the newer FlitSetup-x64.exe."
+            "{headline}\n\n{}",
+            crate::i18n::choose(
+                "Automatic updates are not configured for this installation.\nTo update an installed copy on Windows, close Flit and run the newer FlitSetup-x64.exe.",
+                "이 설치본에는 자동 업데이트가 설정되어 있지 않습니다.\n업데이트하려면 Flit을 닫고 새 FlitSetup-x64.exe를 실행하세요."
+            )
         );
     };
     if update.cache.join(READY).is_file() {
         return format!(
-            "{headline}\n\nA verified update is staged. It will install after Flit closes."
+            "{headline}\n\n{}",
+            crate::i18n::choose(
+                "A verified update is staged. It will install after Flit closes.",
+                "확인된 업데이트가 준비되었습니다. Flit을 닫으면 설치됩니다."
+            )
         );
     }
     let status = fs::read_to_string(update.cache.join(STATUS))
@@ -148,12 +156,21 @@ pub(crate) fn check_manual() -> String {
         })
         .filter(|s| !s.is_empty());
     let current = if update.start("Manual") {
-        "Checking for updates in the background."
+        crate::i18n::choose(
+            "Checking for updates in the background.",
+            "백그라운드에서 업데이트를 확인하는 중입니다."
+        )
     } else {
-        "Could not start the update check."
+        crate::i18n::choose(
+            "Could not start the update check.",
+            "업데이트 확인을 시작하지 못했습니다."
+        )
     };
     match status {
-        Some(last) => format!("{headline}\n\n{current}\nLast check: {last}"),
+        Some(last) => format!(
+            "{headline}\n\n{current}\n{}: {last}",
+            crate::i18n::choose("Last check", "마지막 확인")
+        ),
         None => format!("{headline}\n\n{current}"),
     }
 }

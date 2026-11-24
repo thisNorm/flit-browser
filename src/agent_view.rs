@@ -7,10 +7,30 @@ use std::sync::{
 use url::{Origin, Url};
 
 const LOAD_FAILED: &str = "The page could not be loaded.";
-const REDIRECT_BLOCKED: &str = "The page redirected to an unsupported destination.";
+pub(crate) const REDIRECT_BLOCKED: &str = "The page redirected to an unsupported destination.";
 
 pub(crate) fn client(tab: u32) -> cef::Client {
     AgentClient::new(tab, Arc::new(AtomicBool::new(false)))
+}
+
+fn is_read_request(request: &Request) -> bool {
+    matches!(CefString::from(&request.method()).to_string().as_str(), "GET" | "HEAD")
+}
+
+pub(crate) fn allows_main_navigation(request: &Request, url: &str) -> bool {
+    agent::web_url(url).is_some() && is_read_request(request)
+}
+
+pub(crate) fn resource_handler(
+    navigation: i32,
+    download: i32,
+    initiator: Option<&CefString>,
+) -> ResourceRequestHandler {
+    let http_origin = initiator
+        .and_then(|value| Url::parse(&value.to_string()).ok())
+        .filter(|url| url.scheme() == "http")
+        .map(|url| url.origin());
+    AgentResource::new(http_origin, navigation != 0, download != 0)
 }
 
 wrap_client! {
@@ -165,8 +185,7 @@ wrap_request_handler! {
             if !agent::vault_allows_navigation(self.tab, &url, redirect != 0) {
                 return 1;
             }
-            let method = CefString::from(&request.method()).to_string();
-            if agent::web_url(&url).is_some() && matches!(method.as_str(), "GET" | "HEAD") {
+            if allows_main_navigation(request, &url) {
                 let current = CefString::from(&frame.url()).to_string();
                 if redirect == 0 && !agent::same_document_link(&current, &url) {
                     self.pending.store(true, Relaxed);
@@ -193,11 +212,7 @@ wrap_request_handler! {
             _request: Option<&mut Request>, navigation: i32, download: i32,
             initiator: Option<&CefString>, _disable_default: Option<&mut i32>,
         ) -> Option<ResourceRequestHandler> {
-            let http_origin = initiator
-                .and_then(|value| Url::parse(&value.to_string()).ok())
-                .filter(|url| url.scheme() == "http")
-                .map(|url| url.origin());
-            Some(AgentResource::new(http_origin, navigation != 0, download != 0))
+            Some(resource_handler(navigation, download, initiator))
         }
 
         fn auth_credentials(
@@ -243,7 +258,7 @@ wrap_resource_request_handler! {
             let Some(request) = request.filter(|_| !self.download) else {
                 return ReturnValue::CANCEL;
             };
-            if !matches!(CefString::from(&request.method()).to_string().as_str(), "GET" | "HEAD") {
+            if !is_read_request(request) {
                 return ReturnValue::CANCEL;
             }
             let Ok(url) = Url::parse(&CefString::from(&request.url()).to_string()) else {

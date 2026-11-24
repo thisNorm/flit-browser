@@ -1,12 +1,12 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::Read,
     os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf, Prefix},
 };
 
-use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::de::{MapAccess, Visitor};
 use serde_json::Value;
 use url::Url;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -15,11 +15,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 pub(crate) const MAX_SITES: usize = 12;
+const MAX_PASTED_TAB_BYTES: usize = 256 * 1024;
 const MAX_PROFILE_ENTRIES: usize = 256;
 const MAX_BOOKMARK_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IMPORT_DEPTH: usize = 24;
 const MAX_IMPORT_NODES: usize = 4096;
 const MAX_IMPORT_BYTES: usize = 2 * 1024 * 1024;
+const UNREADABLE_BOOKMARKS: &str = "Could not safely read the selected bookmarks file.";
 
 #[derive(Clone, Copy)]
 pub(crate) enum SourceBrowser {
@@ -38,7 +40,8 @@ impl SourceBrowser {
 
 pub(crate) struct SourceProfile {
     pub label: String,
-    path: PathBuf,
+    directory: PathBuf,
+    files: Vec<&'static str>,
 }
 
 #[derive(serde::Serialize)]
@@ -47,6 +50,8 @@ pub(crate) struct BookmarkNode {
     pub url: Option<String>,
     pub children: Vec<BookmarkNode>,
 }
+
+type BookmarkRoot = (String, Value);
 
 pub(crate) fn discover(local_app_data: &Path, browser: SourceBrowser) -> Vec<SourceProfile> {
     let (vendor, product) = match browser {
@@ -71,9 +76,18 @@ pub(crate) fn discover(local_app_data: &Path, browser: SourceBrowser) -> Vec<Sou
             }
             let directory = entry.path();
             let _profile = hold_directory(&directory)?;
-            let path = directory.join("Bookmarks");
-            let metadata = fs::symlink_metadata(&path).ok()?;
-            (metadata.is_file() && !is_reparse(&metadata)).then_some(SourceProfile { label, path })
+            let files: Vec<_> = ["Bookmarks", "AccountBookmarks"]
+                .into_iter()
+                .filter(|name| {
+                    fs::symlink_metadata(directory.join(name))
+                        .is_ok_and(|metadata| metadata.is_file() && !is_reparse(&metadata))
+                })
+                .collect();
+            (!files.is_empty()).then_some(SourceProfile {
+                label,
+                directory,
+                files,
+            })
         })
         .collect();
     profiles.sort_unstable_by(|left, right| left.label.cmp(&right.label));
@@ -118,40 +132,44 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-fn read_bookmark_roots(source: &SourceProfile) -> Result<Vec<Value>, &'static str> {
-    const UNREADABLE: &str = "Could not safely read the selected bookmarks file.";
-    const TOO_LARGE: &str = "The bookmarks file is too large.";
+fn read_bookmark_roots(source: &SourceProfile) -> Result<Vec<BookmarkRoot>, &'static str> {
+    let _directories = hold_directories(&source.directory).ok_or(UNREADABLE_BOOKMARKS)?;
+    let mut roots = Vec::new();
+    for name in &source.files {
+        roots.extend(read_bookmark_file(&source.directory.join(name))?);
+    }
+    Ok(roots)
+}
 
-    let directories =
-        hold_directories(source.path.parent().ok_or(UNREADABLE)?).ok_or(UNREADABLE)?;
+fn read_bookmark_file(path: &Path) -> Result<Vec<BookmarkRoot>, &'static str> {
+    const TOO_LARGE: &str = "The bookmarks file is too large.";
     let file = fs::File::options()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(&source.path)
-        .map_err(|_| UNREADABLE)?;
-    let metadata = file.metadata().map_err(|_| UNREADABLE)?;
+        .open(path)
+        .map_err(|_| UNREADABLE_BOOKMARKS)?;
+    let metadata = file.metadata().map_err(|_| UNREADABLE_BOOKMARKS)?;
     if !metadata.is_file() || is_reparse(&metadata) {
-        return Err(UNREADABLE);
+        return Err(UNREADABLE_BOOKMARKS);
     }
-    drop(directories);
     if metadata.len() > MAX_BOOKMARK_FILE_BYTES as u64 {
         return Err(TOO_LARGE);
     }
     let mut bytes = Vec::new();
     file.take(MAX_BOOKMARK_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| UNREADABLE)?;
+        .map_err(|_| UNREADABLE_BOOKMARKS)?;
     if bytes.len() > MAX_BOOKMARK_FILE_BYTES {
         return Err(TOO_LARGE);
     }
     parse_bookmark_roots(&bytes)
 }
 
-fn parse_bookmark_roots(bytes: &[u8]) -> Result<Vec<Value>, &'static str> {
+fn parse_bookmark_roots(bytes: &[u8]) -> Result<Vec<BookmarkRoot>, &'static str> {
     #[derive(serde::Deserialize)]
     struct BookmarkFile {
         #[serde(deserialize_with = "ordered_roots")]
-        roots: Vec<Value>,
+        roots: Vec<BookmarkRoot>,
     }
 
     serde_json::from_slice::<BookmarkFile>(bytes)
@@ -161,11 +179,11 @@ fn parse_bookmark_roots(bytes: &[u8]) -> Result<Vec<Value>, &'static str> {
 
 fn ordered_roots<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<Vec<Value>, D::Error> {
+) -> Result<Vec<BookmarkRoot>, D::Error> {
     struct Roots;
 
     impl<'de> Visitor<'de> for Roots {
-        type Value = Vec<Value>;
+        type Value = Vec<BookmarkRoot>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("a map of bookmark roots")
@@ -174,7 +192,7 @@ fn ordered_roots<'de, D: serde::Deserializer<'de>>(
         fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
             // Reading the map directly preserves file order without extra serde features.
             let mut roots = Vec::new();
-            while let Some((_, root)) = map.next_entry::<IgnoredAny, Value>()? {
+            while let Some(root) = map.next_entry()? {
                 roots.push(root);
             }
             Ok(roots)
@@ -191,9 +209,9 @@ pub(crate) fn bookmarked_sites(
     Ok(sites_from_roots(&read_bookmark_roots(source)?, open))
 }
 
-fn sites_from_roots(roots: &[Value], open: &BTreeSet<String>) -> Vec<String> {
+fn sites_from_roots(roots: &[BookmarkRoot], open: &BTreeSet<String>) -> Vec<String> {
     let mut sites = Vec::new();
-    for root in roots {
+    for (_, root) in roots {
         if let Some(children) = folder_children(root, true) {
             collect_sites(children, open, &mut sites);
         }
@@ -217,21 +235,49 @@ fn collect_sites(nodes: &[Value], open: &BTreeSet<String>, sites: &mut Vec<Strin
     }
 }
 
+/// Links from every bookmark folder, with depth for choosing start-page shortcuts.
+pub(crate) fn sidebar_bookmarks(file: &Path) -> Vec<(String, String, usize)> {
+    fn walk(nodes: &[BookmarkNode], depth: usize, out: &mut Vec<(String, String, usize)>) {
+        for node in nodes {
+            if let Some(url) = &node.url {
+                let title = if node.title.trim().is_empty() { url } else { &node.title };
+                out.push((title.clone(), url.clone(), depth));
+            }
+            walk(&node.children, depth + 1, out);
+        }
+    }
+    let Ok((roots, _)) = read_bookmark_file(file).and_then(|roots| import_roots(&roots)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for root in &roots {
+        walk(&root.children, 0, &mut out);
+    }
+    out
+}
+
 pub(crate) fn profile_bookmarks(
     source: &SourceProfile,
 ) -> Result<(Vec<BookmarkNode>, usize), &'static str> {
     import_roots(&read_bookmark_roots(source)?)
 }
 
-fn import_roots(roots: &[Value]) -> Result<(Vec<BookmarkNode>, usize), &'static str> {
+fn import_roots(roots: &[BookmarkRoot]) -> Result<(Vec<BookmarkNode>, usize), &'static str> {
     let mut remaining = MAX_IMPORT_NODES;
-    let mut leaves = 0;
-    let mut bookmarks = Vec::new();
-    for root in roots {
-        if let Some(node) = import_node(root, true, 1, &mut remaining, &mut leaves)? {
-            bookmarks.push(node);
+    let mut root_indexes = BTreeMap::new();
+    let mut bookmarks: Vec<BookmarkNode> = Vec::new();
+    for (key, root) in roots {
+        if let Some(mut node) = import_node(root, true, 1, &mut remaining)? {
+            // Root names can differ between files, so merge by the root key.
+            let index = *root_indexes.entry(key).or_insert(bookmarks.len());
+            if index == bookmarks.len() {
+                bookmarks.push(node);
+            } else {
+                bookmarks[index].children.append(&mut node.children);
+            }
         }
     }
+    let (bookmarks, leaves) = merge_siblings(bookmarks);
     let bytes = serde_json::to_vec(&bookmarks).map_err(|_| "Could not encode the bookmarks.")?;
     if bytes.len() > MAX_IMPORT_BYTES {
         return Err("The imported bookmarks are too large.");
@@ -239,12 +285,39 @@ fn import_roots(roots: &[Value]) -> Result<(Vec<BookmarkNode>, usize), &'static 
     Ok((bookmarks, leaves))
 }
 
+fn merge_siblings(nodes: Vec<BookmarkNode>) -> (Vec<BookmarkNode>, usize) {
+    let mut indexes = BTreeMap::new();
+    let mut merged: Vec<BookmarkNode> = Vec::new();
+    let mut leaves = 0;
+    for mut node in nodes {
+        // Match the destination's title and canonical URL comparison.
+        let address = node
+            .url
+            .as_ref()
+            .map(|raw| Url::parse(raw).map_or_else(|_| raw.clone(), |url| url.to_string()));
+        let index = *indexes
+            .entry((node.title.clone(), address))
+            .or_insert(merged.len());
+        if index == merged.len() {
+            leaves += usize::from(node.url.is_some());
+            merged.push(node);
+        } else {
+            merged[index].children.append(&mut node.children);
+        }
+    }
+    for node in merged.iter_mut().filter(|node| !node.children.is_empty()) {
+        let (children, count) = merge_siblings(std::mem::take(&mut node.children));
+        node.children = children;
+        leaves += count;
+    }
+    (merged, leaves)
+}
+
 fn import_node(
     node: &Value,
     root: bool,
     depth: usize,
     remaining: &mut usize,
-    leaves: &mut usize,
 ) -> Result<Option<BookmarkNode>, &'static str> {
     let folder = folder_children(node, root);
     let url = if root {
@@ -265,12 +338,11 @@ fn import_node(
     let mut children = Vec::new();
     if let Some(folder) = folder {
         for child in folder {
-            if let Some(child) = import_node(child, false, depth + 1, remaining, leaves)? {
+            if let Some(child) = import_node(child, false, depth + 1, remaining)? {
                 children.push(child);
             }
         }
     }
-    *leaves += usize::from(url.is_some());
     Ok(Some(BookmarkNode {
         title: node
             .get("name")
@@ -308,6 +380,34 @@ pub(crate) fn pasted_sites(input: &str, open: &BTreeSet<String>) -> Vec<String> 
         }
     }
     sites
+}
+
+pub(crate) fn pasted_tab_urls(text: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let text = if text.len() > MAX_PASTED_TAB_BYTES {
+        // Keep only complete lines so the byte cutoff cannot change a tab's destination.
+        let Some(end) = text.as_bytes()[..MAX_PASTED_TAB_BYTES]
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+        else {
+            return Vec::new();
+        };
+        &text[..=end]
+    } else {
+        text
+    };
+
+    let mut seen = BTreeSet::new();
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_start_matches('\u{feff}').trim_start();
+            parsed_web_url(line).map(|url| url.to_string())
+        })
+        .filter(|url| seen.insert(url.clone()))
+        .take(limit)
+        .collect()
 }
 
 fn add_site(sites: &mut Vec<String>, open: &BTreeSet<String>, raw: &str) {
@@ -424,6 +524,45 @@ mod tests {
     }
 
     #[test]
+    fn pasted_tab_urls_preserves_full_addresses_in_order() {
+        let input = concat!(
+            "\u{feff}  HTTPS://Example.TEST:443/a%2Fz?q=a@b#first \r\n",
+            "\r\n",
+            "https://example.test/a%2Fz?q=a@b#first\n",
+            "https://user:pass@example.test/\n",
+            "https://@example.test/\n",
+            "https:///example.test/\n",
+            "https://example.test:65536/\n",
+            "file:///C:/private.html\n",
+            "javascript:alert(1)\n",
+            "https://example.test/a https://example.test/b\n",
+            "https://example.test/a%2Fz?q=a@b#second\n",
+            "https://example.test/b?q=a@b#first\r\n",
+            "  http://[::1]:8080/c  \n",
+            "https://later.test/",
+        );
+        assert_eq!(
+            pasted_tab_urls(input, 4),
+            [
+                "https://example.test/a%2Fz?q=a@b#first",
+                "https://example.test/a%2Fz?q=a@b#second",
+                "https://example.test/b?q=a@b#first",
+                "http://[::1]:8080/c",
+            ]
+        );
+        assert!(pasted_tab_urls(input, 0).is_empty());
+    }
+
+    #[test]
+    fn pasted_tab_urls_skips_lines_cut_by_the_byte_limit() {
+        let input = format!(
+            "https://kept.test/a\nhttps://cut.test/{}\nhttps://later.test/",
+            "\u{1f98a}".repeat(MAX_PASTED_TAB_BYTES / 4)
+        );
+        assert_eq!(pasted_tab_urls(&input, usize::MAX), ["https://kept.test/a"]);
+    }
+
+    #[test]
     fn sites_follow_bookmark_file_order_and_ignore_bad_nodes() {
         let roots = parse_bookmark_roots(BOOKMARKS).unwrap();
         assert_eq!(
@@ -456,18 +595,48 @@ mod tests {
     }
 
     #[test]
+    fn import_merges_account_roots_and_counts_unique_links_per_folder() {
+        let mut roots = parse_bookmark_roots(BOOKMARKS).unwrap();
+        let account = br#"{
+            "roots": {"synced": {"name":"Account mobile", "children":[
+                {"type":"folder", "name":"Work", "children":[
+                    {"type":"url", "name":"Inbox", "url":"https://z.test/inbox?q=a@b#unread"},
+                    {"type":"url", "name":"Inbox", "url":"https://account.test/"}
+                ]},
+                {"type":"url", "name":"Inbox", "url":"https://z.test/inbox?q=a@b#unread"}
+            ]}}
+        }"#;
+        roots.extend(parse_bookmark_roots(account).unwrap());
+
+        let (bookmarks, leaves) = import_roots(&roots).unwrap();
+        assert_eq!(bookmarks.len(), 2);
+        let mobile = &bookmarks[0];
+        assert_eq!(mobile.title, "Mobile bookmarks");
+        let work = &mobile.children[0];
+        assert_eq!(work.title, "Work");
+        assert_eq!(
+            work.children
+                .iter()
+                .map(|node| node.url.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["https://Z.test/inbox?q=a@b#unread", "https://account.test/"]
+        );
+        assert_eq!(leaves, 5);
+    }
+
+    #[test]
     fn import_returns_an_error_instead_of_a_partial_tree() {
         let mut deep = json!({"type":"folder", "children":[]});
         for _ in 0..MAX_IMPORT_DEPTH {
             deep = json!({"type":"folder", "children":[deep]});
         }
-        assert!(import_roots(&[deep]).is_err());
+        assert!(import_roots(&[("other".to_owned(), deep)]).is_err());
 
         let empty = json!({"type":"folder", "children":[]});
         let wide = json!({"type":"folder", "children":vec![empty; MAX_IMPORT_NODES]});
-        assert!(import_roots(&[wide]).is_err());
+        assert!(import_roots(&[("other".to_owned(), wide)]).is_err());
 
         let large = json!({"type":"folder", "name":"x".repeat(MAX_IMPORT_BYTES), "children":[]});
-        assert!(import_roots(&[large]).is_err());
+        assert!(import_roots(&[("other".to_owned(), large)]).is_err());
     }
 }

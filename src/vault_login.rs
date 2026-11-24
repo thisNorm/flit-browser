@@ -6,6 +6,14 @@ use url::{Url, form_urlencoded};
 
 pub(crate) const UNSUPPORTED: &str = "unsupported_form";
 
+#[cfg(feature = "vault-fixture")]
+pub(crate) fn configure_fixture_tls(command: &CommandLine) {
+    command.append_switch_with_value(
+        Some(&CefString::from("ignore-certificate-errors-spki-list")),
+        Some(&CefString::from(env!("FLIT_FIXTURE_SPKI"))),
+    );
+}
+
 // Only describe a traditional top-level POST form. The isolated renderer never
 // receives the saved username/password, and this result goes only to Rust.
 pub(crate) const FORM_SCRIPT: &str = r#"(() => {

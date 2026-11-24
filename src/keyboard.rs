@@ -40,6 +40,7 @@ pub(crate) enum Shortcut {
     LastTab,
     FocusFilter,
     ToggleSidebar,
+    ToggleSplit,
     Find,
     FindNext,
     FindPrevious,
@@ -87,6 +88,7 @@ pub(crate) fn shortcut(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<S
         (VK_9 | VK_NUMPAD9, true, false, false) => LastTab,
         (VK_A, true, true, false) => FocusFilter,
         (VK_B, true, true, false) => ToggleSidebar,
+        (VK_OEM_5, true, true, false) => ToggleSplit,
         (VK_F, true, false, false) => Find,
         (VK_F3, false, false, false) | (VK_G, true, false, false) => FindNext,
         (VK_F3, false, true, false) | (VK_G, true, true, false) => FindPrevious,
@@ -214,6 +216,9 @@ pub(crate) fn handle_edit_message(
                     }
                     (WM_KEYDOWN, VK_TAB, true, false) => {
                         expect_char(TranslatedChars::Control(0x09));
+                    }
+                    (WM_KEYDOWN, VK_OEM_5, true, false) => {
+                        expect_char(TranslatedChars::Control(0x1c));
                     }
                     (WM_SYSKEYDOWN, VK_D, false, true) => {
                         expect_char(TranslatedChars::System(b'd' as usize, b'D' as usize));
