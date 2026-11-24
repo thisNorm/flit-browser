@@ -17,3 +17,5 @@ User Data/
 .flit-browser-profile
 session.json
 session.previous.json
+/native-ui/upstream/
+/native-ui/app/target/

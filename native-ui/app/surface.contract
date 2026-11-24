@@ -1,0 +1,140 @@
+shape FlitSurfaceAction
+  id: number
+  label: string
+  selected: bool
+  kind: string
+
+shape FlitSurfaceItem
+  id: string
+  title: string
+  detail: string
+  actions: FlitSurfaceAction[]
+
+shape FlitSurfaceSection
+  id: string
+  title: string
+  items: FlitSurfaceItem[]
+
+shape FlitSurfaceData
+  title: string
+  subtitle: string
+  dark: bool
+  compact: bool
+  start: bool
+  sections: FlitSurfaceSection[]
+
+fn actionLabel(a: FlitSurfaceAction): string = a.selected ? `✓ ${a.label}` : a.label
+fn actionFill(selected: bool, grouped: bool): string = selected ? "light-dark(#e1ebfc, #2b3b58)" : grouped ? "light-dark(#ebeff5, #2a303c)" : "transparent"
+fn inlineActions(item: FlitSurfaceItem, compact: bool): bool = compact ? item.id == "zoom" : item.actions.filter(a => a.kind == "toggle").length == 1
+fn downloadItem(item: FlitSurfaceItem): bool = item.id.startsWith("download-")
+fn toolbarPanel(surface: FlitSurfaceData): bool = surface.compact and surface.sections.filter(s => s.id != "actions").length > 0
+fn separatedGroup(id: string): bool = id == "menu-library" or id == "menu-page" or id == "menu-app" or id == "extensions-installed"
+
+style FlitAction
+  min-width=0 min-height=32 padding="5px 8px" box-sizing="border-box"
+  border-radius=6 border-width=2 border-style="solid" border-color="transparent"
+  cursor="pointer" font="-exact-subheadline" text-align="start"
+  :hover
+    background-color="light-dark(#e7edf6, #313846)"
+  :active
+    background-color="light-dark(#dce6f5, #3a465b)"
+  :focus-visible
+    border-color="light-dark(#305eb3, #91b6fa)"
+
+style FlitMeta
+  font="-exact-footnote" color="light-dark(#536278, #a8b4c9)" overflow-wrap="break-word"
+
+component FlitSurface
+  state revision = 0
+  resource surface = readSurface(revision) as shape FlitSurfaceData
+  mutation result as shape bool queue
+
+  action invoke(id: number)
+    send result = invokeAction(id)
+  // The host sends Refresh once the posted command has taken effect.
+  action refresh
+    revision = revision + 1
+
+  view
+    scroll testId="flit-surface" refresh=refresh() width="100%" height="100%"
+      color-scheme=(surface.dark ? "dark" : "light") color="-exact-label"
+      background-color=(toolbarPanel(surface) ? "light-dark(#fdfdff, #202631)" : surface.compact ? "light-dark(#f8fafc, #222630)" : "light-dark(#f5f7fa, #1c2028)")
+      border=(toolbarPanel(surface) ? "1px solid light-dark(#d7dfeb, #394557)" : "none")
+      scrollbar-width=(toolbarPanel(surface) ? "thin" : "auto")
+      box-sizing="border-box"
+      accent-color="light-dark(#305eb3, #91b6fa)"
+      column width="100%" min-width=0 max-width=(surface.compact ? 440 : 680)
+        margin="0 auto" box-sizing="border-box" padding=(toolbarPanel(surface) ? 7 : surface.compact ? 6 : 20) gap=(toolbarPanel(surface) ? 5 : surface.compact ? 4 : 22)
+        padding-top=(surface.start ? 60 : toolbarPanel(surface) ? 8 : surface.compact ? 6 : 22)
+        if surface.title != "" or surface.subtitle != ""
+          column gap=(surface.compact ? 3 : 6) padding=(toolbarPanel(surface) ? "4px 9px 9px" : surface.compact ? "2px 8px 8px" : "0 8px 2px")
+            border-bottom=(surface.compact ? "1px solid light-dark(#e1e7f0, #374150)" : "none")
+            if surface.title != ""
+              text surface.title role="heading" aria-level=1 font=(surface.start ? "-exact-large-title" : surface.compact ? "-exact-headline" : "-exact-title2") overflow-wrap="break-word"
+            if surface.subtitle != ""
+              text surface.subtitle font="-exact-subheadline" color="light-dark(#536278, #a8b4c9)" overflow-wrap="break-word"
+        for group in surface.sections key=group.id
+          section display="flex" flex-direction="column" gap=(surface.compact ? 2 : 4)
+            border-top=(separatedGroup(group.id) ? "1px solid light-dark(#e1e7f0, #374150)" : "none")
+            padding-top=(separatedGroup(group.id) ? 5 : 0)
+            if group.title != ""
+              text group.title role="heading" aria-level=2 font=(toolbarPanel(surface) ? "-exact-footnote" : "-exact-headline") overflow-wrap="break-word"
+                color=(toolbarPanel(surface) ? "light-dark(#536278, #a8b4c9)" : "-exact-label")
+                padding=(toolbarPanel(surface) ? "2px 9px 3px" : "0 8px 8px")
+                border-bottom=(toolbarPanel(surface) ? "none" : "1px solid -exact-separator")
+            for item in group.items key=item.id
+              if item.title == "" and (surface.start or item.actions.length == 1) and item.actions.filter(a => a.kind != "link").length == 0
+                for control in item.actions.filter(a => a.label != "") key=control.id
+                  button appearance="none" class=FlitAction width="100%" min-height=(surface.compact ? 32 : 36)
+                    press=invoke(control.id) aria-label=control.label aria-description=item.detail testId=`action-${control.id}`
+                    background-color=actionFill(control.selected, false)
+                    row width="100%" align-items="center" gap=12
+                      column flex=1 min-width=0 gap=2
+                        text actionLabel(control) overflow-wrap="break-word" line-clamp=(surface.compact and surface.title == "" ? 1 : 2)
+                        if not surface.compact and item.detail != ""
+                          text item.detail class=FlitMeta
+                      if surface.compact and item.detail != ""
+                        text item.detail class=FlitMeta max-width="44%" text-align="end" line-clamp=1
+              else
+                column padding=(surface.compact ? "6px 8px" : "8px") gap=(surface.compact ? 8 : 10)
+                  flex-direction=(inlineActions(item, surface.compact) ? "row" : "column")
+                  align-items=(inlineActions(item, surface.compact) ? "center" : "stretch")
+                  border-bottom=(downloadItem(item) ? "1px solid light-dark(#e1e7f0, #374150)" : "none")
+                  if downloadItem(item)
+                    row align-items="center" gap=9
+                      box width=26 height=26 flex-shrink=0 border-radius=7 background-color="light-dark(#e8f0fa, #2a3951)"
+                        display="flex" align-items="center" justify-content="center" aria-hidden=true
+                        text "↓" color="light-dark(#345c94, #aac6f2)" font="-exact-subheadline"
+                      column flex=1 min-width=0 gap=2
+                        text item.title font="-exact-headline" line-clamp=2 overflow-wrap="break-word"
+                        text item.detail class=FlitMeta line-clamp=1
+                  else
+                    if item.title != "" or item.detail != ""
+                      column min-width=0 gap=3 flex-grow=(inlineActions(item, surface.compact) ? 1 : 0)
+                        if item.title != ""
+                          text item.title font=(item.actions.length == 0 ? "-exact-subheadline" : "-exact-headline")
+                            color=(item.actions.length == 0 ? "light-dark(#536278, #a8b4c9)" : "-exact-label") overflow-wrap="break-word"
+                        if item.detail != ""
+                          text item.detail class=FlitMeta
+                  if item.actions.length > 0
+                    if item.actions.filter(a => a.kind != "choice").length == 0
+                      row role="radiogroup" aria-label=item.title gap=6 flex-wrap="wrap"
+                        for control in item.actions.filter(a => a.label != "") key=control.id
+                          button appearance="none" class=FlitAction role="radio" aria-checked=control.selected
+                            aria-label=control.label press=invoke(control.id) testId=`action-${control.id}` max-width="100%"
+                            background-color=actionFill(control.selected, true)
+                            text actionLabel(control) overflow-wrap="break-word"
+                    else
+                      row role="group" aria-label=item.title gap=6 flex-wrap=(inlineActions(item, surface.compact) ? "nowrap" : "wrap")
+                        flex-shrink=(inlineActions(item, surface.compact) ? 0 : 1)
+                        for control in item.actions.filter(a => a.label != "") key=control.id
+                          if control.kind == "toggle"
+                            button appearance="none" class=FlitAction aria-pressed=control.selected
+                              aria-label=control.label press=invoke(control.id) testId=`action-${control.id}` max-width="100%"
+                              background-color=actionFill(control.selected, true)
+                              text actionLabel(control) white-space="nowrap"
+                          else
+                            button appearance="none" class=FlitAction press=invoke(control.id)
+                              aria-label=control.label testId=`action-${control.id}` max-width="100%"
+                              background-color=actionFill(control.selected, true)
+                              text actionLabel(control) overflow-wrap="break-word"
